@@ -64,6 +64,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -3656,6 +3657,19 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         kv_cache_raw_tensors[layer_name_inner] = tensor
+                elif (
+                    "attn" in layer_name
+                    and layer_name not in kv_cache_raw_tensors
+                    and isinstance(layer_kv_cache_spec[layer_name], TQFullAttentionSpec)
+                ):
+                    tensor = self._allocate_int8_cache_tensor(
+                        kv_cache_tensor.size,
+                        alignment,
+                    )
+                    for layer_name_inner in kv_cache_tensor.shared_by:
+                        # TurboQuant packs K and V into a single per-layer slot,
+                        # so do not split the raw allocation into K/V tensors.
+                        kv_cache_raw_tensors[layer_name_inner] = tensor
                 elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors and not use_mamba:
                     # NOTE: We need to init k cache tensor (nope cache tensor in mla) and
                     # v cache tensor (rope cache tensor in mla) separately to support prefill disaggregation,
@@ -3839,6 +3853,22 @@ class NPUModelRunner(GPUModelRunner):
                                            )
 
                     kv_caches[layer_name] = kv_cache
+                elif isinstance(current_kv_cache_spec, TQFullAttentionSpec):
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor is not None
+                    assert raw_tensor.numel() % current_kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // current_kv_cache_spec.page_size_bytes
+                    assert num_blocks >= kv_cache_config.num_blocks
+                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                        num_blocks,
+                        current_kv_cache_spec.block_size,
+                        current_kv_cache_spec.num_kv_heads,
+                        current_kv_cache_spec.head_size,
+                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                    )
+                    kv_caches[layer_name] = raw_tensor.view(
+                        current_kv_cache_spec.dtype
+                    ).view(kv_cache_shape)
                 elif isinstance(current_kv_cache_spec, AttentionSpec):
                     # cache_only_layers (extract_hidden_states) are allocated
                     # as a single tensor by the branch at the top of

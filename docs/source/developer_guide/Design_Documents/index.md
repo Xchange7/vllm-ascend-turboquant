@@ -16,5 +16,9 @@ add_custom_aclnn_op
 context_parallel
 dynamic_chunked_pipeline_parallel
 quantization
+TurboQuant_KV_Cache
+TurboQuant_KV_Cache.zh
+TurboQuant_Debug_Guide.zh
+TurboQuant_Related_Papers_Research.zh
 npugraph_ex
 :::
