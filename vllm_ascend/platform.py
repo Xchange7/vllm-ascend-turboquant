@@ -34,6 +34,10 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.kv_cache.turboquant import (
+    is_turboquant_kv_cache_dtype,
+    validate_turboquant_config,
+)
 
 # isort: off
 from vllm_ascend.utils import (
@@ -784,6 +788,20 @@ class NPUPlatform(Platform):
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
         use_compress = getattr(attn_selector_config, "use_compress", False)
         key = (attn_selector_config.use_mla, attn_selector_config.use_sparse)
+        kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
+
+        unsupported_tq_reason = validate_turboquant_config(
+            kv_cache_dtype,
+            use_mla=attn_selector_config.use_mla,
+            use_sparse=attn_selector_config.use_sparse,
+            use_compress=use_compress,
+            is_310p=is_310p(),
+        )
+        if unsupported_tq_reason is not None:
+            raise NotImplementedError(unsupported_tq_reason)
+        if is_turboquant_kv_cache_dtype(kv_cache_dtype):
+            logger.info_once("Using Ascend TurboQuant attention backend.")
+            return "vllm_ascend.attention.turboquant.AscendTurboQuantAttentionBackend"
 
         if selected_backend == AttentionBackendEnum.FLASH_ATTN and cls._validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
