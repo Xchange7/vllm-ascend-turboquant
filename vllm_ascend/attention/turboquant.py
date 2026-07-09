@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 import torch
+import vllm.envs as envs_vllm
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 
@@ -50,7 +51,7 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "TURBOQUANT_ASCEND"
+        return "CUSTOM" if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER else "FLASH_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type[AscendTurboQuantAttentionImpl]:
