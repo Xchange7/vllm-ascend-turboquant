@@ -3510,6 +3510,13 @@ class NPUModelRunner(GPUModelRunner):
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
 
+    def _allocate_int8_cache_tensor(self, size: int, alignment: int) -> torch.Tensor:
+        if self.vllm_config.kv_transfer_config is None:
+            return torch.zeros(size, dtype=torch.int8, device=self.device)
+
+        tensor = torch.zeros(size + alignment, dtype=torch.int8, device=self.device)
+        return self._align_memory(tensor, alignment)[:size]
+
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
