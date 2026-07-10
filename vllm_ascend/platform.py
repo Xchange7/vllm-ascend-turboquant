@@ -612,6 +612,9 @@ class NPUPlatform(Platform):
         key = (attn_selector_config.use_mla, attn_selector_config.use_sparse)
         kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
 
+        if is_turboquant_kv_cache_dtype(kv_cache_dtype) and envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            raise NotImplementedError("TurboQuant KV cache currently supports only the vLLM v1 model runner on Ascend.")
+
         unsupported_tq_reason = validate_turboquant_config(
             kv_cache_dtype,
             use_mla=attn_selector_config.use_mla,

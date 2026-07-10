@@ -286,6 +286,13 @@ def turboquant_store_kv(
     key = key[:num_tokens].view(num_tokens, -1, tq_config.head_dim)
     value = value[:num_tokens].view(num_tokens, -1, tq_config.head_dim)
     slot_mapping = slot_mapping[:num_tokens].to(torch.long)
+    valid_indices = torch.nonzero(slot_mapping >= 0, as_tuple=True)[0]
+    if valid_indices.numel() == 0:
+        return
+
+    key = key.index_select(0, valid_indices)
+    value = value.index_select(0, valid_indices)
+    slot_mapping = slot_mapping.index_select(0, valid_indices)
 
     key_data_bytes = tq_config.key_packed_size - (0 if tq_config.key_fp8 else 2)
     value_data_bytes = tq_config.value_packed_size - 4

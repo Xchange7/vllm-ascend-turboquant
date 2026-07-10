@@ -62,3 +62,49 @@ def test_turboquant_store_dequant_roundtrip_contract():
         assert value_cache.dtype == torch.float16
         assert key_cache[0, 0].abs().sum() > 0
         assert value_cache[1, 1].abs().sum() > 0
+
+
+def test_turboquant_store_ignores_negative_slot_mapping():
+    head_dim = 8
+    tq_config = get_turboquant_config("turboquant_4bit_nc", head_dim)
+    kv_cache = torch.zeros(
+        (2, 4, 2, tq_config.slot_size_aligned),
+        dtype=torch.uint8,
+    )
+    key = torch.randn(3, 2, head_dim, dtype=torch.float16)
+    value = torch.randn(3, 2, head_dim, dtype=torch.float16)
+    slot_mapping = torch.tensor([0, -1, 5], dtype=torch.int64)
+
+    turboquant_store_kv(
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        slot_mapping=slot_mapping,
+        tq_config=tq_config,
+    )
+
+    assert kv_cache[0, 0].abs().sum() > 0
+    assert kv_cache[1, 1].abs().sum() > 0
+    assert kv_cache[1, 3].abs().sum() == 0
+
+
+def test_turboquant_store_returns_when_all_slots_are_negative():
+    head_dim = 8
+    tq_config = get_turboquant_config("turboquant_4bit_nc", head_dim)
+    kv_cache = torch.zeros(
+        (2, 4, 2, tq_config.slot_size_aligned),
+        dtype=torch.uint8,
+    )
+    key = torch.randn(2, 2, head_dim, dtype=torch.float16)
+    value = torch.randn(2, 2, head_dim, dtype=torch.float16)
+    slot_mapping = torch.tensor([-1, -1], dtype=torch.int64)
+
+    turboquant_store_kv(
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        slot_mapping=slot_mapping,
+        tq_config=tq_config,
+    )
+
+    assert kv_cache.abs().sum() == 0

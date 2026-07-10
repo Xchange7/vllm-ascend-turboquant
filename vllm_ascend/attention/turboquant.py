@@ -132,6 +132,11 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError("TurboQuant KV cache currently supports decoder attention only.")
         self.tq_config = get_turboquant_config(kv_cache_dtype, head_size)
+        self._use_layer_aware_fia_graph_replay = getattr(
+            self,
+            "_use_layer_aware_fia_graph_replay",
+            False,
+        )
 
     def do_kv_cache_update(
         self,
