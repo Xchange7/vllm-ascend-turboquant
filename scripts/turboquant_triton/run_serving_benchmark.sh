@@ -88,14 +88,24 @@ trap 'exit 143' TERM
 wait_for_server() {
     local log_file="$1"
     local deadline=$((SECONDS + SERVER_TIMEOUT))
+    local next_report=$((SECONDS + 30))
     while ((SECONDS < deadline)); do
         if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
             printf 'Server exited before becoming healthy. Last log lines:\n' >&2
             tail -n 100 "${log_file}" >&2 || true
             return 1
         fi
-        if curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null; then
+        if curl --noproxy '*' --fail --silent \
+            --connect-timeout 2 --max-time 5 \
+            "http://127.0.0.1:${PORT}/health" >/dev/null; then
+            printf 'Server is healthy on port %s; starting requests.\n' "${PORT}"
             return 0
+        fi
+        if ((SECONDS >= next_report)); then
+            printf 'Still waiting for server health on port %s; latest log: ' \
+                "${PORT}"
+            tail -n 1 "${log_file}" || true
+            next_report=$((SECONDS + 30))
         fi
         sleep 5
     done

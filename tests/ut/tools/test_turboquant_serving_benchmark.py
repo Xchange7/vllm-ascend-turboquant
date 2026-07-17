@@ -69,9 +69,11 @@ def test_stream_completion_measures_between_first_and_last_token() -> None:
     response = MagicMock()
     response.__enter__.return_value = events
     response.__exit__.return_value = False
+    opener = MagicMock()
+    opener.open.return_value = response
 
     with (
-        patch.object(benchmark.urllib.request, "urlopen", return_value=response),
+        patch.object(benchmark.urllib.request, "build_opener", return_value=opener),
         patch.object(
             benchmark.time,
             "perf_counter",

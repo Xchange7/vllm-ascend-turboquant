@@ -123,13 +123,15 @@ def stream_completion(
         },
         method="POST",
     )
+    # Benchmark servers are local; environment proxies can stall localhost I/O.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     started = time.perf_counter()
     first_token_at: float | None = None
     last_token_at: float | None = None
     completion_tokens = 0
     observed_tokens = 0
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             for raw_line in response:
                 line = raw_line.decode("utf-8").strip()
                 if not line.startswith("data:"):
