@@ -1,0 +1,20 @@
+TurboQuant diagnostic summary
+Generated: 2026-07-17T02:34:44+00:00
+Repository: /opt/x50060420/Quant/vllm-ascend-turboquant
+Log directory: /opt/x50060420/Quant/vllm-ascend-turboquant/logs/turboquant/diagnostic_20260717_023201
+Failed stages: 4
+
+stage              status  exit_code  log
+00_system          PASS    0          00_system.log
+01_source          PASS    0          01_source.log
+02_environment     PASS    0          02_environment.log
+03_platform        PASS    0          03_platform.log
+04_backend         FAIL    1          04_backend.log
+05_triton_kernels  FAIL    1          05_triton_kernels.log
+06_aclgraph        FAIL    1          06_aclgraph.log
+07_profile         FAIL    1          07_profile.log
+
+Debug options:
+DEBUG_SYNC=0
+RUN_PROFILE=1
+COLLECT_PROFILE_TRACE=0
