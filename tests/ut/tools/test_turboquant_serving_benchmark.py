@@ -91,7 +91,7 @@ def test_stream_completion_measures_between_first_and_last_token() -> None:
     assert result["end_to_end_seconds"] == pytest.approx(0.5)
 
 
-def test_execute_requests_reaches_requested_concurrency() -> None:
+def test_execute_requests_reaches_requested_concurrency(capsys) -> None:
     benchmark = load_script("serving_benchmark.py")
     barrier = threading.Barrier(4)
     lock = threading.Lock()
@@ -118,6 +118,9 @@ def test_execute_requests_reaches_requested_concurrency() -> None:
     assert max_active == 4
     assert [sample["index"] for sample in samples] == list(range(8))
     assert elapsed > 0
+    output = capsys.readouterr().out
+    assert "request: submitting 8 request(s) with concurrency 4" in output
+    assert "mean TTFT=" in output
 
 
 def test_compare_reports_calculates_effective_compression(tmp_path: Path) -> None:

@@ -27,7 +27,7 @@ import statistics
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -197,21 +197,50 @@ def execute_requests(
 
     samples = []
     started = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=min(count, concurrency)) as executor:
+    effective_concurrency = min(count, concurrency)
+    print(
+        f"{phase}: submitting {count} request(s) with concurrency {effective_concurrency}",
+        flush=True,
+    )
+    with ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
         futures = {executor.submit(stream_completion, endpoint, payload, timeout): index for index in range(count)}
-        for completed, future in enumerate(as_completed(futures), 1):
-            index = futures[future]
-            sample = future.result()
-            sample["index"] = index
-            samples.append(sample)
-            print(
-                f"{phase} {completed}/{count}: "
-                f"TTFT={sample['ttft_seconds'] * 1000:.2f} ms, "
-                f"TPOT={sample['tpot_seconds'] * 1000:.2f} ms",
-                flush=True,
+        pending = set(futures)
+        completed = 0
+        while pending:
+            done, pending = wait(
+                pending,
+                timeout=30,
+                return_when=FIRST_COMPLETED,
             )
+            if not done:
+                elapsed_seconds = time.perf_counter() - started
+                print(
+                    f"{phase}: {completed}/{count} complete after {elapsed_seconds:.1f}s; {len(pending)} pending",
+                    flush=True,
+                )
+                continue
+            for future in done:
+                completed += 1
+                index = futures[future]
+                sample = future.result()
+                sample["index"] = index
+                samples.append(sample)
+                print(
+                    f"{phase} {completed}/{count}: "
+                    f"TTFT={sample['ttft_seconds'] * 1000:.2f} ms, "
+                    f"TPOT={sample['tpot_seconds'] * 1000:.2f} ms",
+                    flush=True,
+                )
     elapsed_seconds = time.perf_counter() - started
     samples.sort(key=lambda item: item["index"])
+    mean_ttft = statistics.fmean(item["ttft_seconds"] for item in samples)
+    mean_tpot = statistics.fmean(item["tpot_seconds"] for item in samples)
+    print(
+        f"{phase} complete in {elapsed_seconds:.2f}s: "
+        f"mean TTFT={mean_ttft * 1000:.2f} ms, "
+        f"mean TPOT={mean_tpot * 1000:.2f} ms",
+        flush=True,
+    )
     return samples, elapsed_seconds
 
 
