@@ -10,7 +10,8 @@ MODEL="${MODEL:?Set MODEL to the local model path}"
 PORT="${PORT:-18001}"
 TP_SIZE="${TP_SIZE:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+CONCURRENCY="${CONCURRENCY:-1}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-${CONCURRENCY}}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 INPUT_TOKENS="${INPUT_TOKENS:-1024}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-128}"
@@ -148,6 +149,7 @@ run_client() {
         --max-model-len "${MAX_MODEL_LEN}" \
         --warmup-requests "${WARMUP_REQUESTS}" \
         --requests "${MEASURE_REQUESTS}" \
+        --concurrency "${CONCURRENCY}" \
         --timeout "${REQUEST_TIMEOUT}" \
         --output "${OUTPUT_DIR}/${label}.json" \
         | tee "${OUTPUT_DIR}/${label}_client.log"

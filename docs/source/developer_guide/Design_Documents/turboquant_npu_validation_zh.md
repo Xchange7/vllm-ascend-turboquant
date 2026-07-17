@@ -298,6 +298,22 @@ MAX_MODEL_LEN=2048 \
 bash scripts/turboquant_triton/run_serving_benchmark.sh
 ```
 
+Qwen3-32B 可使用 4 卡 TP，并把客户端和服务端并发同时设为 16。建议至少运行一轮
+16 请求并发预热和四轮正式请求：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+MODEL=/path/to/Qwen3-32B \
+TP_SIZE=4 CONCURRENCY=16 MAX_NUM_SEQS=16 \
+WARMUP_REQUESTS=16 MEASURE_REQUESTS=64 \
+MAX_MODEL_LEN=2048 INPUT_TOKENS=1024 OUTPUT_TOKENS=128 \
+bash scripts/turboquant_triton/run_serving_benchmark.sh
+```
+
+`CONCURRENCY` 控制客户端同时在途的流式请求数；未显式设置 `MAX_NUM_SEQS` 时，
+服务端会默认使用相同值。报告除逐请求 TTFT/TPOT 外，还会给出 request/s 和
+aggregate output token/s。
+
 ## 7. 第三优先级：性能验证
 
 ### 7.1 默认矩阵

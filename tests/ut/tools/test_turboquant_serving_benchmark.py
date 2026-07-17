@@ -17,6 +17,7 @@ import argparse
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -43,12 +44,15 @@ def benchmark_report(ttft: float, tpot: float) -> dict:
         "actual_input_tokens": 1024,
         "output_tokens": 128,
         "measured_requests": 10,
+        "concurrency": 4,
         "prefix_caching": False,
         "summary": {
             "ttft_seconds": metric(ttft),
             "tpot_seconds": metric(tpot),
             "end_to_end_seconds": metric(2.0),
             "output_tokens_per_second": metric(100.0),
+            "request_throughput": metric(4.0),
+            "aggregate_output_tokens_per_second": metric(400.0),
         },
     }
 
@@ -87,6 +91,35 @@ def test_stream_completion_measures_between_first_and_last_token() -> None:
     assert result["end_to_end_seconds"] == pytest.approx(0.5)
 
 
+def test_execute_requests_reaches_requested_concurrency() -> None:
+    benchmark = load_script("serving_benchmark.py")
+    barrier = threading.Barrier(4)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_completion(*_args):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        barrier.wait(timeout=2)
+        with lock:
+            active -= 1
+        return {
+            "ttft_seconds": 0.1,
+            "tpot_seconds": 0.01,
+            "completion_tokens": 8,
+        }
+
+    with patch.object(benchmark, "stream_completion", side_effect=fake_completion):
+        samples, elapsed = benchmark.execute_requests(8, 4, "http://server", {}, 1.0, "request")
+
+    assert max_active == 4
+    assert [sample["index"] for sample in samples] == list(range(8))
+    assert elapsed > 0
+
+
 def test_compare_reports_calculates_effective_compression(tmp_path: Path) -> None:
     benchmark = load_script("serving_benchmark.py")
     native_path = tmp_path / "native.json"
@@ -121,6 +154,12 @@ def test_compare_reports_calculates_effective_compression(tmp_path: Path) -> Non
     assert compression["estimated_bytes_per_token_ratio"] == 0.25
     assert compression["estimated_kv_memory_reduction_percent"] == 75.0
     assert report["metrics"]["ttft_seconds"]["turboquant_change_percent"] == pytest.approx(-10.0)
+
+    mismatched = benchmark_report(0.09, 0.008)
+    mismatched["concurrency"] = 8
+    tq_path.write_text(json.dumps(mismatched), encoding="utf-8")
+    with pytest.raises(ValueError, match="concurrency"):
+        benchmark.compare_reports(args)
 
 
 def test_accuracy_context_budget_rejects_oversized_case() -> None:

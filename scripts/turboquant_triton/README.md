@@ -96,7 +96,7 @@ The combined suite writes one archive under `logs/turboquant/`. See
 for stage definitions, report interpretation, and reduced test matrices.
 
 To compare end-to-end KV-cache capacity, TTFT, and TPOT with prefix caching
-disabled, run the sequential serving benchmark:
+disabled, run the serving benchmark:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0 \
@@ -112,6 +112,17 @@ derives the effective KV-cache compression ratio from the cache token capacity
 reported by each server. Override `INPUT_TOKENS`, `OUTPUT_TOKENS`,
 `WARMUP_REQUESTS`, or `MEASURE_REQUESTS` to change the workload. Keep
 `INPUT_TOKENS + OUTPUT_TOKENS <= MAX_MODEL_LEN`.
+
+For Qwen3-32B on four NPUs with 16 concurrent sequences, use at least one
+full concurrent warmup wave and several measured waves:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+MODEL=/path/to/Qwen3-32B \
+TP_SIZE=4 CONCURRENCY=16 MAX_NUM_SEQS=16 \
+WARMUP_REQUESTS=16 MEASURE_REQUESTS=64 \
+bash scripts/turboquant_triton/run_serving_benchmark.sh
+```
 
 ## 2. Start Qwen3-32B
 

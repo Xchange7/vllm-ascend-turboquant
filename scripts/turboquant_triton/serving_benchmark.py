@@ -27,6 +27,7 @@ import statistics
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--max-model-len", type=int, default=2048)
     run.add_argument("--warmup-requests", type=int, default=2)
     run.add_argument("--requests", type=int, default=10)
+    run.add_argument("--concurrency", type=int, default=1)
     run.add_argument("--timeout", type=float, default=600.0)
     run.add_argument("--output", type=Path, required=True)
 
@@ -182,9 +184,40 @@ def stream_completion(
     }
 
 
+def execute_requests(
+    count: int,
+    concurrency: int,
+    endpoint: str,
+    payload: dict[str, Any],
+    timeout: float,
+    phase: str,
+) -> tuple[list[dict[str, Any]], float]:
+    if count == 0:
+        return [], 0.0
+
+    samples = []
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=min(count, concurrency)) as executor:
+        futures = {executor.submit(stream_completion, endpoint, payload, timeout): index for index in range(count)}
+        for completed, future in enumerate(as_completed(futures), 1):
+            index = futures[future]
+            sample = future.result()
+            sample["index"] = index
+            samples.append(sample)
+            print(
+                f"{phase} {completed}/{count}: "
+                f"TTFT={sample['ttft_seconds'] * 1000:.2f} ms, "
+                f"TPOT={sample['tpot_seconds'] * 1000:.2f} ms",
+                flush=True,
+            )
+    elapsed_seconds = time.perf_counter() - started
+    samples.sort(key=lambda item: item["index"])
+    return samples, elapsed_seconds
+
+
 def run_benchmark(args: argparse.Namespace) -> int:
-    if args.requests <= 0 or args.warmup_requests < 0:
-        raise ValueError("Request count must be positive and warmup count non-negative")
+    if args.requests <= 0 or args.warmup_requests < 0 or args.concurrency <= 0:
+        raise ValueError("Request and concurrency counts must be positive; warmup count must be non-negative")
     prompt, actual_input_tokens = build_prompt(args.model, args.input_tokens)
     total_budget = actual_input_tokens + args.output_tokens
     if total_budget > args.max_model_len:
@@ -205,21 +238,23 @@ def run_benchmark(args: argparse.Namespace) -> int:
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    for index in range(args.warmup_requests):
-        print(f"warmup {index + 1}/{args.warmup_requests}", flush=True)
-        stream_completion(endpoint, payload, args.timeout)
-
-    samples = []
-    for index in range(args.requests):
-        sample = stream_completion(endpoint, payload, args.timeout)
-        sample["index"] = index
-        samples.append(sample)
-        print(
-            f"request {index + 1}/{args.requests}: "
-            f"TTFT={sample['ttft_seconds'] * 1000:.2f} ms, "
-            f"TPOT={sample['tpot_seconds'] * 1000:.2f} ms",
-            flush=True,
-        )
+    execute_requests(
+        args.warmup_requests,
+        args.concurrency,
+        endpoint,
+        payload,
+        args.timeout,
+        "warmup",
+    )
+    samples, benchmark_elapsed_seconds = execute_requests(
+        args.requests,
+        args.concurrency,
+        endpoint,
+        payload,
+        args.timeout,
+        "request",
+    )
+    total_output_tokens = sum(item["completion_tokens"] for item in samples)
 
     report = {
         "label": args.label,
@@ -232,12 +267,16 @@ def run_benchmark(args: argparse.Namespace) -> int:
         "max_model_len": args.max_model_len,
         "warmup_requests": args.warmup_requests,
         "measured_requests": args.requests,
+        "concurrency": args.concurrency,
+        "benchmark_elapsed_seconds": benchmark_elapsed_seconds,
         "samples": samples,
         "summary": {
             "ttft_seconds": summarize([item["ttft_seconds"] for item in samples]),
             "tpot_seconds": summarize([item["tpot_seconds"] for item in samples]),
             "end_to_end_seconds": summarize([item["end_to_end_seconds"] for item in samples]),
             "output_tokens_per_second": summarize([item["output_tokens_per_second"] for item in samples]),
+            "request_throughput": {"mean": args.requests / benchmark_elapsed_seconds},
+            "aggregate_output_tokens_per_second": {"mean": total_output_tokens / benchmark_elapsed_seconds},
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -265,6 +304,7 @@ def compare_reports(args: argparse.Namespace) -> int:
         "actual_input_tokens",
         "output_tokens",
         "measured_requests",
+        "concurrency",
         "prefix_caching",
     )
     for field in comparable_fields:
@@ -292,6 +332,8 @@ def compare_reports(args: argparse.Namespace) -> int:
         "tpot_seconds",
         "end_to_end_seconds",
         "output_tokens_per_second",
+        "request_throughput",
+        "aggregate_output_tokens_per_second",
     ):
         native_mean = native["summary"][metric]["mean"]
         tq_mean = turboquant["summary"][metric]["mean"]
@@ -320,6 +362,7 @@ def compare_reports(args: argparse.Namespace) -> int:
         f"- Model: `{native['model']}`",
         f"- Input/output tokens: {native['actual_input_tokens']}/{native['output_tokens']}",
         f"- Measured requests: {native['measured_requests']}",
+        f"- Concurrency: {native['concurrency']}",
         "- Prefix caching: disabled",
         "",
         "| Metric | Native | TurboQuant | Change |",
@@ -329,11 +372,13 @@ def compare_reports(args: argparse.Namespace) -> int:
         "ttft_seconds": "Mean TTFT (ms)",
         "tpot_seconds": "Mean TPOT (ms)",
         "end_to_end_seconds": "Mean E2E (ms)",
-        "output_tokens_per_second": "Output throughput (token/s)",
+        "output_tokens_per_second": "Mean per-request output throughput (token/s)",
+        "request_throughput": "Request throughput (request/s)",
+        "aggregate_output_tokens_per_second": "Aggregate output throughput (token/s)",
     }
     for metric, label in labels.items():
         item = metrics[metric]
-        scale = 1.0 if metric == "output_tokens_per_second" else 1000.0
+        scale = 1000.0 if metric.endswith("_seconds") else 1.0
         lines.append(
             f"| {label} | {item['native_mean'] * scale:.3f} | "
             f"{item['turboquant_mean'] * scale:.3f} | "
