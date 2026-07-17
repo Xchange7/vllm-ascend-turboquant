@@ -95,6 +95,24 @@ The combined suite writes one archive under `logs/turboquant/`. See
 `docs/source/developer_guide/Design_Documents/turboquant_npu_validation_zh.md`
 for stage definitions, report interpretation, and reduced test matrices.
 
+To compare end-to-end KV-cache capacity, TTFT, and TPOT with prefix caching
+disabled, run the sequential serving benchmark:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+MODEL=/run/test_llm/Qwen3-0.6B-hf \
+TP_SIZE=1 \
+bash scripts/turboquant_triton/run_serving_benchmark.sh
+```
+
+It starts native and TurboQuant servers one at a time, performs two warmup and
+ten measured streaming requests by default, and writes raw samples, server
+logs, `comparison.json`, and `summary.md` under `logs/turboquant/`. The summary
+derives the effective KV-cache compression ratio from the cache token capacity
+reported by each server. Override `INPUT_TOKENS`, `OUTPUT_TOKENS`,
+`WARMUP_REQUESTS`, or `MEASURE_REQUESTS` to change the workload. Keep
+`INPUT_TOKENS + OUTPUT_TOKENS <= MAX_MODEL_LEN`.
+
 ## 2. Start Qwen3-32B
 
 The default uses tensor parallel size 2 because BF16 Qwen3-32B weights usually

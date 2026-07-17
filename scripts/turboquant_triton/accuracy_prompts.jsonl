@@ -3,4 +3,4 @@
 {"id":"arithmetic","prompt":"Calculate 37 * 29. Show the calculation briefly and give the final integer.","max_tokens":64}
 {"id":"code_completion","prompt":"Complete this Python function without external libraries:\n\ndef stable_softmax(values):\n","max_tokens":128}
 {"id":"repeated_prefix","prompt":"Paged KV cache stores keys and values. Paged KV cache stores keys and values. Paged KV cache stores keys and","max_tokens":64}
-{"id":"long_context_retrieval","prompt":"TurboQuant validation record: ordinary records have value 17. ","repeat":160,"suffix":"The final authoritative record says the validation value is 493. Ignore earlier ordinary values. What is the final authoritative validation value? Answer with only the integer.","max_tokens":16}
+{"id":"long_context_retrieval","prompt":"TurboQuant validation record: ordinary records have value 17. ","repeat":100,"suffix":"The final authoritative record says the validation value is 493. Ignore earlier ordinary values. What is the final authoritative validation value? Answer with only the integer.","max_tokens":16}

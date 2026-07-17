@@ -46,6 +46,12 @@ def parse_args() -> argparse.Namespace:
     collect.add_argument("--logprobs", type=int, default=5)
     collect.add_argument("--timeout", type=float, default=600.0)
     collect.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Reject cases whose prompt and generation budget exceed this limit.",
+    )
+    collect.add_argument(
         "--warm-prefix",
         action="store_true",
         help="Send each prompt once before the recorded request to exercise prefix reuse.",
@@ -99,6 +105,48 @@ def load_prompts(path: Path) -> list[dict[str, Any]]:
     return prompts
 
 
+def validate_context_budgets(
+    prompts: list[dict[str, Any]],
+    model: str,
+    max_model_len: int | None,
+) -> list[dict[str, Any]]:
+    if max_model_len is None:
+        return prompts
+    if max_model_len <= 0:
+        raise ValueError("--max-model-len must be positive")
+
+    # Import lazily so report comparison does not require model dependencies.
+    from transformers import AutoTokenizer
+
+    model_path = Path(model).expanduser()
+    tokenizer = AutoTokenizer.from_pretrained(
+        model,
+        trust_remote_code=True,
+        local_files_only=model_path.exists(),
+    )
+    validated_prompts = []
+    errors = []
+    for prompt in prompts:
+        prompt_tokens = len(tokenizer.encode(prompt["prompt"], add_special_tokens=False))
+        total_token_budget = prompt_tokens + prompt["max_tokens"]
+        validated_prompts.append(
+            {
+                **prompt,
+                "prompt_tokens": prompt_tokens,
+                "total_token_budget": total_token_budget,
+            }
+        )
+        if total_token_budget > max_model_len:
+            errors.append(
+                f"{prompt['id']}: prompt_tokens={prompt_tokens} + "
+                f"max_tokens={prompt['max_tokens']} = {total_token_budget} > "
+                f"max_model_len={max_model_len}"
+            )
+    if errors:
+        raise ValueError("Context budget exceeded:\n" + "\n".join(errors))
+    return validated_prompts
+
+
 def post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
@@ -118,8 +166,18 @@ def collect(args: argparse.Namespace) -> int:
     cases = []
     failures = 0
     endpoint = f"{args.base_url.rstrip('/')}/v1/completions"
-    for prompt in load_prompts(args.prompts):
-        print(f"{prompt['id']}: sending request", flush=True)
+    prompts = validate_context_budgets(
+        load_prompts(args.prompts),
+        args.model,
+        args.max_model_len,
+    )
+    for prompt in prompts:
+        token_budget = ""
+        if "prompt_tokens" in prompt:
+            token_budget = (
+                f" ({prompt['prompt_tokens']} prompt + {prompt['max_tokens']} output <= {args.max_model_len})"
+            )
+        print(f"{prompt['id']}: sending request{token_budget}", flush=True)
         payload = {
             "model": args.model,
             "prompt": prompt["prompt"],
@@ -146,6 +204,8 @@ def collect(args: argparse.Namespace) -> int:
                 "response": response,
                 "error": error,
                 "elapsed_seconds": elapsed_seconds,
+                "prompt_tokens": prompt.get("prompt_tokens"),
+                "total_token_budget": prompt.get("total_token_budget"),
             }
         )
         status = "PASS" if error is None else "FAIL"
@@ -157,6 +217,7 @@ def collect(args: argparse.Namespace) -> int:
         "model": args.model,
         "seed": args.seed,
         "warm_prefix": args.warm_prefix,
+        "max_model_len": args.max_model_len,
         "prompt_file": str(args.prompts),
         "cases": cases,
     }

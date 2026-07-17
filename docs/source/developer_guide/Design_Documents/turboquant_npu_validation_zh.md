@@ -19,8 +19,10 @@
 | `run_910b4_retest.sh` | store 对齐修复后的隔离复测和 Qwen3-0.6B 模型 smoke test |
 | `run_model_startup_debug.sh` | 单独启动 TurboQuant 服务并周期采集进程和 NPU 状态 |
 | `run_accuracy_comparison.sh` | 顺序启动两组服务并比较输出和 logprobs |
+| `run_serving_benchmark.sh` | 关闭 prefix cache，对比 KV 容量、TTFT 和 TPOT |
 | `run_performance_validation.sh` | 运行 batch/context/split 性能矩阵 |
 | `accuracy_eval.py` | 采集 OpenAI completion 响应并生成比较报告 |
+| `serving_benchmark.py` | 采集流式请求计时并生成 native/TurboQuant 对比报告 |
 | `summarize_profiles.py` | 汇总所有 `benchmark.json` |
 
 所有脚本都位于 `scripts/turboquant_triton/`。
@@ -193,6 +195,12 @@ NPU；脚本会记录 PID，并在成功、失败或中断时停止本次启动�
 - 重复 prefix；
 - 较长上下文中的末尾信息检索。
 
+长上下文用例默认按 `MAX_MODEL_LEN=2048` 留出生成空间。采集器会使用模型
+tokenizer 在发送请求前检查 `prompt_tokens + max_tokens`；任一用例超限时会在
+发出 completion 请求前列出用例 ID 和 token 预算，避免把测试配置错误误判为
+TurboQuant 运行错误。实际 token 数和总预算也会记录在 `base.json` 和
+`test.json` 中。
+
 每个请求使用：
 
 - `temperature=0`；
@@ -254,6 +262,40 @@ JSONL 每行格式为：
 ```bash
 PROMPTS=/path/to/custom_prompts.jsonl \
 bash scripts/turboquant_triton/run_accuracy_comparison.sh
+```
+
+### 6.5 服务性能与 KV Cache 压缩率
+
+使用相同模型配置顺序启动 native 和 TurboQuant 服务，并明确关闭 prefix cache：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+MODEL=/run/test_llm/Qwen3-0.6B-hf \
+TP_SIZE=1 \
+bash scripts/turboquant_triton/run_serving_benchmark.sh
+```
+
+默认 workload 为 1024 个输入 token、128 个输出 token、2 次预热和 10 次正式
+串行请求。每次请求都使用流式 completion 和 `ignore_eos=true`，以固定输出长度并
+分别记录 TTFT、TPOT、端到端延迟和 output token/s。TTFT 是请求发出到收到首个
+输出 token 的时间，TPOT 按
+`(末 token 时间 - 首 token 时间) / (输出 token 数 - 1)` 计算；SSE 尾包只计入
+端到端延迟，不计入 TPOT。
+
+脚本给两个服务都传递 `--no-enable-prefix-caching`，因此重复 prompt 不会获得
+prefix 命中。最终 `summary.md` 从两份 server log 的
+`GPU/NPU KV cache size: ... tokens` 计算同等内存预算下的容量倍率、估算
+bytes/token 比率和 KV 内存减少百分比。原始逐请求数据保存在 `native.json` 和
+`turboquant.json`，服务日志和 `comparison.json` 会一并归档。
+
+可用以下变量扩大重复次数或调整上下文，但必须满足
+`INPUT_TOKENS + OUTPUT_TOKENS <= MAX_MODEL_LEN`：
+
+```bash
+INPUT_TOKENS=1536 OUTPUT_TOKENS=256 \
+WARMUP_REQUESTS=3 MEASURE_REQUESTS=20 \
+MAX_MODEL_LEN=2048 \
+bash scripts/turboquant_triton/run_serving_benchmark.sh
 ```
 
 ## 7. 第三优先级：性能验证

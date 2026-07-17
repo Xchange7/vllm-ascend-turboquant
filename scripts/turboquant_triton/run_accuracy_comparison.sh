@@ -150,6 +150,7 @@ collect_results() {
         --output "${OUTPUT_DIR}/${label}.json"
         --label "${label}"
         --timeout "${REQUEST_TIMEOUT}"
+        --max-model-len "${MAX_MODEL_LEN}"
     )
     if [[ "${WARM_PREFIX}" == "1" ]]; then
         collect_args+=(--warm-prefix)
