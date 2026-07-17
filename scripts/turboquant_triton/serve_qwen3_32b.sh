@@ -13,8 +13,17 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-turboquant_4bit_nc}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 SPECULATIVE_CONFIG="${SPECULATIVE_CONFIG:-}"
 COMPILATION_CONFIG="${COMPILATION_CONFIG:-}"
+NETWORK_IFNAME="${NETWORK_IFNAME:-eth0}"
+
+if [[ ! -d "/sys/class/net/${NETWORK_IFNAME}" ]]; then
+    printf 'Network interface does not exist: %s\n' "${NETWORK_IFNAME}" >&2
+    exit 2
+fi
 
 export VLLM_USE_V2_MODEL_RUNNER=0
+export GLOO_SOCKET_IFNAME="${NETWORK_IFNAME}"
+export TP_SOCKET_IFNAME="${NETWORK_IFNAME}"
+export HCCL_SOCKET_IFNAME="${NETWORK_IFNAME}"
 
 EAGER_ARGS=()
 if [[ "${ENFORCE_EAGER}" == "1" ]]; then

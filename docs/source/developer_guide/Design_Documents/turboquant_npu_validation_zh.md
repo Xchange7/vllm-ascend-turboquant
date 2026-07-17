@@ -83,10 +83,11 @@ bash scripts/turboquant_triton/run_910b4_retest.sh
 `npu-smi info`。由此可以区分模型文件 I/O、API frontend、EngineCore spawn 和 NPU worker
 初始化阶段的阻塞。
 
-单机脚本默认设置 `VLLM_HOST_IP=127.0.0.1` 和 `GLOO_SOCKET_IFNAME=lo`。vLLM-Ascend
-即使在 world size 为 1 时也会创建多个 Gloo CPU group；loopback 可以避免每个 group 重复
-等待 hostname 或容器网卡解析。诊断脚本会在启动服务前执行单 rank Gloo probe，30 秒内
-不能完成则直接失败。多机部署不能使用这组 loopback 设置。
+测试脚本默认把 `GLOO_SOCKET_IFNAME`、`TP_SOCKET_IFNAME` 和
+`HCCL_SOCKET_IFNAME` 统一设置为 `eth0`。vLLM-Ascend 即使在 world size 为 1 时也会创建
+多个 Gloo CPU group，显式网卡可避免每个 group 重复进行错误的接口选择。诊断脚本会在
+启动服务前执行单 rank Gloo probe，30 秒内不能完成则直接失败。可通过
+`NETWORK_IFNAME=<interface>` 为其他服务器选择网卡。
 
 ### 3.3 端口和磁盘
 

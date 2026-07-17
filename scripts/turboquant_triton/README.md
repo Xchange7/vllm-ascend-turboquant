@@ -76,9 +76,10 @@ bash scripts/turboquant_triton/run_model_startup_debug.sh
 
 The watchdog prints the process state, child-process tree, latest server log,
 and NPU state every 30 seconds. Text logs are not excluded by the repository's
-`*.log` ignore rule. Because this is a single-node diagnostic, it defaults
-`VLLM_HOST_IP=127.0.0.1` and `GLOO_SOCKET_IFNAME=lo`, then requires a
-single-rank Gloo probe to finish within 30 seconds before starting vLLM.
+`*.log` ignore rule. It defaults `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, and
+`HCCL_SOCKET_IFNAME` to `eth0`, then requires a single-rank Gloo probe to
+finish within 30 seconds before starting vLLM. Set
+`NETWORK_IFNAME=<interface>` to select another NIC.
 
 To run correctness, eager/ACLGraph model comparison, native/TurboQuant
 accuracy comparison, and the kernel performance matrix in one command:

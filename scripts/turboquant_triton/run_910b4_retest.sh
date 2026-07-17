@@ -20,15 +20,16 @@ RUN_ACLGRAPH="${RUN_ACLGRAPH:-1}"
 RUN_MODEL_SMOKE="${RUN_MODEL_SMOKE:-1}"
 DEBUG_SYNC="${DEBUG_SYNC:-1}"
 MODEL_DEBUG_SYNC="${MODEL_DEBUG_SYNC:-0}"
+NETWORK_IFNAME="${NETWORK_IFNAME:-eth0}"
 FAILURES=0
 
 mkdir -p "${RUN_DIR}"
 printf 'stage\tstatus\texit_code\tlog\n' >"${RESULTS_FILE}"
 
-# This retest is single-node. Avoid repeated Gloo hostname/interface discovery
-# while vLLM creates its world and model-parallel CPU groups.
-export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
-export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
+# Keep all host-side collective transports on the server's configured NIC.
+export GLOO_SOCKET_IFNAME="${NETWORK_IFNAME}"
+export TP_SOCKET_IFNAME="${NETWORK_IFNAME}"
+export HCCL_SOCKET_IFNAME="${NETWORK_IFNAME}"
 export PYTHONFAULTHANDLER=1
 export TORCH_SHOW_CPP_STACKTRACES=1
 if [[ "${DEBUG_SYNC}" == "1" ]]; then
@@ -70,6 +71,11 @@ collect_source() {
 }
 
 cd "${REPO_ROOT}"
+
+if [[ ! -d "/sys/class/net/${NETWORK_IFNAME}" ]]; then
+    printf 'Network interface does not exist: %s\n' "${NETWORK_IFNAME}"
+    exit 2
+fi
 
 run_stage "00_source" "branch and commit used by the retest" collect_source
 run_stage \

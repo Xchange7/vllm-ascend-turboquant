@@ -15,6 +15,7 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-turboquant_4bit_nc}"
 SERVER_TIMEOUT="${SERVER_TIMEOUT:-600}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 GLOO_PROBE_TIMEOUT="${GLOO_PROBE_TIMEOUT:-30}"
+NETWORK_IFNAME="${NETWORK_IFNAME:-eth0}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/logs/turboquant/model_startup_${TIMESTAMP}}"
 SERVER_LOG="${OUTPUT_DIR}/turboquant_server.txt"
 DIAGNOSTIC_LOG="${OUTPUT_DIR}/startup_diagnostics.txt"
@@ -22,10 +23,10 @@ SERVER_PID=""
 
 mkdir -p "${OUTPUT_DIR}"
 
-# This diagnostic targets one host. Loopback removes hostname and container
-# route discovery from vLLM's TCP rendezvous and Gloo CPU groups.
-export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
-export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
+# Match the NIC configuration used by the vLLM-Ascend deployment examples.
+export GLOO_SOCKET_IFNAME="${NETWORK_IFNAME}"
+export TP_SOCKET_IFNAME="${NETWORK_IFNAME}"
+export HCCL_SOCKET_IFNAME="${NETWORK_IFNAME}"
 
 port_is_listening() {
     python3 -c '
@@ -99,6 +100,10 @@ if [[ ! -r "${MODEL}/config.json" ]]; then
     printf 'Model config is not readable: %s/config.json\n' "${MODEL}"
     exit 2
 fi
+if [[ ! -d "/sys/class/net/${NETWORK_IFNAME}" ]]; then
+    printf 'Network interface does not exist: %s\n' "${NETWORK_IFNAME}"
+    exit 2
+fi
 
 {
     printf 'Model: %s\n' "${MODEL}"
@@ -106,8 +111,9 @@ fi
     printf 'TP size: %s\n' "${TP_SIZE}"
     printf 'KV cache dtype: %s\n' "${KV_CACHE_DTYPE}"
     printf 'Visible devices: %s\n' "${ASCEND_RT_VISIBLE_DEVICES-<unset>}"
-    printf 'vLLM host IP: %s\n' "${VLLM_HOST_IP}"
     printf 'Gloo interface: %s\n' "${GLOO_SOCKET_IFNAME}"
+    printf 'TP interface: %s\n' "${TP_SOCKET_IFNAME}"
+    printf 'HCCL interface: %s\n' "${HCCL_SOCKET_IFNAME}"
     git rev-parse HEAD
 } | tee "${DIAGNOSTIC_LOG}"
 
@@ -118,16 +124,18 @@ import socket
 import time
 
 import torch.distributed as dist
+from vllm.utils.network_utils import get_ip
 
+host = get_ip()
 with socket.socket() as listener:
-    listener.bind(("127.0.0.1", 0))
+    listener.bind((host, 0))
     port = listener.getsockname()[1]
 
 started = time.perf_counter()
 group_timeout = datetime.timedelta(seconds=20)
 dist.init_process_group(
     "gloo",
-    init_method=f"tcp://127.0.0.1:{port}",
+    init_method=f"tcp://{host}:{port}",
     rank=0,
     world_size=1,
     timeout=group_timeout,
