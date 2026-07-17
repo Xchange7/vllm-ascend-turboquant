@@ -72,6 +72,10 @@ bash scripts/turboquant_triton/run_910b4_retest.sh
 完整 kernel、ACLGraph 和 native-vs-TurboQuant eager 模型对照，日志最终打包到
 `logs/turboquant/910b4_retest_<timestamp>.tar.gz`。
 
+`DEBUG_SYNC=1` 默认只用于 direct kernel 阶段。模型阶段会移除
+`ASCEND_LAUNCH_BLOCKING`，避免同步执行显著拖慢服务启动和逐 token 推理；只有定位模型级
+异步异常时才设置 `MODEL_DEBUG_SYNC=1`。等待服务期间脚本每 30 秒打印一次最新日志行。
+
 ### 3.3 端口和磁盘
 
 默认服务端口是 8000，确保没有其他进程占用。测试会在

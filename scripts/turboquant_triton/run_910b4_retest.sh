@@ -19,6 +19,7 @@ TQ_CACHE_DTYPE="${TQ_CACHE_DTYPE:-turboquant_4bit_nc}"
 RUN_ACLGRAPH="${RUN_ACLGRAPH:-1}"
 RUN_MODEL_SMOKE="${RUN_MODEL_SMOKE:-1}"
 DEBUG_SYNC="${DEBUG_SYNC:-1}"
+MODEL_DEBUG_SYNC="${MODEL_DEBUG_SYNC:-0}"
 FAILURES=0
 
 mkdir -p "${RUN_DIR}"
@@ -108,10 +109,14 @@ else
 fi
 
 if [[ "${RUN_MODEL_SMOKE}" == "1" ]]; then
+    MODEL_ENV=(env)
+    if [[ "${MODEL_DEBUG_SYNC}" != "1" ]]; then
+        MODEL_ENV+=(-u ASCEND_LAUNCH_BLOCKING)
+    fi
     run_stage \
         "06_qwen3_0_6b_eager" \
         "Qwen3-0.6B native versus TurboQuant eager requests" \
-        env \
+        "${MODEL_ENV[@]}" \
         MODEL="${MODEL}" \
         PORT="${PORT}" \
         TP_SIZE="${TP_SIZE}" \
@@ -132,6 +137,7 @@ fi
     printf 'Port: %s\n' "${PORT}"
     printf 'TP size: %s\n' "${TP_SIZE}"
     printf 'Debug sync: %s\n' "${DEBUG_SYNC}"
+    printf 'Model debug sync: %s\n' "${MODEL_DEBUG_SYNC}"
     printf 'Failed stages: %s\n\n' "${FAILURES}"
     column -t -s $'\t' "${RESULTS_FILE}" 2>/dev/null || cat "${RESULTS_FILE}"
 } >"${SUMMARY_FILE}"

@@ -119,6 +119,7 @@ def collect(args: argparse.Namespace) -> int:
     failures = 0
     endpoint = f"{args.base_url.rstrip('/')}/v1/completions"
     for prompt in load_prompts(args.prompts):
+        print(f"{prompt['id']}: sending request", flush=True)
         payload = {
             "model": args.model,
             "prompt": prompt["prompt"],
@@ -148,7 +149,7 @@ def collect(args: argparse.Namespace) -> int:
             }
         )
         status = "PASS" if error is None else "FAIL"
-        print(f"{prompt['id']}: {status} ({elapsed_seconds:.3f}s)")
+        print(f"{prompt['id']}: {status} ({elapsed_seconds:.3f}s)", flush=True)
 
     report = {
         "label": args.label,
