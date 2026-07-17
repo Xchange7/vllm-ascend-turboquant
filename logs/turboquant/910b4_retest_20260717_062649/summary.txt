@@ -1,0 +1,18 @@
+TurboQuant 910B4 post-fix retest
+Generated: 2026-07-17T06:33:35+00:00
+Model: /run/test_llm/Qwen3-0.6B-hf
+TP size: 1
+Debug sync: 1
+Failed stages: 2
+
+stage                status  exit_code  log
+00_source            PASS    0          00_source.log
+01_environment       PASS    0          01_environment.log
+02_backend           PASS    0          02_backend.log
+03_store_4bit-d64    PASS    0          03_store_4bit-d64.log
+03_store_4bit-d128   PASS    0          03_store_4bit-d128.log
+03_store_k3v4-d128   PASS    0          03_store_k3v4-d128.log
+03_store_3bit-d128   PASS    0          03_store_3bit-d128.log
+04_kernel_reference  PASS    0          04_kernel_reference.log
+05_aclgraph          FAIL    1          05_aclgraph.log
+06_qwen3_0_6b_eager  FAIL    1          06_qwen3_0_6b_eager.log
