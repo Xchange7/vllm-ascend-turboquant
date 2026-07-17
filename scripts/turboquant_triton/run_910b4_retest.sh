@@ -25,6 +25,10 @@ FAILURES=0
 mkdir -p "${RUN_DIR}"
 printf 'stage\tstatus\texit_code\tlog\n' >"${RESULTS_FILE}"
 
+# This retest is single-node. Avoid repeated Gloo hostname/interface discovery
+# while vLLM creates its world and model-parallel CPU groups.
+export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
 export PYTHONFAULTHANDLER=1
 export TORCH_SHOW_CPP_STACKTRACES=1
 if [[ "${DEBUG_SYNC}" == "1" ]]; then

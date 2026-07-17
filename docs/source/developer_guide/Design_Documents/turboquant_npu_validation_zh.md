@@ -17,6 +17,7 @@
 | `run_npu_validation.sh` | 按正确性、精度、性能顺序执行全部测试 |
 | `run_diagnostic_suite.sh` | 环境、backend、KV Cache、kernel 和 ACLGraph 单测 |
 | `run_910b4_retest.sh` | store 对齐修复后的隔离复测和 Qwen3-0.6B 模型 smoke test |
+| `run_model_startup_debug.sh` | 单独启动 TurboQuant 服务并周期采集进程和 NPU 状态 |
 | `run_accuracy_comparison.sh` | 顺序启动两组服务并比较输出和 logprobs |
 | `run_performance_validation.sh` | 运行 batch/context/split 性能矩阵 |
 | `accuracy_eval.py` | 采集 OpenAI completion 响应并生成比较报告 |
@@ -75,6 +76,17 @@ bash scripts/turboquant_triton/run_910b4_retest.sh
 `DEBUG_SYNC=1` 默认只用于 direct kernel 阶段。模型阶段会移除
 `ASCEND_LAUNCH_BLOCKING`，避免同步执行显著拖慢服务启动和逐 token 推理；只有定位模型级
 异步异常时才设置 `MODEL_DEBUG_SYNC=1`。等待服务期间脚本每 30 秒打印一次最新日志行。
+
+如果服务进程一直存活但 NPU 显存没有变化，使用 `run_model_startup_debug.sh` 绕过 native
+精度基线。该脚本先在 60 秒超时内离线读取模型 config，再只启动
+`turboquant_4bit_nc` eager 服务；等待期间周期打印主进程状态、子进程树、server log 尾部和
+`npu-smi info`。由此可以区分模型文件 I/O、API frontend、EngineCore spawn 和 NPU worker
+初始化阶段的阻塞。
+
+单机脚本默认设置 `VLLM_HOST_IP=127.0.0.1` 和 `GLOO_SOCKET_IFNAME=lo`。vLLM-Ascend
+即使在 world size 为 1 时也会创建多个 Gloo CPU group；loopback 可以避免每个 group 重复
+等待 hostname 或容器网卡解析。诊断脚本会在启动服务前执行单 rank Gloo probe，30 秒内
+不能完成则直接失败。多机部署不能使用这组 loopback 设置。
 
 ### 3.3 端口和磁盘
 

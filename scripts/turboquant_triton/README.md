@@ -65,6 +65,21 @@ Kernel stages use synchronous launches for precise error attribution, while
 the model stage removes `ASCEND_LAUNCH_BLOCKING` by default. Set
 `MODEL_DEBUG_SYNC=1` only when diagnosing an asynchronous model-level error.
 
+If the model stage stays alive without allocating NPU memory, bypass the
+native comparison and run one TurboQuant server with a startup watchdog:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+MODEL=/run/test_llm/Qwen3-0.6B-hf \
+bash scripts/turboquant_triton/run_model_startup_debug.sh
+```
+
+The watchdog prints the process state, child-process tree, latest server log,
+and NPU state every 30 seconds. Text logs are not excluded by the repository's
+`*.log` ignore rule. Because this is a single-node diagnostic, it defaults
+`VLLM_HOST_IP=127.0.0.1` and `GLOO_SOCKET_IFNAME=lo`, then requires a
+single-rank Gloo probe to finish within 30 seconds before starting vLLM.
+
 To run correctness, eager/ACLGraph model comparison, native/TurboQuant
 accuracy comparison, and the kernel performance matrix in one command:
 
