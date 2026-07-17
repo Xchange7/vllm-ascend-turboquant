@@ -11,6 +11,7 @@ RESULTS_FILE="${RUN_DIR}/results.tsv"
 SUMMARY_FILE="${RUN_DIR}/summary.txt"
 
 MODEL="${MODEL:-/run/test_llm/Qwen3-0.6B-hf}"
+PORT="${PORT:-18000}"
 TP_SIZE="${TP_SIZE:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
@@ -112,6 +113,7 @@ if [[ "${RUN_MODEL_SMOKE}" == "1" ]]; then
         "Qwen3-0.6B native versus TurboQuant eager requests" \
         env \
         MODEL="${MODEL}" \
+        PORT="${PORT}" \
         TP_SIZE="${TP_SIZE}" \
         MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
         MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
@@ -127,6 +129,7 @@ fi
     printf 'TurboQuant 910B4 post-fix retest\n'
     printf 'Generated: %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
     printf 'Model: %s\n' "${MODEL}"
+    printf 'Port: %s\n' "${PORT}"
     printf 'TP size: %s\n' "${TP_SIZE}"
     printf 'Debug sync: %s\n' "${DEBUG_SYNC}"
     printf 'Failed stages: %s\n\n' "${FAILURES}"

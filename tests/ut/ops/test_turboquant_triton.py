@@ -579,6 +579,8 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
     impl.num_heads = num_query_heads
     impl.head_size = head_dim
     impl.scale = 1 / math.sqrt(head_dim)
+    impl.alibi_slopes = None
+    impl.logits_soft_cap = None
     impl.tq_config = config
     impl.max_num_kv_splits = num_splits
     output = torch.empty_like(query)

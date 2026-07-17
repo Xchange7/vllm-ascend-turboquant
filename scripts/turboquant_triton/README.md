@@ -59,6 +59,9 @@ TP_SIZE=1 \
 bash scripts/turboquant_triton/run_910b4_retest.sh
 ```
 
+The retest uses port `18000` by default and refuses to start if any process is
+already listening there. Override it with `PORT=<free-port>` when necessary.
+
 To run correctness, eager/ACLGraph model comparison, native/TurboQuant
 accuracy comparison, and the kernel performance matrix in one command:
 

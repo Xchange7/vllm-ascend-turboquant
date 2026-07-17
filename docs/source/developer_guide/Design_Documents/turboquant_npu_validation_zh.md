@@ -67,7 +67,8 @@ bash scripts/turboquant_triton/run_910b4_retest.sh
 ```
 
 该脚本默认使用 `MAX_MODEL_LEN=2048`、`MAX_NUM_SEQS=2` 和
-`turboquant_4bit_nc`。它会让四种 store 对齐 case 分别运行在独立 pytest 进程，再运行
+`turboquant_4bit_nc`，服务端口默认为 `18000`。它会让四种 store 对齐 case 分别运行在
+独立 pytest 进程，再运行
 完整 kernel、ACLGraph 和 native-vs-TurboQuant eager 模型对照，日志最终打包到
 `logs/turboquant/910b4_retest_<timestamp>.tar.gz`。
 

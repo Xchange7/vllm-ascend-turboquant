@@ -17,6 +17,8 @@
 
 import importlib.metadata
 import inspect
+import subprocess
+from pathlib import Path
 
 import torch
 import torch_npu  # noqa: F401
@@ -29,6 +31,7 @@ from vllm.model_executor.layers.quantization.turboquant.config import (
 )
 from vllm.v1.kv_cache_interface import TQFullAttentionSpec
 
+import vllm_ascend
 from vllm_ascend.attention.turboquant import AscendTurboQuantAttentionBackend
 
 
@@ -37,6 +40,17 @@ def _version(distribution: str) -> str:
         return importlib.metadata.version(distribution)
     except importlib.metadata.PackageNotFoundError:
         return "editable/unknown"
+
+
+def _source_commit(module_file: str) -> str:
+    repository = Path(module_file).resolve().parents[1]
+    result = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
 def main() -> None:
@@ -77,6 +91,8 @@ def main() -> None:
     print(f"vLLM:          {vllm.__version__}")
     print(f"vLLM source:   {vllm.__file__}")
     print(f"vLLM Ascend:   {_version('vllm-ascend')}")
+    print(f"Ascend source: {vllm_ascend.__file__}")
+    print(f"Ascend commit: {_source_commit(vllm_ascend.__file__)}")
     print(f"torch:         {torch.__version__}")
     print(f"torch-npu:     {_version('torch-npu')}")
     print(f"Triton:        {triton.__version__}")

@@ -33,6 +33,17 @@ WARM_PREFIX="${WARM_PREFIX:-1}"
 SERVER_PID=""
 mkdir -p "${OUTPUT_DIR}"
 
+port_is_listening() {
+    python3 -c '
+import socket
+import sys
+
+with socket.socket() as sock:
+    sock.settimeout(1)
+    sys.exit(sock.connect_ex(("127.0.0.1", int(sys.argv[1]))) != 0)
+' "${PORT}"
+}
+
 stop_server() {
     if [[ -z "${SERVER_PID}" ]]; then
         return
@@ -53,12 +64,12 @@ stop_server() {
     SERVER_PID=""
 
     for _ in $(seq 1 60); do
-        if ! curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+        if ! port_is_listening; then
             return
         fi
         sleep 1
     done
-    printf 'Port %s still serves /health after stopping the test server.\n' "${PORT}"
+    printf 'Port %s is still listening after stopping the test server.\n' "${PORT}"
     return 1
 }
 
@@ -139,8 +150,8 @@ collect_results() {
 }
 
 cd "${REPO_ROOT}"
-if curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-    printf 'Port %s already has a healthy server; refusing to test the wrong process.\n' "${PORT}"
+if port_is_listening; then
+    printf 'Port %s is already in use; refusing to test the wrong process.\n' "${PORT}"
     exit 2
 fi
 python3 "${SCRIPT_DIR}/check_environment.py" | tee "${OUTPUT_DIR}/environment.log"
