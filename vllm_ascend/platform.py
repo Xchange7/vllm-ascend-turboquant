@@ -34,6 +34,10 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.kv_cache.turboquant import (
+    is_turboquant_kv_cache_dtype,
+    validate_turboquant_backend,
+)
 
 # isort: off
 from vllm_ascend.utils import (
@@ -297,6 +301,17 @@ class NPUPlatform(Platform):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
+        if cache_config and is_turboquant_kv_cache_dtype(cache_config.cache_dtype):
+            speculative_config = vllm_config.speculative_config
+            if speculative_config is not None and getattr(speculative_config, "parallel_drafting", False):
+                raise NotImplementedError("Ascend TurboQuant does not currently support parallel drafting.")
+            if vllm_config.kv_transfer_config is not None:
+                raise NotImplementedError("Ascend TurboQuant does not currently support KV transfer.")
+            context_parallel_size = (
+                parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
+            )
+            if context_parallel_size > 1:
+                raise NotImplementedError("Ascend TurboQuant does not currently support context parallelism.")
         ascend_compilation_config = ascend_config.ascend_compilation_config
         if ascend_compilation_config:
             vllm_config.additional_config.setdefault("ascend_compilation_config", {}).update(
@@ -606,6 +621,23 @@ class NPUPlatform(Platform):
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
         use_compress = getattr(attn_selector_config, "use_compress", False)
         key = (attn_selector_config.use_mla, attn_selector_config.use_sparse)
+
+        validate_turboquant_backend(
+            attn_selector_config.kv_cache_dtype,
+            head_dim=attn_selector_config.head_size,
+            use_mla=attn_selector_config.use_mla,
+            use_sparse=attn_selector_config.use_sparse,
+            use_compress=use_compress,
+            use_v2_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
+            is_310p_device=is_310p(),
+            has_sink=attn_selector_config.has_sink,
+            use_mm_prefix=attn_selector_config.use_mm_prefix,
+            use_non_causal=attn_selector_config.use_non_causal,
+            use_batch_invariant=attn_selector_config.use_batch_invariant,
+        )
+        if is_turboquant_kv_cache_dtype(attn_selector_config.kv_cache_dtype):
+            logger.info_once("Using the Ascend Triton TurboQuant attention backend.")
+            return "vllm_ascend.attention.turboquant.AscendTurboQuantAttentionBackend"
 
         if selected_backend == AttentionBackendEnum.FLASH_ATTN and cls._validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"

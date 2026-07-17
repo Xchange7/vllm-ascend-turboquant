@@ -16,5 +16,9 @@ add_custom_aclnn_op
 context_parallel
 dynamic_chunked_pipeline_parallel
 quantization
+turboquant_code_walkthrough_zh
+turboquant_implementation_zh
+turboquant_limitations_zh
+turboquant_npu_validation_zh
 npugraph_ex
 :::

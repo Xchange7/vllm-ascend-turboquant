@@ -64,6 +64,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -3628,8 +3629,24 @@ class NPUModelRunner(GPUModelRunner):
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
-                # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
+                current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                 if (
+                    isinstance(current_kv_cache_spec, TQFullAttentionSpec)
+                    and layer_name not in kv_cache_raw_tensors
+                ):
+                    if self.vllm_config.kv_transfer_config is not None:
+                        raise NotImplementedError(
+                            "Ascend TurboQuant does not currently support KV transfer."
+                        )
+                    tensor = torch.zeros(
+                        kv_cache_tensor.size,
+                        dtype=torch.int8,
+                        device=self.device,
+                    )
+                    for layer_name_inner in kv_cache_tensor.shared_by:
+                        kv_cache_raw_tensors[layer_name_inner] = tensor
+                # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
+                elif (
                     "linear_attn" in layer_name
                     or self.hybrid_with_attn_and_mamba
                     or "cache_only_layers" in layer_name
@@ -3663,7 +3680,6 @@ class NPUModelRunner(GPUModelRunner):
                     # as it only support the 0-dim of kv_cache is `num_blocks`.
                     # For deepseek mla, we need to spilt cache tensor accrodding to the nope head dim
                     # and rope head dim.
-                    current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
                     if self.use_sparse:
@@ -3840,6 +3856,31 @@ class NPUModelRunner(GPUModelRunner):
                                            )
 
                     kv_caches[layer_name] = kv_cache
+                elif isinstance(current_kv_cache_spec, TQFullAttentionSpec):
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor is not None
+                    assert (
+                        raw_tensor.numel()
+                        % current_kv_cache_spec.page_size_bytes
+                        == 0
+                    )
+                    num_blocks = (
+                        raw_tensor.numel()
+                        // current_kv_cache_spec.page_size_bytes
+                    )
+                    assert num_blocks >= kv_cache_config.num_blocks
+                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                        num_blocks,
+                        current_kv_cache_spec.block_size,
+                        current_kv_cache_spec.num_kv_heads,
+                        current_kv_cache_spec.head_size,
+                        cache_dtype_str=(
+                            self.vllm_config.cache_config.cache_dtype
+                        ),
+                    )
+                    kv_caches[layer_name] = raw_tensor.view(
+                        current_kv_cache_spec.dtype
+                    ).view(kv_cache_shape)
                 elif isinstance(current_kv_cache_spec, AttentionSpec):
                     # cache_only_layers (extract_hidden_states) are allocated
                     # as a single tensor by the branch at the top of

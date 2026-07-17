@@ -5,6 +5,7 @@ import pytest
 import torch
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.platforms import PlatformEnum
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.selector import AttentionSelectorConfig  # type: ignore
 
 from tests.ut.base import TestBase
@@ -723,6 +724,37 @@ class TestNPUPlatform(TestBase):
         )
         result = self.platform.get_attn_backend_cls("ascend", attn_selector_config)
         self.assertEqual(result, "vllm_ascend.attention.attention_v1.AscendAttentionBackend")
+
+    @patch("vllm_ascend.platform.is_310p", return_value=False)
+    def test_get_attn_backend_cls_uses_turboquant(self, _mock_is_310p):
+        attn_selector_config = AttentionSelectorConfig(
+            dtype=torch.float16,
+            head_size=128,
+            kv_cache_dtype="turboquant_4bit_nc",
+            block_size=128,
+            use_mla=False,
+            use_sparse=False,
+        )
+
+        result = self.platform.get_attn_backend_cls("ascend", attn_selector_config)
+
+        self.assertEqual(
+            result,
+            "vllm_ascend.attention.turboquant.AscendTurboQuantAttentionBackend",
+        )
+
+    def test_turboquant_supports_uniform_batch_graph_capture(self):
+        from vllm_ascend.attention.turboquant import (
+            AscendTurboQuantMetadataBuilder,
+        )
+
+        self.assertEqual(
+            AscendTurboQuantMetadataBuilder.get_cudagraph_support(
+                MagicMock(),
+                MagicMock(),
+            ),
+            AttentionCGSupport.UNIFORM_BATCH,
+        )
 
     def test_get_punica_wrapper(self):
         result = self.platform.get_punica_wrapper()
