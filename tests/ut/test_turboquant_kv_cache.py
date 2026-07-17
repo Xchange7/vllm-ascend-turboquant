@@ -304,7 +304,11 @@ def test_turboquant_builder_routes_all_decode_tokens_to_packed_path():
         result = builder.build(0, common_attn_metadata)
 
     assert result.attn_state is AscendAttentionState.DecodeOnly
-    assert result.seq_lens is common_attn_metadata.seq_lens
+    assert result.seq_lens.data_ptr() == common_attn_metadata.seq_lens.data_ptr()
+    torch.testing.assert_close(
+        result.seq_lens,
+        common_attn_metadata.seq_lens[: common_attn_metadata.num_reqs],
+    )
 
 
 @pytest.mark.parametrize(
@@ -612,6 +616,7 @@ def test_turboquant_feature_prefill_applies_softcap_alibi_and_causal_mask():
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_heads = 2
     impl.num_kv_heads = 1
+    impl.head_size = 1
     impl.scale = 1.0
     impl.logits_soft_cap = 2.0
     impl.alibi_slopes = torch.tensor([1.0, 0.5])

@@ -20,6 +20,64 @@ import math
 import torch
 from vllm.triton_utils import tl, triton
 
+ASCEND_UB_ALIGNMENT_BYTES = 32
+
+
+@triton.jit
+def _quantize_key_coordinates(
+    rotated_key_ptr,
+    midpoint_ptr,
+    vector_base,
+    coordinate_offsets,
+    coordinate_mask,
+    KEY_BITS: tl.constexpr,
+    NUM_CENTROIDS: tl.constexpr,
+    PACK_SIZE: tl.constexpr,
+):
+    rotated_key = tl.load(
+        rotated_key_ptr + vector_base + coordinate_offsets,
+        mask=coordinate_mask,
+        other=0.0,
+    )
+    low = tl.zeros([PACK_SIZE], dtype=tl.int32)
+    high = tl.full([PACK_SIZE], NUM_CENTROIDS - 1, dtype=tl.int32)
+    for _ in range(KEY_BITS):
+        middle = (low + high) >> 1
+        safe_middle = tl.minimum(middle, NUM_CENTROIDS - 2)
+        midpoint = tl.load(
+            midpoint_ptr + safe_middle,
+            mask=coordinate_mask,
+            other=0.0,
+        )
+        move_right = rotated_key >= midpoint
+        low = tl.where(move_right, middle + 1, low)
+        high = tl.where(move_right, high, middle)
+    return tl.minimum(low, NUM_CENTROIDS - 1)
+
+
+@triton.jit
+def _quantize_value_coordinates(
+    value_ptr,
+    value_base,
+    coordinate_offsets,
+    coordinate_mask,
+    value_min,
+    scale,
+    levels,
+):
+    value = tl.load(
+        value_ptr + value_base + coordinate_offsets,
+        mask=coordinate_mask,
+        other=0.0,
+    ).to(tl.float32)
+    return tl.minimum(
+        tl.maximum(
+            ((value - value_min) / scale + 0.5).to(tl.int32),
+            0,
+        ),
+        levels,
+    )
+
 
 @triton.jit
 def _store_quantized_value(
@@ -52,37 +110,52 @@ def _store_quantized_value(
     )
     levels = (1 << VALUE_BITS) - 1
     scale = tl.maximum((value_max - value_min) / levels, 1e-8)
-    quantized = tl.minimum(
-        tl.maximum(
-            ((value - value_min) / scale + 0.5).to(tl.int32),
-            0,
-        ),
-        levels,
-    )
 
     value_slot_base = slot_base + KPS
     if VALUE_BITS == 4:
-        pairs = tl.reshape(quantized, [BLOCK_D // 2, 2])
-        shifts = tl.arange(0, 2) * 4
-        packed = tl.sum(
-            (pairs & 0xF) << shifts[None, :],
-            axis=1,
-        ).to(tl.uint8)
         byte_offsets = tl.arange(0, BLOCK_D // 2)
+        even_offsets = byte_offsets * 2
+        odd_offsets = even_offsets + 1
+        even = _quantize_value_coordinates(
+            value_ptr,
+            value_base,
+            even_offsets,
+            even_offsets < D,
+            value_min,
+            scale,
+            levels,
+        )
+        odd = _quantize_value_coordinates(
+            value_ptr,
+            value_base,
+            odd_offsets,
+            odd_offsets < D,
+            value_min,
+            scale,
+            levels,
+        )
+        packed = ((even & 0xF) | ((odd & 0xF) << 4)).to(tl.uint8)
         tl.store(
             cache_u8_ptr + value_slot_base + byte_offsets,
             packed,
             mask=byte_offsets < VALUE_DATA_BYTES,
         )
     else:
-        groups = tl.reshape(quantized, [BLOCK_GROUPS, 8])
-        shifts = tl.arange(0, 8) * 3
-        packed_24 = tl.sum(
-            (groups & 0x7) << shifts[None, :],
-            axis=1,
-        )
         group_offsets = tl.arange(0, BLOCK_GROUPS)
         group_mask = group_offsets < (D // 8)
+        packed_24 = tl.zeros([BLOCK_GROUPS], dtype=tl.int32)
+        for coordinate in range(8):
+            coordinate_offsets = group_offsets * 8 + coordinate
+            quantized = _quantize_value_coordinates(
+                value_ptr,
+                value_base,
+                coordinate_offsets,
+                group_mask,
+                value_min,
+                scale,
+                levels,
+            )
+            packed_24 = packed_24 | ((quantized & 0x7) << (coordinate * 3))
         tl.store(
             cache_u8_ptr + value_slot_base + group_offsets * 3,
             (packed_24 & 0xFF).to(tl.uint8),
@@ -154,49 +227,54 @@ def _turboquant_store_kernel(
     vector_base = program_id * D
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < D
-    rotated_key = tl.load(
-        rotated_key_ptr + vector_base + d_offsets,
-        mask=d_mask,
-        other=0.0,
-    )
-
-    low = tl.zeros([BLOCK_D], dtype=tl.int32)
-    high = tl.full([BLOCK_D], NUM_CENTROIDS - 1, dtype=tl.int32)
-    for _ in range(KEY_BITS):
-        middle = (low + high) >> 1
-        safe_middle = tl.minimum(middle, NUM_CENTROIDS - 2)
-        midpoint = tl.load(
-            midpoint_ptr + safe_middle,
-            mask=d_mask,
-            other=0.0,
-        )
-        move_right = rotated_key >= midpoint
-        low = tl.where(move_right, middle + 1, low)
-        high = tl.where(move_right, high, middle)
-    centroid_index = tl.minimum(low, NUM_CENTROIDS - 1)
 
     if KEY_BITS == 4:
-        pairs = tl.reshape(centroid_index, [BLOCK_D // 2, 2])
-        shifts = tl.arange(0, 2) * 4
-        packed = tl.sum(
-            (pairs & 0xF) << shifts[None, :],
-            axis=1,
-        ).to(tl.uint8)
         byte_offsets = tl.arange(0, BLOCK_D // 2)
+        even_offsets = byte_offsets * 2
+        odd_offsets = even_offsets + 1
+        even = _quantize_key_coordinates(
+            rotated_key_ptr,
+            midpoint_ptr,
+            vector_base,
+            even_offsets,
+            even_offsets < D,
+            KEY_BITS=KEY_BITS,
+            NUM_CENTROIDS=NUM_CENTROIDS,
+            PACK_SIZE=BLOCK_D // 2,
+        )
+        odd = _quantize_key_coordinates(
+            rotated_key_ptr,
+            midpoint_ptr,
+            vector_base,
+            odd_offsets,
+            odd_offsets < D,
+            KEY_BITS=KEY_BITS,
+            NUM_CENTROIDS=NUM_CENTROIDS,
+            PACK_SIZE=BLOCK_D // 2,
+        )
+        packed = ((even & 0xF) | ((odd & 0xF) << 4)).to(tl.uint8)
         tl.store(
             cache_u8_ptr + slot_base + byte_offsets,
             packed,
             mask=byte_offsets < MSE_BYTES,
         )
     else:
-        groups = tl.reshape(centroid_index, [BLOCK_GROUPS, 8])
-        shifts = tl.arange(0, 8) * 3
-        packed_24 = tl.sum(
-            (groups & 0x7) << shifts[None, :],
-            axis=1,
-        )
         group_offsets = tl.arange(0, BLOCK_GROUPS)
         group_mask = group_offsets < (D // 8)
+        packed_24 = tl.zeros([BLOCK_GROUPS], dtype=tl.int32)
+        for coordinate in range(8):
+            coordinate_offsets = group_offsets * 8 + coordinate
+            centroid_index = _quantize_key_coordinates(
+                rotated_key_ptr,
+                midpoint_ptr,
+                vector_base,
+                coordinate_offsets,
+                group_mask,
+                KEY_BITS=KEY_BITS,
+                NUM_CENTROIDS=NUM_CENTROIDS,
+                PACK_SIZE=BLOCK_GROUPS,
+            )
+            packed_24 = packed_24 | ((centroid_index & 0x7) << (coordinate * 3))
         tl.store(
             cache_u8_ptr + slot_base + group_offsets * 3,
             (packed_24 & 0xFF).to(tl.uint8),
@@ -258,7 +336,7 @@ def triton_turboquant_store(
     num_tokens, num_kv_heads, head_dim = key.shape
     if num_tokens == 0:
         return
-    if head_dim % 32 != 0:
+    if head_dim % ASCEND_UB_ALIGNMENT_BYTES != 0:
         raise ValueError(f"TurboQuant Triton packing requires head_dim % 32 == 0, got {head_dim}.")
 
     num_vectors = num_tokens * num_kv_heads
@@ -273,7 +351,10 @@ def triton_turboquant_store(
     value_contiguous = value.reshape(num_vectors, head_dim).contiguous()
 
     block_d = triton.next_power_of_2(head_dim)
-    block_groups = block_d // 8
+    # Ascend vector operations and UB transfers require at least one aligned
+    # 32-byte data block. Pad 3-bit packing lanes and mask inactive groups;
+    # the external packed slot layout remains unchanged.
+    block_groups = max(ASCEND_UB_ALIGNMENT_BYTES, block_d // 8)
     mse_bytes = math.ceil(head_dim * key_bits / 8)
     value_data_bytes = math.ceil(head_dim * value_bits / 8)
     metadata_offsets = (

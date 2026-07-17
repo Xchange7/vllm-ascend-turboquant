@@ -103,6 +103,49 @@ def test_turboquant_negative_slot_mapping_does_not_write_cache():
 
 @npu_test(num_npus=1, npu_type="a2")
 @pytest.mark.parametrize(
+    ("cache_dtype", "head_dim"),
+    [
+        pytest.param("turboquant_4bit_nc", 64, id="4bit-d64"),
+        pytest.param("turboquant_4bit_nc", 128, id="4bit-d128"),
+        pytest.param("turboquant_k3v4_nc", 128, id="k3v4-d128"),
+        pytest.param("turboquant_3bit_nc", 128, id="3bit-d128"),
+    ],
+)
+def test_turboquant_store_writes_valid_slots(cache_dtype, head_dim):
+    """Compile and execute only the positive-slot store path."""
+    torch.manual_seed(1)
+    config, hadamard, _, midpoints = _constants(cache_dtype, head_dim)
+    key = torch.randn(2, 2, head_dim, dtype=torch.float16, device="npu")
+    value = torch.randn_like(key)
+    cache = torch.zeros(
+        2,
+        128,
+        2,
+        config.slot_size_aligned,
+        dtype=torch.uint8,
+        device="npu",
+    )
+    slot_mapping = torch.tensor([0, 129], dtype=torch.int64, device="npu")
+
+    triton_turboquant_store(
+        key,
+        value,
+        cache,
+        slot_mapping,
+        hadamard,
+        midpoints,
+        key_bits=config.key_quant_bits,
+        key_packed_size=config.key_packed_size,
+        value_bits=config.value_quant_bits,
+    )
+    torch.npu.synchronize()
+
+    assert torch.count_nonzero(cache[0, 0].cpu()) > 0
+    assert torch.count_nonzero(cache[1, 1].cpu()) > 0
+
+
+@npu_test(num_npus=1, npu_type="a2")
+@pytest.mark.parametrize(
     (
         "cache_dtype",
         "query_len",
@@ -188,6 +231,9 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
     )
+    # Triton launches asynchronously. Surface a store-kernel failure here so
+    # it cannot poison the stream and masquerade as a later dequant/FIA error.
+    torch.npu.synchronize()
 
     key_rotated = torch.empty_like(key)
     value_dense = torch.empty_like(value)
@@ -205,6 +251,7 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         value_bits=config.value_quant_bits,
         norm_correction=config.norm_correction,
     )
+    torch.npu.synchronize()
     key_dense = (key_rotated.float().reshape(-1, head_dim) @ hadamard).view_as(key_rotated)
 
     num_splits = 4
@@ -263,6 +310,7 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         alibi_slopes=alibi_slopes,
         logits_soft_cap=logits_soft_cap,
     )
+    torch.npu.synchronize()
 
     kv_head_indices = torch.arange(num_query_heads, device="npu") // (num_query_heads // num_kv_heads)
     expanded_key = key_dense[:, kv_head_indices].float()
@@ -336,6 +384,7 @@ def test_turboquant_zero_keys_and_constant_values_remain_finite(
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
     )
+    torch.npu.synchronize()
     buffers = SimpleNamespace(
         _tq_mid_o_buf=torch.empty(
             1,
@@ -374,6 +423,7 @@ def test_turboquant_zero_keys_and_constant_values_remain_finite(
         max_num_kv_splits=num_splits,
         buffer_holder=buffers,
     )
+    torch.npu.synchronize()
 
     assert torch.isfinite(result).all()
     torch.testing.assert_close(
@@ -468,6 +518,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
     )
+    torch.npu.synchronize()
     cache.zero_()
     triton_turboquant_store(
         history_key,
@@ -480,6 +531,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
     )
+    torch.npu.synchronize()
 
     layer = SimpleNamespace(
         _tq_mid_o_buf=torch.empty(

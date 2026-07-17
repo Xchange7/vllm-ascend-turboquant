@@ -12,7 +12,7 @@ centroids, and layer workspaces.
 - `torch==2.10.0`, `torch-npu==2.10.0`, and `triton-ascend==3.2.1`.
 - vLLM `0.20.2` or `0.20.2+empty` from the same environment used to launch
   the server.
-- Qwen3-32B weights accessible through `MODEL`.
+- Qwen3-0.6B or Qwen3-32B weights accessible through `MODEL`.
 
 Install this checkout after installing the matching vLLM core:
 
@@ -47,6 +47,17 @@ profile under `logs/turboquant/diagnostic_<timestamp>/`. It also creates a
 `.tar.gz` archive next to that directory. Set `RUN_PROFILE=0` to skip the short
 profile, `DEBUG_SYNC=1` to diagnose an asynchronous kernel failure, or
 `COLLECT_PROFILE_TRACE=1` to include torch-npu profiler traces.
+
+After a store-kernel alignment failure, use the isolated 910B4 retest. Each
+positive-slot store preset runs in a fresh pytest process before the full
+kernel, ACLGraph, and model checks:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+MODEL=/run/test_llm/Qwen3-0.6B-hf \
+TP_SIZE=1 \
+bash scripts/turboquant_triton/run_910b4_retest.sh
+```
 
 To run correctness, eager/ACLGraph model comparison, native/TurboQuant
 accuracy comparison, and the kernel performance matrix in one command:

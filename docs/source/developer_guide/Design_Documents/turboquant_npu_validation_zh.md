@@ -16,6 +16,7 @@
 | --- | --- |
 | `run_npu_validation.sh` | 按正确性、精度、性能顺序执行全部测试 |
 | `run_diagnostic_suite.sh` | 环境、backend、KV Cache、kernel 和 ACLGraph 单测 |
+| `run_910b4_retest.sh` | store 对齐修复后的隔离复测和 Qwen3-0.6B 模型 smoke test |
 | `run_accuracy_comparison.sh` | 顺序启动两组服务并比较输出和 logprobs |
 | `run_performance_validation.sh` | 运行 batch/context/split 性能矩阵 |
 | `accuracy_eval.py` | 采集 OpenAI completion 响应并生成比较报告 |
@@ -33,7 +34,7 @@
 - vLLM core 是与该分支匹配的 `0.20.2`/`0.20.2+empty`；
 - 当前 vLLM Ascend checkout 已安装为 editable package；
 - `which vllm` 和 `python3 -c 'import vllm; print(vllm.__file__)'` 指向预期环境；
-- Qwen3-32B 权重路径可读。
+- Qwen3-0.6B 或 Qwen3-32B 权重路径可读。
 
 推荐执行：
 
@@ -55,6 +56,20 @@ export MAX_NUM_SEQS=4
 ```
 
 Qwen3-32B BF16 权重通常不适合在单张 64 GiB NPU 上完成有意义的 KV Cache 测试。
+
+首轮建议在单张 910B4 上使用 Qwen3-0.6B：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+MODEL=/run/test_llm/Qwen3-0.6B-hf \
+TP_SIZE=1 \
+bash scripts/turboquant_triton/run_910b4_retest.sh
+```
+
+该脚本默认使用 `MAX_MODEL_LEN=2048`、`MAX_NUM_SEQS=2` 和
+`turboquant_4bit_nc`。它会让四种 store 对齐 case 分别运行在独立 pytest 进程，再运行
+完整 kernel、ACLGraph 和 native-vs-TurboQuant eager 模型对照，日志最终打包到
+`logs/turboquant/910b4_retest_<timestamp>.tar.gz`。
 
 ### 3.3 端口和磁盘
 
@@ -330,6 +345,20 @@ bash scripts/turboquant_triton/run_diagnostic_suite.sh
 ```
 
 性能测试前必须取消 `ASCEND_LAUNCH_BLOCKING`。
+
+如果日志包含错误码 `507035` 和 `The UB address accessed by the VEC instruction is not
+aligned`，这是 Ascend Vector Core 的 UB 对齐错误。按以下顺序处理：
+
+1. 找到第一个使用非负 `slot_mapping` 的 `triton_turboquant_store()`；负 slot case 只会
+   提前返回，不能证明写 cache 路径正常；
+2. 在 store 后立即执行 `torch.npu.synchronize()`，不要依据随后任意一次 tensor 分配或
+   `IsFinite` 抛出的异步异常判断故障算子；
+3. 检查 Triton 中小于 32 字节的 vector operand、长度很短的 shift/reduction vector，
+   以及 3-bit byte packing 的内部 lane 数；
+4. store 单测通过并重启 pytest 进程后，再分别运行 dequant、packed decode 和 ACLGraph。
+
+NPU stream 在 device exception 后可能处于错误状态。同一进程里的后续失败通常只是连带
+结果，不能当作独立 bug；修改 kernel 后应启动新进程复测。
 
 ### 9.3 服务启动失败
 

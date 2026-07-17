@@ -549,6 +549,12 @@ Mixed batch
 `cache_u8_ptr` 与 `cache_f16_ptr` 指向同一 storage。前者访问 packed bytes，后者用于
 偶数字节对齐的 FP16 metadata。
 
+Ascend Vector Core 的 UB operand 按 32 字节对齐。kernel 因此不构造长度为 2 的 shift
+vector，也不会直接用 8/16 lane 的 `uint8` 中间结果执行 3-bit 写入。4-bit 路径分别计算
+偶数和奇数坐标后做按位或；3-bit 路径把内部 group vector 补齐到至少 32 lane，再通过
+mask 只写真实 group。这个 padding 只存在于 UB 中间表示，paged cache 的紧凑字节布局和
+slot size 不变。
+
 ### 12.2 `_turboquant_store_kernel()`
 
 kernel grid 是 `[num_tokens * num_kv_heads]`。每个 program 通过 program id 得到
@@ -575,8 +581,9 @@ Python launcher 负责 kernel 外的向量运算和参数校验：
 3. 归一化 key；
 4. 乘 Hadamard，得到连续的 rotated key；
 5. 让 value 变为连续内存；
-6. 计算 packed payload byte offset，并检查 FP16 metadata 对齐；
-7. 以每个 token、每个 KV head 一个 program 的 grid 启动 kernel。
+6. 为 3-bit 打包选择至少 32 lane 的内部 block，并 mask 无效 lane；
+7. 计算 packed payload byte offset，并检查 FP16 metadata 对齐；
+8. 以每个 token、每个 KV head 一个 program 的 grid 启动 kernel。
 
 这部分仍使用 dense Hadamard matrix multiplication，是后续 FWT 优化的主要入口。
 
