@@ -19,6 +19,7 @@
 | `run_910b4_retest.sh` | store 对齐修复后的隔离复测和 Qwen3-0.6B 模型 smoke test |
 | `run_model_startup_debug.sh` | 单独启动 TurboQuant 服务并周期采集进程和 NPU 状态 |
 | `run_accuracy_comparison.sh` | 顺序启动两组服务并比较输出和 logprobs |
+| `run_quality_comparison.sh` | 独立判分 native/TurboQuant，并检查幻觉和质量回归 |
 | `run_serving_benchmark.sh` | 关闭 prefix cache，对比 KV 容量、TTFT 和 TPOT |
 | `run_performance_validation.sh` | 运行 batch/context/split 性能矩阵 |
 | `accuracy_eval.py` | 采集 OpenAI completion 响应并生成比较报告 |
@@ -264,7 +265,39 @@ PROMPTS=/path/to/custom_prompts.jsonl \
 bash scripts/turboquant_triton/run_accuracy_comparison.sh
 ```
 
-### 6.5 服务性能与 KV Cache 压缩率
+### 6.5 客观质量与抗幻觉测试
+
+仅比较两种输出是否相同不能判断模型是否乱说，因为 native 也可能回答错误。
+`run_quality_comparison.sh` 使用带标准答案的 chat 用例分别判分，然后统计量化回归：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+MODEL=/path/to/Qwen3-32B \
+TP_SIZE=4 \
+bash scripts/turboquant_triton/run_quality_comparison.sh
+```
+
+默认使用 `chat_template_kwargs={"enable_thinking": false}` 和贪心解码，覆盖：
+
+- 稳定事实、中文事实、算术和逻辑推理；
+- 直接检索、多跳检索、表格检索和长上下文末尾信息；
+- 资料缺失时输出 `INSUFFICIENT_INFORMATION`，用于发现无依据编造；
+- 过期值干扰、上下文 prompt injection、严格复制和 JSON 输出。
+
+报告中的核心指标是：
+
+- `native_accuracy`：baseline 相对标准答案的正确率；
+- `turboquant_accuracy`：TurboQuant 相对标准答案的正确率；
+- `quality_regressions`：native 正确、TurboQuant 错误的 case 数；
+- `both_wrong`：两者都错，通常属于模型能力或测试提示问题；
+- `category_accuracy`：按事实、算术、检索和抗幻觉等类别拆分的正确率。
+
+默认 `MAX_QUALITY_REGRESSIONS=0`，任何量化回归都会让脚本返回非零，但仍会保存
+完整报告和两边原始回答。可在审核首轮结果后设置
+`MIN_TURBOQUANT_ACCURACY` 和新的回归门限。该固定题集用于发现明显回归，不能替代
+业务数据集、长文本事实一致性评测或人工审核。
+
+### 6.6 服务性能与 KV Cache 压缩率
 
 使用相同模型配置顺序启动 native 和 TurboQuant 服务，并明确关闭 prefix cache：
 

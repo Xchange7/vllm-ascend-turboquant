@@ -28,7 +28,10 @@ REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-600}"
 MIN_EXACT_MATCH_RATE="${MIN_EXACT_MATCH_RATE:-0.0}"
 MIN_TOKEN_PREFIX_RATE="${MIN_TOKEN_PREFIX_RATE:-0.0}"
 MAX_MEAN_LOGPROB_DIFF="${MAX_MEAN_LOGPROB_DIFF:-}"
+MIN_TURBOQUANT_ACCURACY="${MIN_TURBOQUANT_ACCURACY:-}"
+MAX_QUALITY_REGRESSIONS="${MAX_QUALITY_REGRESSIONS:-}"
 WARM_PREFIX="${WARM_PREFIX:-1}"
+REQUEST_MODE="${REQUEST_MODE:-completion}"
 
 SERVER_PID=""
 mkdir -p "${OUTPUT_DIR}"
@@ -101,7 +104,9 @@ wait_for_server() {
             tail -n 100 "${log_file}" || true
             return 1
         fi
-        if curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null; then
+        if curl --noproxy '*' --fail --silent \
+            --connect-timeout 2 --max-time 5 \
+            "http://127.0.0.1:${PORT}/health" >/dev/null; then
             printf 'Server is healthy on port %s.\n' "${PORT}"
             return 0
         fi
@@ -151,6 +156,7 @@ collect_results() {
         --label "${label}"
         --timeout "${REQUEST_TIMEOUT}"
         --max-model-len "${MAX_MODEL_LEN}"
+        --request-mode "${REQUEST_MODE}"
     )
     if [[ "${WARM_PREFIX}" == "1" ]]; then
         collect_args+=(--warm-prefix)
@@ -192,6 +198,12 @@ COMPARE_ARGS=(
 )
 if [[ -n "${MAX_MEAN_LOGPROB_DIFF}" ]]; then
     COMPARE_ARGS+=(--max-mean-logprob-diff "${MAX_MEAN_LOGPROB_DIFF}")
+fi
+if [[ -n "${MIN_TURBOQUANT_ACCURACY}" ]]; then
+    COMPARE_ARGS+=(--min-turboquant-accuracy "${MIN_TURBOQUANT_ACCURACY}")
+fi
+if [[ -n "${MAX_QUALITY_REGRESSIONS}" ]]; then
+    COMPARE_ARGS+=(--max-quality-regressions "${MAX_QUALITY_REGRESSIONS}")
 fi
 python3 "${SCRIPT_DIR}/accuracy_eval.py" "${COMPARE_ARGS[@]}" | tee "${OUTPUT_DIR}/comparison.log"
 printf 'Accuracy report: %s\n' "${OUTPUT_DIR}/summary.md"

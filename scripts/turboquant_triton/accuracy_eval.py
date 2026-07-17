@@ -15,7 +15,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
-"""Collect and compare deterministic OpenAI completion responses."""
+"""Collect, grade, and compare deterministic OpenAI responses."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ import math
 import statistics
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     collect.add_argument("--logprobs", type=int, default=5)
     collect.add_argument("--timeout", type=float, default=600.0)
     collect.add_argument(
+        "--request-mode",
+        choices=("completion", "chat"),
+        default="completion",
+    )
+    collect.add_argument(
         "--max-model-len",
         type=int,
         default=None,
@@ -65,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     compare.add_argument("--min-exact-match-rate", type=float, default=0.0)
     compare.add_argument("--min-token-prefix-rate", type=float, default=0.0)
     compare.add_argument("--max-mean-logprob-diff", type=float, default=None)
+    compare.add_argument("--min-turboquant-accuracy", type=float, default=None)
+    compare.add_argument("--max-quality-regressions", type=int, default=None)
     return parser.parse_args()
 
 
@@ -92,11 +100,26 @@ def load_prompts(path: Path) -> list[dict[str, Any]]:
         max_tokens = item.get("max_tokens", 64)
         if not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError(f"{path}:{line_number}: max_tokens must be positive")
+        category = item.get("category", "uncategorized")
+        if not isinstance(category, str) or not category:
+            raise ValueError(f"{path}:{line_number}: category must be a string")
+        system_prompt = item.get(
+            "system_prompt",
+            "Follow the user instruction exactly. Use only supplied context when the user restricts the source.",
+        )
+        if not isinstance(system_prompt, str) or not system_prompt:
+            raise ValueError(f"{path}:{line_number}: system_prompt must be a string")
+        evaluation = item.get("evaluation")
+        if evaluation is not None and not isinstance(evaluation, dict):
+            raise ValueError(f"{path}:{line_number}: evaluation must be an object")
         prompts.append(
             {
                 "id": case_id,
+                "category": category,
+                "system_prompt": system_prompt,
                 "prompt": prompt * repeat + suffix,
                 "max_tokens": max_tokens,
+                "evaluation": evaluation,
             }
         )
         seen_ids.add(case_id)
@@ -109,6 +132,7 @@ def validate_context_budgets(
     prompts: list[dict[str, Any]],
     model: str,
     max_model_len: int | None,
+    request_mode: str = "completion",
 ) -> list[dict[str, Any]]:
     if max_model_len is None:
         return prompts
@@ -127,7 +151,27 @@ def validate_context_budgets(
     validated_prompts = []
     errors = []
     for prompt in prompts:
-        prompt_tokens = len(tokenizer.encode(prompt["prompt"], add_special_tokens=False))
+        if request_mode == "chat":
+            messages = [
+                {"role": "system", "content": prompt["system_prompt"]},
+                {"role": "user", "content": prompt["prompt"]},
+            ]
+            try:
+                token_ids = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                token_ids = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+            prompt_tokens = len(token_ids)
+        else:
+            prompt_tokens = len(tokenizer.encode(prompt["prompt"], add_special_tokens=False))
         total_token_budget = prompt_tokens + prompt["max_tokens"]
         validated_prompts.append(
             {
@@ -154,22 +198,83 @@ def post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, An
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    hostname = urllib.parse.urlparse(url).hostname
+    if hostname in {"127.0.0.1", "localhost", "::1"}:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        open_request = opener.open
+    else:
+        open_request = urllib.request.urlopen
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_request(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {error.code}: {body}") from error
 
 
+def choice_text(choice: dict[str, Any] | None) -> str | None:
+    if choice is None:
+        return None
+    text = choice.get("text")
+    if isinstance(text, str):
+        return text
+    message = choice.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"]
+    return None
+
+
+def normalize_answer(answer: str) -> str:
+    return " ".join(answer.strip().split()).casefold()
+
+
+def evaluate_answer(
+    answer: str | None,
+    evaluation: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if evaluation is None:
+        return None
+    if answer is None:
+        return {"correct": False, "reason": "missing answer"}
+
+    evaluation_type = evaluation.get("type")
+    expected = evaluation.get("expected")
+    if evaluation_type == "exact":
+        if not isinstance(expected, str):
+            raise ValueError("exact evaluation requires a string expected value")
+        correct = normalize_answer(answer) == normalize_answer(expected)
+    elif evaluation_type == "one_of":
+        if not isinstance(expected, list) or not all(isinstance(value, str) for value in expected):
+            raise ValueError("one_of evaluation requires a string list")
+        normalized_answer = normalize_answer(answer)
+        correct = normalized_answer in {normalize_answer(value) for value in expected}
+    elif evaluation_type == "json_exact":
+        try:
+            parsed_answer = json.loads(answer.strip())
+        except json.JSONDecodeError:
+            parsed_answer = None
+        correct = parsed_answer == expected
+    else:
+        raise ValueError(f"Unsupported evaluation type: {evaluation_type!r}")
+
+    return {
+        "correct": correct,
+        "evaluation_type": evaluation_type,
+        "expected": expected,
+        "normalized_answer": normalize_answer(answer),
+    }
+
+
 def collect(args: argparse.Namespace) -> int:
     cases = []
     failures = 0
-    endpoint = f"{args.base_url.rstrip('/')}/v1/completions"
+    endpoint_path = "chat/completions" if args.request_mode == "chat" else "completions"
+    endpoint = f"{args.base_url.rstrip('/')}/v1/{endpoint_path}"
     prompts = validate_context_budgets(
         load_prompts(args.prompts),
         args.model,
         args.max_model_len,
+        args.request_mode,
     )
     for prompt in prompts:
         token_budget = ""
@@ -178,14 +283,32 @@ def collect(args: argparse.Namespace) -> int:
                 f" ({prompt['prompt_tokens']} prompt + {prompt['max_tokens']} output <= {args.max_model_len})"
             )
         print(f"{prompt['id']}: sending request{token_budget}", flush=True)
-        payload = {
+        payload: dict[str, Any] = {
             "model": args.model,
-            "prompt": prompt["prompt"],
             "max_tokens": prompt["max_tokens"],
             "temperature": 0,
             "seed": args.seed,
-            "logprobs": args.logprobs,
         }
+        if args.request_mode == "chat":
+            payload.update(
+                {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": prompt["system_prompt"],
+                        },
+                        {"role": "user", "content": prompt["prompt"]},
+                    ],
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+            )
+        else:
+            payload.update(
+                {
+                    "prompt": prompt["prompt"],
+                    "logprobs": args.logprobs,
+                }
+            )
         started = time.perf_counter()
         try:
             if args.warm_prefix:
@@ -197,9 +320,18 @@ def collect(args: argparse.Namespace) -> int:
             error = f"{type(exception).__name__}: {exception}"
             failures += 1
         elapsed_seconds = time.perf_counter() - started
+        answer = None
+        if response is not None:
+            response_choices = response.get("choices") or []
+            if response_choices and isinstance(response_choices[0], dict):
+                answer = choice_text(response_choices[0])
+        evaluation_result = evaluate_answer(answer, prompt["evaluation"])
         cases.append(
             {
                 "id": prompt["id"],
+                "category": prompt["category"],
+                "evaluation": prompt["evaluation"],
+                "evaluation_result": evaluation_result,
                 "request": payload,
                 "response": response,
                 "error": error,
@@ -208,7 +340,12 @@ def collect(args: argparse.Namespace) -> int:
                 "total_token_budget": prompt.get("total_token_budget"),
             }
         )
-        status = "PASS" if error is None else "FAIL"
+        if error is not None:
+            status = "FAIL"
+        elif evaluation_result is None:
+            status = "PASS"
+        else:
+            status = "CORRECT" if evaluation_result["correct"] else "WRONG"
         print(f"{prompt['id']}: {status} ({elapsed_seconds:.3f}s)", flush=True)
 
     report = {
@@ -216,6 +353,7 @@ def collect(args: argparse.Namespace) -> int:
         "base_url": args.base_url,
         "model": args.model,
         "seed": args.seed,
+        "request_mode": args.request_mode,
         "warm_prefix": args.warm_prefix,
         "max_model_len": args.max_model_len,
         "prompt_file": str(args.prompts),
@@ -255,10 +393,17 @@ def finite_number(value: Any) -> float | None:
 def compare_case(native: dict[str, Any], turboquant: dict[str, Any]) -> dict[str, Any]:
     native_choice = first_choice(native)
     tq_choice = first_choice(turboquant)
+    native_evaluation = native.get("evaluation_result")
+    tq_evaluation = turboquant.get("evaluation_result")
+    native_correct = native_evaluation.get("correct") if isinstance(native_evaluation, dict) else None
+    tq_correct = tq_evaluation.get("correct") if isinstance(tq_evaluation, dict) else None
     if native_choice is None or tq_choice is None:
         return {
             "id": native["id"],
+            "category": native.get("category", "uncategorized"),
             "valid": False,
+            "native_correct": native_correct,
+            "turboquant_correct": tq_correct,
             "native_error": native.get("error"),
             "turboquant_error": turboquant.get("error"),
         }
@@ -283,10 +428,16 @@ def compare_case(native: dict[str, Any], turboquant: dict[str, Any]) -> dict[str
 
     return {
         "id": native["id"],
+        "category": native.get("category", "uncategorized"),
         "valid": True,
-        "exact_text_match": native_choice.get("text") == tq_choice.get("text"),
-        "native_text": native_choice.get("text"),
-        "turboquant_text": tq_choice.get("text"),
+        "exact_text_match": choice_text(native_choice) == choice_text(tq_choice),
+        "native_text": choice_text(native_choice),
+        "turboquant_text": choice_text(tq_choice),
+        "native_correct": native_correct,
+        "turboquant_correct": tq_correct,
+        "quality_regression": native_correct is True and tq_correct is False,
+        "both_wrong": native_correct is False and tq_correct is False,
+        "expected": (native.get("evaluation") or {}).get("expected"),
         "native_token_count": len(native_tokens),
         "turboquant_token_count": len(tq_tokens),
         "common_prefix_tokens": prefix_tokens,
@@ -305,25 +456,59 @@ def markdown_summary(report: dict[str, Any]) -> str:
         "",
         f"- Cases: {summary['total_cases']}",
         f"- Valid cases: {summary['valid_cases']}",
-        f"- Exact text match rate: {summary['exact_text_match_rate']:.4f}",
-        f"- Aggregate token prefix rate: {summary['token_prefix_rate']:.4f}",
-        f"- Mean common-token logprob difference: {summary['mean_logprob_diff']}",
-        f"- Max common-token logprob difference: {summary['max_logprob_diff']}",
-        "",
-        "| Case | Valid | Exact | Prefix rate | Mean logprob diff |",
-        "| --- | --- | --- | ---: | ---: |",
     ]
+    if summary["graded_cases"]:
+        lines.extend(
+            [
+                f"- Graded cases: {summary['graded_cases']}",
+                f"- Native accuracy: {summary['native_accuracy']:.4f}",
+                f"- TurboQuant accuracy: {summary['turboquant_accuracy']:.4f}",
+                f"- Quality regressions: {summary['quality_regressions']}",
+                f"- Both wrong: {summary['both_wrong']}",
+            ]
+        )
+    lines.extend(
+        [
+            f"- Exact text match rate: {summary['exact_text_match_rate']:.4f}",
+            f"- Aggregate token prefix rate: {summary['token_prefix_rate']:.4f}",
+            f"- Mean common-token logprob difference: {summary['mean_logprob_diff']}",
+            f"- Max common-token logprob difference: {summary['max_logprob_diff']}",
+            "",
+            "| Case | Category | Valid | Native correct | TQ correct | Regression | Exact | Prefix rate |",
+            "| --- | --- | --- | --- | --- | --- | --- | ---: |",
+        ]
+    )
     for case in report["cases"]:
-        mean_diff = case.get("mean_common_token_logprob_diff")
         lines.append(
-            "| {id} | {valid} | {exact} | {prefix:.4f} | {diff} |".format(
+            "| {id} | {category} | {valid} | {native_correct} | "
+            "{tq_correct} | {regression} | {exact} | {prefix:.4f} |".format(
                 id=case["id"],
+                category=case["category"],
                 valid=case["valid"],
+                native_correct=case.get("native_correct", "N/A"),
+                tq_correct=case.get("turboquant_correct", "N/A"),
+                regression=case.get("quality_regression", "N/A"),
                 exact=case.get("exact_text_match", "N/A"),
                 prefix=case.get("token_prefix_rate", 0.0),
-                diff="N/A" if mean_diff is None else f"{mean_diff:.6f}",
             )
         )
+    if summary["category_accuracy"]:
+        lines.extend(
+            [
+                "",
+                "## Category Accuracy",
+                "",
+                "| Category | Cases | Native | TurboQuant | Regressions |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for category, metrics in summary["category_accuracy"].items():
+            lines.append(
+                f"| {category} | {metrics['cases']} | "
+                f"{metrics['native_accuracy']:.4f} | "
+                f"{metrics['turboquant_accuracy']:.4f} | "
+                f"{metrics['quality_regressions']} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -338,6 +523,11 @@ def compare(args: argparse.Namespace) -> int:
 
     cases = [compare_case(native_by_id[case_id], tq_by_id[case_id]) for case_id in native_by_id]
     valid_cases = [case for case in cases if case["valid"]]
+    graded_cases = [
+        case
+        for case in valid_cases
+        if case.get("native_correct") is not None and case.get("turboquant_correct") is not None
+    ]
     exact_matches = sum(case["exact_text_match"] for case in valid_cases)
     total_prefix = sum(case["common_prefix_tokens"] for case in valid_cases)
     total_tokens = sum(max(case["native_token_count"], case["turboquant_token_count"]) for case in valid_cases)
@@ -351,10 +541,31 @@ def compare(args: argparse.Namespace) -> int:
         for case in valid_cases
         if case["max_common_token_logprob_diff"] is not None
     ]
+    category_accuracy = {}
+    for category in sorted({case["category"] for case in graded_cases}):
+        category_cases = [case for case in graded_cases if case["category"] == category]
+        category_accuracy[category] = {
+            "cases": len(category_cases),
+            "native_accuracy": sum(case["native_correct"] for case in category_cases) / len(category_cases),
+            "turboquant_accuracy": sum(case["turboquant_correct"] for case in category_cases) / len(category_cases),
+            "quality_regressions": sum(case["quality_regression"] for case in category_cases),
+        }
+    native_correct = sum(case["native_correct"] for case in graded_cases)
+    tq_correct = sum(case["turboquant_correct"] for case in graded_cases)
+    quality_regressions = sum(case["quality_regression"] for case in graded_cases)
+    both_wrong = sum(case["both_wrong"] for case in graded_cases)
     summary = {
         "total_cases": len(cases),
         "valid_cases": len(valid_cases),
         "request_failures": len(cases) - len(valid_cases),
+        "graded_cases": len(graded_cases),
+        "native_correct": native_correct,
+        "turboquant_correct": tq_correct,
+        "native_accuracy": native_correct / max(len(graded_cases), 1),
+        "turboquant_accuracy": tq_correct / max(len(graded_cases), 1),
+        "quality_regressions": quality_regressions,
+        "both_wrong": both_wrong,
+        "category_accuracy": category_accuracy,
         "exact_text_matches": exact_matches,
         "exact_text_match_rate": exact_matches / max(len(valid_cases), 1),
         "common_prefix_tokens": total_prefix,
@@ -382,6 +593,14 @@ def compare(args: argparse.Namespace) -> int:
         and summary["mean_logprob_diff"] > args.max_mean_logprob_diff
     ):
         failures.append("mean logprob difference is above threshold")
+    if (
+        args.min_turboquant_accuracy is not None
+        and summary["graded_cases"]
+        and summary["turboquant_accuracy"] < args.min_turboquant_accuracy
+    ):
+        failures.append("TurboQuant ground-truth accuracy is below threshold")
+    if args.max_quality_regressions is not None and summary["quality_regressions"] > args.max_quality_regressions:
+        failures.append("quality regression count is above threshold")
 
     print(json.dumps(summary, indent=2))
     print(f"Report: {args.output}")

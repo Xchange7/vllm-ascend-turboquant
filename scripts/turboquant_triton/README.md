@@ -124,6 +124,24 @@ WARMUP_REQUESTS=16 MEASURE_REQUESTS=64 \
 bash scripts/turboquant_triton/run_serving_benchmark.sh
 ```
 
+To compare ground-truth quality and hallucination resistance, run the chat
+quality suite. It grades native and TurboQuant independently, then treats a
+native-correct/TurboQuant-wrong case as a quantization regression:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+MODEL=/path/to/Qwen3-32B \
+TP_SIZE=4 \
+bash scripts/turboquant_triton/run_quality_comparison.sh
+```
+
+The cases cover factual recall, arithmetic, reasoning, context retrieval,
+long-context distractors, missing-information refusal, prompt injection,
+instruction following, and structured output. Reports are written under
+`logs/turboquant/accuracy_*`. The default fails when any quality regression is
+observed; set `MAX_QUALITY_REGRESSIONS` only after manually reviewing the raw
+native and TurboQuant answers.
+
 ## 2. Start Qwen3-32B
 
 The default uses tensor parallel size 2 because BF16 Qwen3-32B weights usually

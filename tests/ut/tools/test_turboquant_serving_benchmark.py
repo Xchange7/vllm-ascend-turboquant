@@ -179,3 +179,108 @@ def test_accuracy_context_budget_rejects_oversized_case() -> None:
         pytest.raises(ValueError, match=r"2040 \+ max_tokens=16 = 2056"),
     ):
         accuracy.validate_context_budgets(prompts, "/models/qwen3", 2048)
+
+
+def test_accuracy_evaluates_exact_and_json_answers() -> None:
+    accuracy = load_script("accuracy_eval.py")
+    exact = accuracy.evaluate_answer(
+        "  Canberra\n",
+        {"type": "exact", "expected": "canberra"},
+    )
+    structured = accuracy.evaluate_answer(
+        '{"red": 3, "blue": 2}',
+        {"type": "json_exact", "expected": {"blue": 2, "red": 3}},
+    )
+    assert exact["correct"] is True
+    assert structured["correct"] is True
+
+
+def test_accuracy_marks_native_pass_turboquant_fail_as_regression() -> None:
+    accuracy = load_script("accuracy_eval.py")
+
+    def case(answer: str, correct: bool) -> dict:
+        return {
+            "id": "grounded",
+            "category": "hallucination_resistance",
+            "evaluation": {
+                "type": "exact",
+                "expected": "INSUFFICIENT_INFORMATION",
+            },
+            "evaluation_result": {"correct": correct},
+            "response": {
+                "choices": [{"message": {"content": answer}}],
+            },
+            "error": None,
+        }
+
+    compared = accuracy.compare_case(
+        case("INSUFFICIENT_INFORMATION", True),
+        case("The answer is 2020", False),
+    )
+    assert compared["native_correct"] is True
+    assert compared["turboquant_correct"] is False
+    assert compared["quality_regression"] is True
+
+
+def test_quality_case_file_has_valid_ground_truth() -> None:
+    accuracy = load_script("accuracy_eval.py")
+    cases = accuracy.load_prompts(REPO_ROOT / "scripts" / "turboquant_triton" / "quality_cases.jsonl")
+    assert len(cases) >= 15
+    assert {case["category"] for case in cases} >= {
+        "arithmetic",
+        "context_retrieval",
+        "hallucination_resistance",
+        "long_context",
+    }
+    for case in cases:
+        assert case["evaluation"] is not None
+
+
+def test_quality_comparison_threshold_fails_on_regression(tmp_path: Path) -> None:
+    accuracy = load_script("accuracy_eval.py")
+
+    def report(answer: str, correct: bool) -> dict:
+        return {
+            "cases": [
+                {
+                    "id": "grounded",
+                    "category": "hallucination_resistance",
+                    "evaluation": {
+                        "type": "exact",
+                        "expected": "INSUFFICIENT_INFORMATION",
+                    },
+                    "evaluation_result": {"correct": correct},
+                    "response": {"choices": [{"message": {"content": answer}}]},
+                    "error": None,
+                }
+            ]
+        }
+
+    native = tmp_path / "native.json"
+    turboquant = tmp_path / "turboquant.json"
+    output = tmp_path / "comparison.json"
+    summary_markdown = tmp_path / "summary.md"
+    native.write_text(
+        json.dumps(report("INSUFFICIENT_INFORMATION", True)),
+        encoding="utf-8",
+    )
+    turboquant.write_text(
+        json.dumps(report("The answer is 2020", False)),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        native=native,
+        turboquant=turboquant,
+        output=output,
+        summary_markdown=summary_markdown,
+        min_exact_match_rate=0.0,
+        min_token_prefix_rate=0.0,
+        max_mean_logprob_diff=None,
+        min_turboquant_accuracy=None,
+        max_quality_regressions=0,
+    )
+    assert accuracy.compare(args) == 1
+    comparison = json.loads(output.read_text(encoding="utf-8"))
+    assert comparison["summary"]["native_accuracy"] == 1.0
+    assert comparison["summary"]["turboquant_accuracy"] == 0.0
+    assert comparison["summary"]["quality_regressions"] == 1
