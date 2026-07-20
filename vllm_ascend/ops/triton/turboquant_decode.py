@@ -21,6 +21,12 @@ from typing import Any
 import torch
 from vllm.triton_utils import tl, triton
 
+_GROUPED_GQA_MIN_GROUP_SIZE = 4
+_GROUPED_GQA_MAX_GROUP_SIZE = 32
+_GROUPED_GQA_MAX_HEAD_DIM = 128
+_GROUPED_GQA_BLOCK_KV = 16
+_GROUPED_GQA_BLOCK_KV_OPTIONS = (16, 32)
+
 
 @triton.jit
 def _tanh(value):
@@ -62,13 +68,17 @@ def _turboquant_decode_stage1(
     NORM_CORRECTION: tl.constexpr,
     HAS_ALIBI: tl.constexpr,
     LOGITS_SOFT_CAP: tl.constexpr,
+    SEQUENCE_LENGTH_DELTA: tl.constexpr,
 ):
     batch_index = tl.program_id(0)
     query_head = tl.program_id(1)
     split_index = tl.program_id(2)
     kv_head = query_head // KV_GROUP_SIZE
 
-    seq_len = tl.load(seq_lens_ptr + batch_index)
+    seq_len = tl.maximum(
+        tl.load(seq_lens_ptr + batch_index) + SEQUENCE_LENGTH_DELTA,
+        0,
+    )
     split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
     split_start = split_len * split_index
     split_end = tl.minimum(split_start + split_len, seq_len)
@@ -233,6 +243,232 @@ def _turboquant_decode_stage1(
 
 
 @triton.jit
+def _turboquant_grouped_gqa_stage1(
+    query_rotated_ptr,
+    cache_u8_ptr,
+    cache_f16_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    centroids_ptr,
+    alibi_slopes_ptr,
+    partial_output_ptr,
+    stride_query_batch,
+    stride_query_head,
+    stride_cache_block,
+    stride_cache_position,
+    stride_cache_head,
+    stride_block_table_batch,
+    stride_partial_batch,
+    stride_partial_head,
+    stride_partial_split,
+    NUM_QUERY_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CACHE_BLOCK_SIZE: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    KEY_BITS: tl.constexpr,
+    MSE_BYTES: tl.constexpr,
+    KPS: tl.constexpr,
+    VALUE_BITS: tl.constexpr,
+    VALUE_DATA_BYTES: tl.constexpr,
+    ATTENTION_SCALE: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    NORM_CORRECTION: tl.constexpr,
+    HAS_ALIBI: tl.constexpr,
+    LOGITS_SOFT_CAP: tl.constexpr,
+    SEQUENCE_LENGTH_DELTA: tl.constexpr,
+):
+    """Decode one GQA group while unpacking each compressed KV tile once."""
+    batch_index = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split_index = tl.program_id(2)
+
+    seq_len = tl.maximum(
+        tl.load(seq_lens_ptr + batch_index) + SEQUENCE_LENGTH_DELTA,
+        0,
+    )
+    split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
+    split_start = split_len * split_index
+    split_end = tl.minimum(split_start + split_len, seq_len)
+    if split_start >= split_end:
+        return
+
+    query_offsets = tl.arange(0, BLOCK_Q)
+    dimension_offsets = tl.arange(0, BLOCK_D)
+    kv_offsets = tl.arange(0, BLOCK_KV)
+    query_heads = kv_head * KV_GROUP_SIZE + query_offsets
+    query_mask = (query_offsets < KV_GROUP_SIZE) & (query_heads < NUM_QUERY_HEADS)
+    dimension_mask = dimension_offsets < HEAD_DIM
+    query_addresses = (
+        batch_index * stride_query_batch + query_heads[:, None] * stride_query_head + dimension_offsets[None, :]
+    )
+    query_rotated = tl.load(
+        query_rotated_ptr + query_addresses,
+        mask=query_mask[:, None] & dimension_mask[None, :],
+        other=0.0,
+    )
+
+    key_bit_offsets = dimension_offsets * KEY_BITS
+    key_byte_indices = key_bit_offsets // 8
+    key_bit_shifts = key_bit_offsets % 8
+    key_mask = (1 << KEY_BITS) - 1
+    if VALUE_BITS == 3:
+        value_bit_offsets = dimension_offsets * 3
+        value_byte_indices = value_bit_offsets // 8
+        value_bit_shifts = value_bit_offsets % 8
+
+    running_max = tl.zeros([BLOCK_Q], dtype=tl.float32) - float("inf")
+    running_sum = tl.zeros([BLOCK_Q], dtype=tl.float32)
+    accumulator = tl.zeros([BLOCK_Q, BLOCK_D], dtype=tl.float32)
+    block_table_base = batch_index * stride_block_table_batch
+
+    for tile_start in range(split_start, split_end, BLOCK_KV):
+        positions = tile_start + kv_offsets
+        position_mask = positions < split_end
+        logical_pages = positions // CACHE_BLOCK_SIZE
+        page_offsets = positions % CACHE_BLOCK_SIZE
+        physical_blocks = tl.cast(
+            tl.load(
+                block_table_ptr + block_table_base + logical_pages,
+                mask=position_mask,
+                other=0,
+            ),
+            tl.int64,
+        )
+        slot_bases = (
+            physical_blocks * stride_cache_block
+            + tl.cast(page_offsets, tl.int64) * stride_cache_position
+            + tl.cast(kv_head, tl.int64) * stride_cache_head
+        )
+
+        key_addresses = slot_bases[:, None] + key_byte_indices[None, :]
+        key_byte_0 = tl.load(
+            cache_u8_ptr + key_addresses,
+            mask=position_mask[:, None] & dimension_mask[None, :],
+            other=0,
+        ).to(tl.int32)
+        key_byte_1 = tl.load(
+            cache_u8_ptr + key_addresses + 1,
+            mask=position_mask[:, None] & dimension_mask[None, :],
+            other=0,
+        ).to(tl.int32)
+        key_indices = ((key_byte_0 | (key_byte_1 << 8)) >> key_bit_shifts[None, :]) & key_mask
+        centroid_values = tl.load(
+            centroids_ptr + key_indices,
+            mask=position_mask[:, None] & dimension_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        if NORM_CORRECTION:
+            centroid_norm_sq = tl.sum(
+                tl.where(
+                    dimension_mask[None, :],
+                    centroid_values * centroid_values,
+                    0.0,
+                ),
+                axis=1,
+            )
+            centroid_values *= (1.0 / tl.sqrt(centroid_norm_sq + 1e-16))[:, None]
+
+        key_dot = tl.dot(
+            query_rotated,
+            tl.trans(centroid_values.to(query_rotated_ptr.dtype.element_ty)),
+        )
+        key_norm = tl.load(
+            cache_f16_ptr + (slot_bases + MSE_BYTES) // 2,
+            mask=position_mask,
+            other=0.0,
+        ).to(tl.float32)
+        scores = key_dot * key_norm[None, :] * ATTENTION_SCALE
+        if LOGITS_SOFT_CAP > 0:
+            scores = LOGITS_SOFT_CAP * _tanh(scores / LOGITS_SOFT_CAP)
+        if HAS_ALIBI:
+            alibi_slopes = tl.load(
+                alibi_slopes_ptr + query_heads,
+                mask=query_mask,
+                other=0.0,
+            )
+            scores += alibi_slopes[:, None] * (positions[None, :] - seq_len + 1)
+        scores = tl.where(
+            position_mask[None, :],
+            scores,
+            -float("inf"),
+        )
+        scores = tl.where(query_mask[:, None], scores, 0.0)
+
+        tile_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(tile_max, running_max)
+        previous_scale = tl.exp(running_max - new_max)
+        probabilities = tl.exp(scores - new_max[:, None])
+        probabilities = tl.where(
+            query_mask[:, None] & position_mask[None, :],
+            probabilities,
+            0.0,
+        )
+
+        value_bases = slot_bases + KPS
+        if VALUE_BITS == 3:
+            value_addresses = value_bases[:, None] + value_byte_indices[None, :]
+            value_byte_0 = tl.load(
+                cache_u8_ptr + value_addresses,
+                mask=position_mask[:, None] & dimension_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            value_byte_1 = tl.load(
+                cache_u8_ptr + value_addresses + 1,
+                mask=position_mask[:, None] & dimension_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            value_indices = ((value_byte_0 | (value_byte_1 << 8)) >> value_bit_shifts[None, :]) & 0x7
+        else:
+            value_byte_indices_4 = dimension_offsets // 2
+            value_bit_shifts_4 = (dimension_offsets % 2) * 4
+            value_byte = tl.load(
+                cache_u8_ptr + value_bases[:, None] + value_byte_indices_4[None, :],
+                mask=position_mask[:, None] & dimension_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            value_indices = (value_byte >> value_bit_shifts_4[None, :]) & 0xF
+
+        value_metadata_base = value_bases + VALUE_DATA_BYTES
+        value_scale = tl.load(
+            cache_f16_ptr + value_metadata_base // 2,
+            mask=position_mask,
+            other=0.0,
+        ).to(tl.float32)
+        value_minimum = tl.load(
+            cache_f16_ptr + value_metadata_base // 2 + 1,
+            mask=position_mask,
+            other=0.0,
+        ).to(tl.float32)
+        values = value_indices.to(tl.float32) * value_scale[:, None] + value_minimum[:, None]
+        weighted_values = tl.dot(
+            probabilities.to(query_rotated_ptr.dtype.element_ty),
+            values.to(query_rotated_ptr.dtype.element_ty),
+        )
+
+        accumulator = accumulator * previous_scale[:, None] + weighted_values
+        running_sum = running_sum * previous_scale + tl.sum(probabilities, axis=1)
+        running_max = new_max
+
+    partial_bases = (
+        batch_index * stride_partial_batch + query_heads * stride_partial_head + split_index * stride_partial_split
+    )
+    safe_sum = tl.maximum(running_sum, 1e-20)
+    tl.store(
+        partial_output_ptr + partial_bases[:, None] + dimension_offsets[None, :],
+        accumulator / safe_sum[:, None],
+        mask=query_mask[:, None] & dimension_mask[None, :],
+    )
+    tl.store(
+        partial_output_ptr + partial_bases + HEAD_DIM,
+        running_max + tl.log(safe_sum),
+        mask=query_mask,
+    )
+
+
+@triton.jit
 def _turboquant_decode_stage2(
     partial_output_ptr,
     output_ptr,
@@ -247,10 +483,14 @@ def _turboquant_decode_stage2(
     NUM_KV_SPLITS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SEQUENCE_LENGTH_DELTA: tl.constexpr,
 ):
     batch_index = tl.program_id(0)
     head_index = tl.program_id(1)
-    seq_len = tl.load(seq_lens_ptr + batch_index)
+    seq_len = tl.maximum(
+        tl.load(seq_lens_ptr + batch_index) + SEQUENCE_LENGTH_DELTA,
+        0,
+    )
     split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
 
     d_offsets = tl.arange(0, BLOCK_D)
@@ -428,6 +668,35 @@ def _layout(
     )
 
 
+def _supports_grouped_gqa(
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> bool:
+    group_size = num_query_heads // num_kv_heads
+    return (
+        _GROUPED_GQA_MIN_GROUP_SIZE <= group_size <= _GROUPED_GQA_MAX_GROUP_SIZE
+        and head_dim <= _GROUPED_GQA_MAX_HEAD_DIM
+        and head_dim % 16 == 0
+    )
+
+
+def _get_compute_rotation(
+    holder: Any,
+    rotation: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a cached low-precision rotation suitable for NPU Cube matmul."""
+    name = "_tq_ascend_compute_rotation"
+    cached = getattr(holder, name, None)
+    if cached is not None and cached.device == rotation.device and cached.dtype == dtype:
+        return cached
+    converted = rotation.to(dtype=dtype)
+    if holder is not None:
+        setattr(holder, name, converted)
+    return converted
+
+
 def _get_workspace(
     holder: Any,
     name: str,
@@ -464,6 +733,11 @@ def triton_turboquant_decode_attention(
     buffer_holder: Any,
     alibi_slopes: torch.Tensor | None = None,
     logits_soft_cap: float | None = None,
+    output: torch.Tensor | None = None,
+    sequence_length_delta: int = 0,
+    implementation: str = "auto",
+    compute_rotation: torch.Tensor | None = None,
+    grouped_block_kv: int = _GROUPED_GQA_BLOCK_KV,
 ) -> torch.Tensor:
     """Run split-KV decode directly against packed TurboQuant pages."""
     if logits_soft_cap is not None and logits_soft_cap <= 0:
@@ -481,6 +755,14 @@ def triton_turboquant_decode_attention(
         )
     if max_num_kv_splits <= 0:
         raise ValueError(f"TurboQuant max_num_kv_splits must be positive, got {max_num_kv_splits}.")
+    if implementation not in ("auto", "grouped_gqa", "reference"):
+        raise ValueError(
+            f"TurboQuant decode implementation must be auto, grouped_gqa, or reference; got {implementation}."
+        )
+    if grouped_block_kv not in _GROUPED_GQA_BLOCK_KV_OPTIONS:
+        raise ValueError(
+            f"TurboQuant grouped BLOCK_KV must be one of {_GROUPED_GQA_BLOCK_KV_OPTIONS}, got {grouped_block_kv}."
+        )
     query = query[:batch_size]
     _, num_query_heads, head_dim = query.shape
     num_kv_heads = kv_cache.shape[2]
@@ -491,13 +773,51 @@ def triton_turboquant_decode_attention(
             "TurboQuant ALiBi slopes must contain one value per query head, "
             f"got {alibi_slopes.numel()} for {num_query_heads} heads."
         )
+    grouped_gqa_supported = _supports_grouped_gqa(
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+    )
+    if implementation == "grouped_gqa" and not grouped_gqa_supported:
+        group_size = num_query_heads // num_kv_heads
+        raise ValueError(
+            "The grouped TurboQuant decode requires GQA group size in "
+            f"[{_GROUPED_GQA_MIN_GROUP_SIZE}, "
+            f"{_GROUPED_GQA_MAX_GROUP_SIZE}] and head_dim <= "
+            f"{_GROUPED_GQA_MAX_HEAD_DIM}; got group_size={group_size}, "
+            f"head_dim={head_dim}."
+        )
+    use_grouped_gqa = grouped_gqa_supported and implementation != "reference"
 
     mse_bytes, value_data_bytes, block_d = _layout(
         head_dim,
         key_bits,
         value_bits,
     )
-    query_rotated = (query.float() @ hadamard_transpose).contiguous()
+    if compute_rotation is None and use_grouped_gqa:
+        compute_rotation = _get_compute_rotation(
+            buffer_holder,
+            hadamard_transpose,
+            query.dtype,
+        )
+    if compute_rotation is not None:
+        if compute_rotation.dtype != query.dtype:
+            raise TypeError(
+                f"TurboQuant compute rotation dtype must match query, got {compute_rotation.dtype} and {query.dtype}."
+            )
+        if compute_rotation.device != query.device:
+            raise ValueError(
+                "TurboQuant compute rotation must be on the query device, got "
+                f"{compute_rotation.device} and {query.device}."
+            )
+        if compute_rotation.shape != (head_dim, head_dim):
+            raise ValueError(
+                "TurboQuant compute rotation must be square with the attention "
+                f"head dimension, got {compute_rotation.shape} for {head_dim}."
+            )
+        query_rotated = (query @ compute_rotation).contiguous()
+    else:
+        query_rotated = (query.float() @ hadamard_transpose).contiguous()
     num_splits = max_num_kv_splits
 
     # Layer buffers are sized for max_num_seqs and are stable during graph
@@ -510,21 +830,50 @@ def triton_turboquant_decode_attention(
         (batch_size, num_query_heads, num_splits, head_dim + 1),
         query.device,
     )
-    output = _get_workspace(
-        buffer_holder,
-        "_tq_output_buf",
-        (batch_size, num_query_heads, head_dim),
-        query.device,
-    )
     lse = _get_workspace(
         buffer_holder,
         "_tq_lse_buf",
         (batch_size, num_query_heads),
         query.device,
     )
+    if output is None:
+        output = torch.empty(
+            batch_size,
+            num_query_heads,
+            head_dim,
+            dtype=query.dtype,
+            device=query.device,
+        )
+    else:
+        if output.dtype != query.dtype or output.device != query.device:
+            raise TypeError(
+                "TurboQuant output must match query dtype and device, got "
+                f"{output.dtype}/{output.device} and "
+                f"{query.dtype}/{query.device}."
+            )
+        if output.ndim != 3 or any(
+            actual < required
+            for actual, required in zip(
+                output.shape,
+                (batch_size, num_query_heads, head_dim),
+            )
+        ):
+            raise ValueError(
+                "TurboQuant output is smaller than the decode result: "
+                f"{output.shape} vs "
+                f"{(batch_size, num_query_heads, head_dim)}."
+            )
+        if output.stride(2) != 1:
+            raise ValueError(
+                f"TurboQuant output must be contiguous in the head dimension, got strides {output.stride()}."
+            )
+        output = output[
+            :batch_size,
+            :num_query_heads,
+            :head_dim,
+        ]
 
-    grid = (batch_size, num_query_heads, num_splits)
-    _turboquant_decode_stage1[grid](
+    common_args = (
         query_rotated,
         kv_cache,
         kv_cache.view(torch.float16),
@@ -542,25 +891,57 @@ def triton_turboquant_decode_attention(
         partial.stride(0),
         partial.stride(1),
         partial.stride(2),
-        NUM_KV_HEADS=num_kv_heads,
-        HEAD_DIM=head_dim,
-        CACHE_BLOCK_SIZE=kv_cache.shape[1],
-        NUM_KV_SPLITS=num_splits,
-        KV_GROUP_SIZE=num_query_heads // num_kv_heads,
-        KEY_BITS=key_bits,
-        MSE_BYTES=mse_bytes,
-        KPS=key_packed_size,
-        VALUE_BITS=value_bits,
-        VALUE_DATA_BYTES=value_data_bytes,
-        ATTENTION_SCALE=scale,
-        BLOCK_D=block_d,
-        BLOCK_KV=4,
-        NORM_CORRECTION=norm_correction,
-        HAS_ALIBI=alibi_slopes is not None,
-        LOGITS_SOFT_CAP=logits_soft_cap or 0.0,
-        num_warps=1,
-        num_stages=1,
     )
+    group_size = num_query_heads // num_kv_heads
+    if use_grouped_gqa:
+        grouped_grid = (batch_size, num_kv_heads, num_splits)
+        _turboquant_grouped_gqa_stage1[grouped_grid](
+            *common_args,
+            NUM_QUERY_HEADS=num_query_heads,
+            HEAD_DIM=head_dim,
+            CACHE_BLOCK_SIZE=kv_cache.shape[1],
+            NUM_KV_SPLITS=num_splits,
+            KV_GROUP_SIZE=group_size,
+            KEY_BITS=key_bits,
+            MSE_BYTES=mse_bytes,
+            KPS=key_packed_size,
+            VALUE_BITS=value_bits,
+            VALUE_DATA_BYTES=value_data_bytes,
+            ATTENTION_SCALE=scale,
+            BLOCK_Q=max(16, triton.next_power_of_2(group_size)),
+            BLOCK_D=block_d,
+            BLOCK_KV=grouped_block_kv,
+            NORM_CORRECTION=norm_correction,
+            HAS_ALIBI=alibi_slopes is not None,
+            LOGITS_SOFT_CAP=logits_soft_cap or 0.0,
+            SEQUENCE_LENGTH_DELTA=sequence_length_delta,
+            num_warps=4,
+            num_stages=1,
+        )
+    else:
+        reference_grid = (batch_size, num_query_heads, num_splits)
+        _turboquant_decode_stage1[reference_grid](
+            *common_args,
+            NUM_KV_HEADS=num_kv_heads,
+            HEAD_DIM=head_dim,
+            CACHE_BLOCK_SIZE=kv_cache.shape[1],
+            NUM_KV_SPLITS=num_splits,
+            KV_GROUP_SIZE=group_size,
+            KEY_BITS=key_bits,
+            MSE_BYTES=mse_bytes,
+            KPS=key_packed_size,
+            VALUE_BITS=value_bits,
+            VALUE_DATA_BYTES=value_data_bytes,
+            ATTENTION_SCALE=scale,
+            BLOCK_D=block_d,
+            BLOCK_KV=4,
+            NORM_CORRECTION=norm_correction,
+            HAS_ALIBI=alibi_slopes is not None,
+            LOGITS_SOFT_CAP=logits_soft_cap or 0.0,
+            SEQUENCE_LENGTH_DELTA=sequence_length_delta,
+            num_warps=1,
+            num_stages=1,
+        )
 
     reduce_grid = (batch_size, num_query_heads)
     _turboquant_decode_stage2[reduce_grid](
@@ -577,10 +958,11 @@ def triton_turboquant_decode_attention(
         NUM_KV_SPLITS=num_splits,
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
+        SEQUENCE_LENGTH_DELTA=sequence_length_delta,
         num_warps=4,
         num_stages=1,
     )
-    return output.to(query.dtype)
+    return output
 
 
 def triton_turboquant_dequant_paged_cache(

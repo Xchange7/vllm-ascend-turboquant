@@ -17,10 +17,12 @@ BASE_LABEL="${BASE_LABEL:-native}"
 BASE_CACHE_DTYPE="${BASE_CACHE_DTYPE:-auto}"
 BASE_ENFORCE_EAGER="${BASE_ENFORCE_EAGER:-1}"
 BASE_SPECULATIVE_CONFIG="${BASE_SPECULATIVE_CONFIG:-}"
+BASE_DECODE_IMPLEMENTATION="${BASE_DECODE_IMPLEMENTATION:-auto}"
 TEST_LABEL="${TEST_LABEL:-turboquant}"
 TEST_CACHE_DTYPE="${TEST_CACHE_DTYPE:-${TQ_CACHE_DTYPE}}"
 TEST_ENFORCE_EAGER="${TEST_ENFORCE_EAGER:-1}"
 TEST_SPECULATIVE_CONFIG="${TEST_SPECULATIVE_CONFIG:-}"
+TEST_DECODE_IMPLEMENTATION="${TEST_DECODE_IMPLEMENTATION:-auto}"
 PROMPTS="${PROMPTS:-${SCRIPT_DIR}/accuracy_prompts.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/logs/turboquant/accuracy_${TIMESTAMP}}"
 SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"
@@ -127,10 +129,11 @@ start_server() {
     local cache_dtype="$2"
     local enforce_eager="$3"
     local speculative_config="$4"
+    local decode_implementation="$5"
     local log_file="${OUTPUT_DIR}/${label}_server.log"
 
-    printf 'Starting %s server with cache dtype %s; log: %s\n' \
-        "${label}" "${cache_dtype}" "${log_file}"
+    printf 'Starting %s server with cache dtype %s and decode implementation %s; log: %s\n' \
+        "${label}" "${cache_dtype}" "${decode_implementation}" "${log_file}"
     MODEL="${MODEL}" \
         PORT="${PORT}" \
         TP_SIZE="${TP_SIZE}" \
@@ -140,6 +143,7 @@ start_server() {
         KV_CACHE_DTYPE="${cache_dtype}" \
         ENFORCE_EAGER="${enforce_eager}" \
         SPECULATIVE_CONFIG="${speculative_config}" \
+        VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION="${decode_implementation}" \
         bash "${TQ_COMMON_DIR}/serve_qwen3_32b.sh" >"${log_file}" 2>&1 &
     SERVER_PID=$!
     wait_for_server "${log_file}"
@@ -178,7 +182,8 @@ start_server \
     "${BASE_LABEL}" \
     "${BASE_CACHE_DTYPE}" \
     "${BASE_ENFORCE_EAGER}" \
-    "${BASE_SPECULATIVE_CONFIG}"
+    "${BASE_SPECULATIVE_CONFIG}" \
+    "${BASE_DECODE_IMPLEMENTATION}"
 collect_results base "${BASE_LABEL}" origin_answers.txt
 stop_server
 
@@ -186,7 +191,8 @@ start_server \
     "${TEST_LABEL}" \
     "${TEST_CACHE_DTYPE}" \
     "${TEST_ENFORCE_EAGER}" \
-    "${TEST_SPECULATIVE_CONFIG}"
+    "${TEST_SPECULATIVE_CONFIG}" \
+    "${TEST_DECODE_IMPLEMENTATION}"
 collect_results test "${TEST_LABEL}" turboquant_answers.txt
 stop_server
 

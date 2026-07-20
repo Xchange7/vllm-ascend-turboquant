@@ -35,6 +35,24 @@ ModelSlim calibration artifact and does not quantize model weights.
 All shell entrypoints resolve the repository root through `common/paths.sh`,
 so they can be launched from any working directory.
 
+For one exhaustive Ascend 910B4 run across devices 0-3, use the full
+orchestrator. It validates the loaded editable checkout, runs isolated kernel
+and ACLGraph tests, profiles the Qwen3-32B TP4 operator shape, compares native,
+reference, and grouped-auto quality, and measures eager/ACLGraph serving:
+
+```bash
+MODEL=/run/test_llm/Qwen3-32B \
+VISIBLE_DEVICES=0,1,2,3 \
+TP_SIZE=4 \
+bash scripts/turboquant_triton/diagnostics/run_full_910b4_validation.sh
+```
+
+The complete matrix starts several model servers and can take hours. Set
+`QUICK=1` for kernel, operator, basic accuracy, and eager serving only. Every
+stage has an individual `RUN_*` switch, and all logs, periodic `npu-smi`
+snapshots, raw answers, benchmark JSON, summaries, and server logs are packed
+under `logs/turboquant/full_910b4_<timestamp>.tar.gz`.
+
 ## 1. Check environment and kernels
 
 Run from the repository root:
@@ -254,6 +272,34 @@ bash scripts/turboquant_triton/performance/profile_kernels.sh \
     --num-query-heads 32 \
     --num-kv-heads 4 \
     --head-dim 128
+```
+
+`--operation decode` measures packed attention only. Use
+`--operation decode_step` to include the current-token TurboQuant cache write,
+which is the closer approximation of one attention layer during generation.
+Select `--decode-implementation reference` to compare the original per-query-
+head kernel with the default grouped-GQA path.
+
+For the Qwen3-32B TP4 production shape (16 local query heads, 2 local KV
+heads, batch 16, and 16K context), run:
+
+```bash
+bash scripts/turboquant_triton/performance/profile_qwen3_32b_tp4.sh
+```
+
+This records pure decode and full decode-step timings for grouped `BLOCK_KV`
+16/32 and the reference implementation. Native paged attention is included in
+the pure-decode cases. The script writes all reports and logs under
+`logs/turboquant/qwen3_32b_tp4_<timestamp>/`.
+
+Production serving selects grouped GQA and activation-dtype rotation
+automatically. To isolate either optimization without changing code, start the
+server with `reference`; this restores the per-query-head kernel and FP32
+key/query rotation:
+
+```bash
+VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION=reference \
+bash scripts/turboquant_triton/common/serve_qwen3_32b.sh
 ```
 
 Run the compact compatibility/performance matrix for all presets, FP16/BF16,

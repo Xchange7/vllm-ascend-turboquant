@@ -84,7 +84,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--operation",
-        choices=("all", "store", "decode", "dequant", "native_decode"),
+        choices=(
+            "all",
+            "store",
+            "decode",
+            "decode_step",
+            "dequant",
+            "native_decode",
+        ),
         default="all",
     )
     parser.add_argument(
@@ -109,6 +116,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--num-kv-splits", type=int, default=8)
+    parser.add_argument(
+        "--decode-implementation",
+        choices=("auto", "grouped_gqa", "reference"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--grouped-block-kv",
+        choices=(16, 32),
+        type=int,
+        default=16,
+    )
     parser.add_argument(
         "--activation-dtype",
         choices=("float16", "bfloat16"),
@@ -179,7 +197,8 @@ def make_constants(args: argparse.Namespace):
     )
     centroids, _ = centroids.sort()
     midpoints = (centroids[:-1] + centroids[1:]) / 2
-    return config, hadamard, centroids, midpoints
+    compute_rotation = hadamard.to(activation_dtype(args))
+    return config, hadamard, centroids, midpoints, compute_rotation
 
 
 def activation_dtype(args: argparse.Namespace) -> torch.dtype:
@@ -187,7 +206,7 @@ def activation_dtype(args: argparse.Namespace) -> torch.dtype:
 
 
 def build_store_case(args: argparse.Namespace, constants) -> BenchmarkCase:
-    config, hadamard, _, midpoints = constants
+    config, hadamard, _, midpoints, compute_rotation = constants
     device = torch.device(f"npu:{args.device}")
     key = torch.randn(
         args.store_tokens,
@@ -211,6 +230,7 @@ def build_store_case(args: argparse.Namespace, constants) -> BenchmarkCase:
         dtype=torch.int64,
         device=device,
     )
+    active_rotation = None if args.decode_implementation == "reference" else compute_rotation
 
     def run() -> None:
         triton_turboquant_store(
@@ -223,6 +243,7 @@ def build_store_case(args: argparse.Namespace, constants) -> BenchmarkCase:
             key_bits=config.key_quant_bits,
             key_packed_size=config.key_packed_size,
             value_bits=config.value_quant_bits,
+            compute_rotation=active_rotation,
         )
 
     return BenchmarkCase(
@@ -235,7 +256,7 @@ def build_store_case(args: argparse.Namespace, constants) -> BenchmarkCase:
 
 
 def build_paged_cache(args: argparse.Namespace, constants):
-    config, hadamard, centroids, midpoints = constants
+    config, hadamard, centroids, midpoints, compute_rotation = constants
     device = torch.device(f"npu:{args.device}")
     pages_per_request = math.ceil(args.sequence_length / args.block_size)
     total_blocks = args.batch_size * pages_per_request
@@ -271,6 +292,7 @@ def build_paged_cache(args: argparse.Namespace, constants):
         device=device,
     )
     value = torch.randn_like(key)
+    active_rotation = None if args.decode_implementation == "reference" else compute_rotation
     triton_turboquant_store(
         key,
         value,
@@ -281,6 +303,7 @@ def build_paged_cache(args: argparse.Namespace, constants):
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
+        compute_rotation=active_rotation,
     )
     torch.npu.synchronize()
     del key, value
@@ -294,9 +317,15 @@ def build_paged_cache(args: argparse.Namespace, constants):
     return cache, block_table, seq_lens, slot_mapping, centroids
 
 
-def build_decode_case(args: argparse.Namespace, constants, paged_cache) -> BenchmarkCase:
-    config, hadamard, centroids, _ = constants
-    cache, block_table, seq_lens, _, _ = paged_cache
+def build_decode_case(
+    args: argparse.Namespace,
+    constants,
+    paged_cache,
+    *,
+    include_store: bool = False,
+) -> BenchmarkCase:
+    config, hadamard, centroids, midpoints, compute_rotation = constants
+    cache, block_table, seq_lens, slot_mapping, _ = paged_cache
     device = torch.device(f"npu:{args.device}")
     query = torch.randn(
         args.batch_size,
@@ -314,13 +343,6 @@ def build_decode_case(args: argparse.Namespace, constants, paged_cache) -> Bench
             dtype=torch.float32,
             device=device,
         ),
-        _tq_output_buf=torch.empty(
-            args.batch_size,
-            args.num_query_heads,
-            args.head_dim,
-            dtype=torch.float32,
-            device=device,
-        ),
         _tq_lse_buf=torch.empty(
             args.batch_size,
             args.num_query_heads,
@@ -328,8 +350,39 @@ def build_decode_case(args: argparse.Namespace, constants, paged_cache) -> Bench
             device=device,
         ),
     )
+    output = torch.empty_like(query)
+    active_rotation = None if args.decode_implementation == "reference" else compute_rotation
+    current_key = None
+    current_value = None
+    current_slots = None
+    if include_store:
+        current_key = torch.randn(
+            args.batch_size,
+            args.num_kv_heads,
+            args.head_dim,
+            dtype=activation_dtype(args),
+            device=device,
+        )
+        current_value = torch.randn_like(current_key)
+        current_slots = slot_mapping.view(args.batch_size, args.sequence_length)[:, -1].contiguous()
 
     def run() -> torch.Tensor:
+        if include_store:
+            assert current_key is not None
+            assert current_value is not None
+            assert current_slots is not None
+            triton_turboquant_store(
+                current_key,
+                current_value,
+                cache,
+                current_slots,
+                hadamard,
+                midpoints,
+                key_bits=config.key_quant_bits,
+                key_packed_size=config.key_packed_size,
+                value_bits=config.value_quant_bits,
+                compute_rotation=active_rotation,
+            )
         return triton_turboquant_decode_attention(
             query,
             cache,
@@ -344,14 +397,28 @@ def build_decode_case(args: argparse.Namespace, constants, paged_cache) -> Bench
             norm_correction=config.norm_correction,
             max_num_kv_splits=args.num_kv_splits,
             buffer_holder=buffers,
+            output=output,
+            implementation=args.decode_implementation,
+            compute_rotation=active_rotation,
+            grouped_block_kv=args.grouped_block_kv,
         )
 
     return BenchmarkCase(
-        name="decode",
+        name="decode_step" if include_store else "decode",
         run=run,
         work_per_iteration=args.batch_size,
         throughput_name="generated_tokens_per_second",
-        tensors=(query, cache, block_table, seq_lens, buffers),
+        tensors=(
+            query,
+            cache,
+            block_table,
+            seq_lens,
+            buffers,
+            output,
+            current_key,
+            current_value,
+            current_slots,
+        ),
     )
 
 
@@ -422,7 +489,7 @@ def build_native_decode_case(args: argparse.Namespace) -> BenchmarkCase:
 
 
 def build_dequant_case(args: argparse.Namespace, constants, paged_cache) -> BenchmarkCase:
-    config, _, centroids, _ = constants
+    config, _, centroids, _, _ = constants
     cache, block_table, seq_lens, _, _ = paged_cache
     device = torch.device(f"npu:{args.device}")
     total_tokens = args.batch_size * args.sequence_length
@@ -572,10 +639,19 @@ def main() -> None:
     cases: list[BenchmarkCase] = []
     if args.operation in ("all", "store"):
         cases.append(build_store_case(args, constants))
-    if args.operation in ("all", "decode", "dequant"):
+    if args.operation in ("all", "decode", "decode_step", "dequant"):
         paged_cache = build_paged_cache(args, constants)
         if args.operation in ("all", "decode"):
             cases.append(build_decode_case(args, constants, paged_cache))
+        if args.operation in ("all", "decode_step"):
+            cases.append(
+                build_decode_case(
+                    args,
+                    constants,
+                    paged_cache,
+                    include_store=True,
+                )
+            )
         if args.operation in ("all", "dequant"):
             cases.append(build_dequant_case(args, constants, paged_cache))
     if args.operation == "native_decode" or (args.native_baseline and args.operation in ("all", "decode")):
@@ -589,24 +665,37 @@ def main() -> None:
         results.append(asdict(result))
 
     result_by_operation = {result["operation"]: result for result in results}
-    comparison = None
+    comparison: dict[str, float] = {}
     if "decode" in result_by_operation and "native_decode" in result_by_operation:
         tq_decode = result_by_operation["decode"]
         native_decode = result_by_operation["native_decode"]
         config = get_turboquant_config(args.cache_dtype, args.head_dim)
         native_slot_bytes = 2 * args.head_dim * torch.empty((), dtype=activation_dtype(args)).element_size()
-        comparison = {
-            "decode_speedup_vs_native": (native_decode["mean_ms"] / tq_decode["mean_ms"]),
-            "native_mean_ms": native_decode["mean_ms"],
-            "turboquant_mean_ms": tq_decode["mean_ms"],
-            "theoretical_cache_compression_ratio": (native_slot_bytes / config.slot_size_aligned),
-        }
+        comparison.update(
+            {
+                "decode_speedup_vs_native": (native_decode["mean_ms"] / tq_decode["mean_ms"]),
+                "native_mean_ms": native_decode["mean_ms"],
+                "turboquant_mean_ms": tq_decode["mean_ms"],
+                "theoretical_cache_compression_ratio": (native_slot_bytes / config.slot_size_aligned),
+            }
+        )
         print(
             "compare: "
             f"decode_speedup={comparison['decode_speedup_vs_native']:.3f}x "
             "cache_compression="
             f"{comparison['theoretical_cache_compression_ratio']:.3f}x"
         )
+    if "decode" in result_by_operation and "decode_step" in result_by_operation:
+        decode = result_by_operation["decode"]
+        decode_step = result_by_operation["decode_step"]
+        store_overhead_ms = max(0.0, decode_step["mean_ms"] - decode["mean_ms"])
+        comparison.update(
+            {
+                "decode_step_mean_ms": decode_step["mean_ms"],
+                "current_token_store_overhead_ms": store_overhead_ms,
+            }
+        )
+        print(f"decode step: store_overhead={store_overhead_ms:.4f} ms total={decode_step['mean_ms']:.4f} ms")
 
     report = {
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},

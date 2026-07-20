@@ -327,12 +327,13 @@ batch invariant 的前置条件之一。
 
 ### 8.2 Store 临时空间
 
-Key normalization 和 rotation 使用 FP32 中间结果。长 prefill 时需要评估额外显存和带宽，
-后续可以将 norm、rotation、centroid search 和 packing 进一步融合。
+当前实现已经把 FP32 key norm 和 normalization 融入 store Triton kernel，并使用
+activation-dtype rotation GEMM，不再物化完整的 FP32 normalized key。长 prefill 仍会产生
+一个 activation-dtype rotated-key 临时 tensor，需要继续评估其显存和带宽。
 
-可以达到的优化上限是 fused normalize + FWT + centroid lookup + bit-pack store。Value 的
-min/max、scale 和 pack 也可以在同一 program 完成。长 prefill 应使用分块 grid，避免为全部
-tokens 保留 FP32 rotated key。
+可以达到的优化上限是 fused FWT + centroid lookup + bit-pack store。Value 的 min/max、
+scale 和 pack 已在同一 program 完成。长 prefill 后续可使用分块 grid，避免为全部 tokens
+保留 rotated key。
 
 ### 8.3 Decode 固定 splits
 

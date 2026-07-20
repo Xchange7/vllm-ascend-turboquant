@@ -30,13 +30,14 @@ from vllm_ascend.attention.turboquant import (
 )
 from vllm_ascend.kv_cache.turboquant import get_turboquant_config
 from vllm_ascend.ops.triton.turboquant_decode import (
+    _supports_grouped_gqa,
     triton_turboquant_decode_attention,
     triton_turboquant_dequant_paged_cache,
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
 
 _DECODE_CORRECTNESS_CASES = [
-    (cache_dtype, query_len, torch.float16, 128, False, False, None)
+    (cache_dtype, query_len, torch.float16, 128, False, False, None, "auto")
     for cache_dtype in (
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
@@ -44,13 +45,13 @@ _DECODE_CORRECTNESS_CASES = [
     )
     for query_len in (1, 2, 4, 8)
 ] + [
-    ("turboquant_4bit_nc", 4, torch.bfloat16, 128, False, False, None),
-    ("turboquant_k3v4_nc", 4, torch.bfloat16, 128, False, False, None),
-    ("turboquant_3bit_nc", 4, torch.bfloat16, 128, False, False, None),
-    ("turboquant_4bit_nc", 1, torch.float16, 64, False, False, None),
-    ("turboquant_4bit_nc", 1, torch.float16, 256, False, False, None),
-    ("turboquant_4bit_nc", 4, torch.float16, 128, True, False, None),
-    ("turboquant_4bit_nc", 2, torch.float16, 128, False, True, 3.0),
+    ("turboquant_4bit_nc", 4, torch.bfloat16, 128, False, False, None, "auto"),
+    ("turboquant_k3v4_nc", 4, torch.bfloat16, 128, False, False, None, "auto"),
+    ("turboquant_3bit_nc", 4, torch.bfloat16, 128, False, False, None, "auto"),
+    ("turboquant_4bit_nc", 1, torch.float16, 64, False, False, None, "auto"),
+    ("turboquant_4bit_nc", 1, torch.float16, 256, False, False, None, "reference"),
+    ("turboquant_4bit_nc", 4, torch.float16, 128, True, False, None, "auto"),
+    ("turboquant_4bit_nc", 2, torch.float16, 128, False, True, 3.0, "auto"),
 ]
 
 
@@ -64,6 +65,25 @@ def _constants(cache_dtype: str, head_dim: int):
     centroids, _ = centroids.sort()
     midpoints = (centroids[:-1] + centroids[1:]) / 2
     return config, hadamard, centroids, midpoints
+
+
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads", "head_dim", "expected"),
+    [
+        (16, 2, 128, True),
+        (8, 2, 64, True),
+        (4, 2, 128, False),
+        (64, 1, 128, False),
+        (16, 2, 256, False),
+    ],
+)
+def test_turboquant_grouped_gqa_dispatch(
+    num_query_heads,
+    num_kv_heads,
+    head_dim,
+    expected,
+):
+    assert _supports_grouped_gqa(num_query_heads, num_kv_heads, head_dim) is expected
 
 
 @npu_test(num_npus=1, npu_type="a2")
@@ -154,6 +174,7 @@ def test_turboquant_store_writes_valid_slots(cache_dtype, head_dim):
         "use_noncontiguous_pages",
         "use_alibi",
         "logits_soft_cap",
+        "implementation",
     ),
     _DECODE_CORRECTNESS_CASES,
 )
@@ -165,11 +186,13 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
     use_noncontiguous_pages,
     use_alibi,
     logits_soft_cap,
+    implementation,
 ):
     torch.manual_seed(1)
     num_tokens = 133 if use_noncontiguous_pages else max(8, query_len)
     num_kv_heads = 2
-    num_query_heads = 4
+    # Qwen3-32B uses a GQA group size of eight after tensor parallelism.
+    num_query_heads = 16
     config, hadamard, centroids, midpoints = _constants(
         cache_dtype,
         head_dim,
@@ -230,6 +253,7 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
+        compute_rotation=None if implementation == "reference" else hadamard.to(activation_dtype),
     )
     # Triton launches asynchronously. Surface a store-kernel failure here so
     # it cannot poison the stream and masquerade as a later dequant/FIA error.
@@ -252,8 +276,6 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         norm_correction=config.norm_correction,
     )
     torch.npu.synchronize()
-    key_dense = (key_rotated.float().reshape(-1, head_dim) @ hadamard.T).view_as(key_rotated)
-
     num_splits = 4
     # A continuation chunk can be larger than max_num_seqs. Exercise the
     # eager fallback instead of giving every case an exactly sized workspace.
@@ -264,13 +286,6 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
             num_query_heads,
             num_splits,
             head_dim + 1,
-            dtype=torch.float32,
-            device="npu",
-        ),
-        _tq_output_buf=torch.empty(
-            workspace_batch,
-            num_query_heads,
-            head_dim,
             dtype=torch.float32,
             device="npu",
         ),
@@ -293,6 +308,8 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         if use_alibi
         else None
     )
+    output = torch.empty_like(query)
+    compute_rotation = None if implementation == "reference" else hadamard.to(activation_dtype)
     result = triton_turboquant_decode_attention(
         query,
         cache,
@@ -309,13 +326,17 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         buffer_holder=buffers,
         alibi_slopes=alibi_slopes,
         logits_soft_cap=logits_soft_cap,
+        output=output,
+        compute_rotation=compute_rotation,
+        implementation=implementation,
     )
     torch.npu.synchronize()
 
     kv_head_indices = torch.arange(num_query_heads, device="npu") // (num_query_heads // num_kv_heads)
-    expanded_key = key_dense[:, kv_head_indices].float()
+    expanded_key = key_rotated[:, kv_head_indices].float()
     expanded_value = value_dense[:, kv_head_indices].float()
-    scores = torch.einsum("qhd,thd->qht", query.float(), expanded_key) * scale
+    query_rotated = (query.float() @ hadamard if compute_rotation is None else query @ compute_rotation).float()
+    scores = torch.einsum("qhd,thd->qht", query_rotated, expanded_key) * scale
     if logits_soft_cap is not None:
         scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
     positions = torch.arange(num_tokens, device="npu")
@@ -334,6 +355,7 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         atol=2e-2,
     )
     assert buffers._tq_mid_o_buf.shape[0] == workspace_batch
+    assert result.data_ptr() == output.data_ptr()
 
 
 @npu_test(num_npus=1, npu_type="a2")
@@ -350,6 +372,7 @@ def test_turboquant_zero_keys_and_constant_values_remain_finite(
         "turboquant_4bit_nc",
         head_dim,
     )
+    compute_rotation = hadamard.to(activation_dtype)
     key = torch.zeros(
         num_tokens,
         num_kv_heads,
@@ -383,6 +406,7 @@ def test_turboquant_zero_keys_and_constant_values_remain_finite(
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
+        compute_rotation=compute_rotation,
     )
     torch.npu.synchronize()
     buffers = SimpleNamespace(
@@ -391,13 +415,6 @@ def test_turboquant_zero_keys_and_constant_values_remain_finite(
             num_query_heads,
             num_splits,
             head_dim + 1,
-            dtype=torch.float32,
-            device="npu",
-        ),
-        _tq_output_buf=torch.empty(
-            1,
-            num_query_heads,
-            head_dim,
             dtype=torch.float32,
             device="npu",
         ),
@@ -422,6 +439,8 @@ def test_turboquant_zero_keys_and_constant_values_remain_finite(
         norm_correction=config.norm_correction,
         max_num_kv_splits=num_splits,
         buffer_holder=buffers,
+        output=torch.empty_like(query),
+        compute_rotation=compute_rotation,
     )
     torch.npu.synchronize()
 
@@ -442,13 +461,14 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
     history_len = 3
     final_seq_len = history_len + query_len
     num_kv_heads = 2
-    num_query_heads = 4
+    num_query_heads = 16
     head_dim = 128
     num_splits = 4
     config, hadamard, centroids, midpoints = _constants(
         "turboquant_4bit_nc",
         head_dim,
     )
+    compute_rotation = hadamard.to(torch.float16)
     history_key = torch.randn(
         num_reqs * history_len,
         num_kv_heads,
@@ -517,6 +537,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
+        compute_rotation=compute_rotation,
     )
     torch.npu.synchronize()
     cache.zero_()
@@ -530,6 +551,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
+        compute_rotation=compute_rotation,
     )
     torch.npu.synchronize()
 
@@ -542,13 +564,6 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
             dtype=torch.float32,
             device="npu",
         ),
-        _tq_output_buf=torch.empty(
-            num_reqs,
-            num_query_heads,
-            head_dim,
-            dtype=torch.float32,
-            device="npu",
-        ),
         _tq_lse_buf=torch.empty(
             num_reqs,
             num_query_heads,
@@ -556,6 +571,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
             device="npu",
         ),
         _tq_ascend_hadamard=hadamard,
+        _tq_ascend_compute_rotation=compute_rotation,
         _tq_ascend_centroids=centroids,
     )
     metadata = AscendMetadata(
@@ -583,6 +599,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
     impl.logits_soft_cap = None
     impl.tq_config = config
     impl.max_num_kv_splits = num_splits
+    impl.decode_implementation = "auto"
     output = torch.empty_like(query)
 
     # Warm up compilation before entering the graph capture scope.
@@ -607,6 +624,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
             key_bits=config.key_quant_bits,
             key_packed_size=config.key_packed_size,
             value_bits=config.value_quant_bits,
+            compute_rotation=compute_rotation,
         )
         graph_result = impl._decode_attention(
             layer,
@@ -653,6 +671,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
+        compute_rotation=compute_rotation,
     )
     block_table.copy_(alternate_blocks)
     slot_mapping.copy_(

@@ -579,15 +579,15 @@ kernel grid 是 `[num_tokens * num_kv_heads]`。每个 program 通过 program id
 Python launcher 负责 kernel 外的向量运算和参数校验：
 
 1. 检查 bit 数、K/V shape、cache dtype 和 head dimension；
-2. 将 key 转为 FP32，计算每个 vector 的 L2 norm；
-3. 归一化 key；
-4. 乘 Hadamard，得到连续的 rotated key；
-5. 让 value 变为连续内存；
-6. 为 3-bit 打包选择至少 32 lane 的内部 block，并 mask 无效 lane；
-7. 计算 packed payload byte offset，并检查 FP16 metadata 对齐；
-8. 以每个 token、每个 KV head 一个 program 的 grid 启动 kernel。
+2. 使用与 activation 相同 dtype 的共享 rotation 做 key GEMM；
+3. 让 key/value 变为连续内存；
+4. 在 store Triton program 内用 FP32 reduction 计算 key norm，并在 centroid search 前归一化；
+5. 为 3-bit 打包选择至少 32 lane 的内部 block，并 mask 无效 lane；
+6. 计算 packed payload byte offset，并检查 FP16 metadata 对齐；
+7. 以每个 token、每个 KV head 一个 program 的 grid 启动 kernel。
 
-这部分仍使用 dense Hadamard matrix multiplication，是后续 FWT 优化的主要入口。
+rotation 的 FP32 主副本和 activation-dtype 计算副本由所有 attention layer 共享。当前仍使用
+dense Hadamard matrix multiplication，是后续 FWT 优化的主要入口。
 
 ## 13. Decode Triton kernel
 
@@ -603,9 +603,9 @@ tanh(x) = 2 * sigmoid(2x) - 1
 
 仅在启用 logits soft cap 时使用。
 
-### 13.2 `_turboquant_decode_stage1()` 的 program 划分
+### 13.2 Stage 1 的两种 program 划分
 
-grid 是：
+`_turboquant_decode_stage1()` 是通用 reference fallback，grid 是：
 
 ```text
 (batch_size, num_query_heads, num_kv_splits)
@@ -618,6 +618,19 @@ kv_head = query_head // KV_GROUP_SIZE
 ```
 
 把多个 query head 映射到同一个 KV head。
+
+`_turboquant_grouped_gqa_stage1()` 是默认 fast path，适用于 GQA group size 4 到 32 且
+`head_dim <= 128` 的 shape。它的 grid 是：
+
+```text
+(batch_size, num_kv_heads, num_kv_splits)
+```
+
+每个 program 一次加载和解包一个 KV head 的 tile，然后通过两个 `tl.dot` 同时完成整个 GQA
+group 的 QK 和 PV。以 Qwen3-32B TP4 的本地 shape `Hq=16, Hkv=2` 为例，packed K/V 不再为
+8 个 query head 重复读取。其他 shape 自动回退到 reference kernel。
+环境变量 `VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION=reference` 还会同时恢复 FP32
+key/query rotation，用于把 grouped kernel 和低精度 GEMM 的影响从端到端结果中隔离出来。
 
 ### 13.3 Stage 1 的 page 定位
 
@@ -721,15 +734,17 @@ ACLGraph 的 uniform decode 使用预分配 layer workspace，不依赖动态图
 
 ### 13.11 `triton_turboquant_decode_attention()`
 
-Python launcher 的工作分为四块：
+Python launcher 的工作分为五块：
 
 1. **输入校验**：检查 soft cap、batch、query row、block-table row、split 数和 GQA head；
-2. **query rotation**：将 query 转为 FP32 并乘 Hadamard；
-3. **workspace 准备**：取得 partial output、output 和 LSE；
-4. **两阶段 launch**：先执行 split-KV Stage 1，再执行 Stage 2 reduction。
+2. **query rotation**：优先用 activation-dtype 的共享 rotation 走 NPU Cube matmul；
+3. **workspace 准备**：取得 FP32 partial output 和 LSE；
+4. **实现选择**：按 GQA group size 和 head dimension 自动选择 grouped 或 reference Stage 1；
+5. **两阶段 launch**：Stage 2 直接写入调用方提供的 query-dtype output。
 
-最终将 FP32 workspace 中的结果转换回 query dtype。decode 过程中没有完整 FP16/BF16
-历史 K/V tensor。
+multi-token decode 不再为每个 token 构造新的 device-side `seq_lens`。launcher 将 Python
+整数 delta 作为 constexpr 传入 kernel，由 device 端完成 clamp。decode 过程中没有额外的
+FP32 output 转换、二次 output copy 或完整 FP16/BF16 历史 K/V tensor。
 
 ### 13.12 `triton_turboquant_dequant_paged_cache()`
 

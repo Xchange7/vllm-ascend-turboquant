@@ -30,6 +30,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -99,6 +100,16 @@ def _build_hadamard(head_dim: int, device_string: str) -> torch.Tensor:
     signs.mul_(2).sub_(1)
     matrix.mul_(signs[:, None])
     return matrix.to(torch.device(device_string))
+
+
+@functools.cache
+def _build_compute_rotation(
+    head_dim: int,
+    device_string: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Share the low-precision Cube operand across attention layers."""
+    return _build_hadamard(head_dim, device_string).to(dtype=dtype)
 
 
 def _query_lens_from_cumulative(
@@ -305,16 +316,39 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         )
         attention_config = get_current_vllm_config().attention_config
         self.max_num_kv_splits = attention_config.tq_max_kv_splits_for_cuda_graph
+        self.decode_implementation = envs.VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION
+        if self.decode_implementation not in ("auto", "grouped_gqa", "reference"):
+            raise ValueError(
+                "VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION must be auto, "
+                f"grouped_gqa, or reference; got {self.decode_implementation}."
+            )
 
     def _ensure_constants(
         self,
         layer: AttentionLayer,
         device: torch.device,
+        activation_dtype: torch.dtype,
     ) -> None:
         if hasattr(layer, "_tq_ascend_constants_ready"):
+            compute_rotation = getattr(layer, "_tq_ascend_compute_rotation", None)
+            if (
+                compute_rotation is None
+                or compute_rotation.dtype != activation_dtype
+                or compute_rotation.device != device
+            ):
+                layer._tq_ascend_compute_rotation = _build_compute_rotation(
+                    self.head_size,
+                    str(device),
+                    activation_dtype,
+                )
             return
         rotation = _build_hadamard(self.head_size, str(device))
         layer._tq_ascend_hadamard = rotation
+        layer._tq_ascend_compute_rotation = _build_compute_rotation(
+            self.head_size,
+            str(device),
+            activation_dtype,
+        )
         centroids = layer._tq_centroids.to(  # type: ignore[attr-defined]
             device=device,
             dtype=torch.float32,
@@ -335,7 +369,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         num_tokens = slot_mapping.shape[0]
         if num_tokens == 0:
             return
-        self._ensure_constants(layer, key.device)
+        self._ensure_constants(layer, key.device, key.dtype)
         key = key[:num_tokens].view(
             num_tokens,
             self.num_kv_heads,
@@ -356,6 +390,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             key_bits=self.tq_config.key_quant_bits,
             key_packed_size=self.tq_config.key_packed_size,
             value_bits=self.tq_config.value_quant_bits,
+            compute_rotation=(None if self.decode_implementation == "reference" else layer._tq_ascend_compute_rotation),
         )
 
     def _prefill_attention(
@@ -557,15 +592,14 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             request_query = query[token_start : token_start + query_len]
             request_output = output[token_start : token_start + query_len]
             for token_index in range(query_len):
-                effective_seq_len = (
-                    metadata.seq_lens[request_index : request_index + 1] - query_len + token_index + 1
-                ).clamp_min(0)
-                request_output[token_index : token_index + 1] = self._launch_decode(
+                self._launch_decode(
                     layer,
                     request_query[token_index : token_index + 1],
                     kv_cache,
                     metadata.block_tables[request_index : request_index + 1],
-                    effective_seq_len,
+                    metadata.seq_lens[request_index : request_index + 1],
+                    output=request_output[token_index : token_index + 1],
+                    sequence_length_delta=-query_len + token_index + 1,
                 )
             token_start += query_len
         return output
@@ -594,13 +628,14 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         # Keep workspace proportional to requests, not requests * query_len.
         # The static loop is captured in full for uniform multi-token graphs.
         for token_index in range(query_len):
-            effective_seq_lens = (final_seq_lens - query_len + token_index + 1).clamp_min(0)
-            output_by_request[:, token_index] = self._launch_decode(
+            self._launch_decode(
                 layer,
                 query_by_request[:, token_index],
                 kv_cache,
                 block_tables,
-                effective_seq_lens,
+                final_seq_lens,
+                output=output_by_request[:, token_index],
+                sequence_length_delta=-query_len + token_index + 1,
             )
 
     def _launch_decode(
@@ -610,6 +645,9 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         kv_cache: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
+        *,
+        output: torch.Tensor | None = None,
+        sequence_length_delta: int = 0,
     ) -> torch.Tensor:
         return triton_turboquant_decode_attention(
             query,
@@ -627,6 +665,10 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             buffer_holder=layer,
             alibi_slopes=self.alibi_slopes,
             logits_soft_cap=self.logits_soft_cap,
+            output=output,
+            sequence_length_delta=sequence_length_delta,
+            compute_rotation=(None if self.decode_implementation == "reference" else layer._tq_ascend_compute_rotation),
+            implementation=self.decode_implementation,
         )
 
     def _continuation_prefill(
@@ -664,14 +706,13 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
                 device=query.device,
             )
             expanded_block_table = block_table.expand(query_len, -1)
-            output.copy_(
-                self._launch_decode(
-                    layer,
-                    query,
-                    kv_cache,
-                    expanded_block_table,
-                    seq_lens,
-                )
+            self._launch_decode(
+                layer,
+                query,
+                kv_cache,
+                expanded_block_table,
+                seq_lens,
+                output=output,
             )
             return
 
@@ -796,7 +837,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         if attn_metadata is None:
             return output.fill_(0)
 
-        self._ensure_constants(layer, query.device)
+        self._ensure_constants(layer, query.device, query.dtype)
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             if key is None or value is None:
                 raise RuntimeError("TurboQuant first prefill requires the current raw K/V.")

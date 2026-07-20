@@ -27,6 +27,21 @@ from vllm_ascend.kv_cache.turboquant import (
 )
 
 
+def _copy_decode_output(
+    _layer,
+    step_query,
+    _cache,
+    _blocks,
+    _seq_lens,
+    *,
+    output=None,
+    **_kwargs,
+):
+    assert output is not None
+    output.copy_(step_query)
+    return output
+
+
 @pytest.mark.parametrize(
     ("cache_dtype", "slot_size"),
     [
@@ -384,7 +399,8 @@ def test_turboquant_uniform_multi_token_decode_reuses_request_workspace():
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_heads = 1
     impl.head_size = 1
-    impl._launch_decode = MagicMock(side_effect=lambda _layer, step_query, _cache, _blocks, _seq_lens: step_query)
+
+    impl._launch_decode = MagicMock(side_effect=_copy_decode_output)
 
     result = impl._decode_attention(
         MagicMock(),
@@ -396,22 +412,12 @@ def test_turboquant_uniform_multi_token_decode_reuses_request_workspace():
 
     torch.testing.assert_close(result, query)
     assert impl._launch_decode.call_count == query_len
-    effective_seq_lens = [call.args[4] for call in impl._launch_decode.call_args_list]
-    torch.testing.assert_close(
-        torch.stack(effective_seq_lens),
-        torch.tensor(
-            [
-                [4, 6],
-                [5, 7],
-                [6, 8],
-                [7, 9],
-            ],
-            dtype=torch.int32,
-        ),
-    )
+    for call in impl._launch_decode.call_args_list:
+        assert call.args[4].data_ptr() == metadata.seq_lens.data_ptr()
+    assert [call.kwargs["sequence_length_delta"] for call in impl._launch_decode.call_args_list] == [-3, -2, -1, 0]
 
 
-def test_turboquant_uniform_decode_clamps_padded_request_lengths():
+def test_turboquant_uniform_decode_passes_padded_lengths_to_device():
     from vllm_ascend.attention.attention_v1 import AscendMetadata
     from vllm_ascend.attention.turboquant import AscendTurboQuantAttentionImpl
 
@@ -427,7 +433,8 @@ def test_turboquant_uniform_decode_clamps_padded_request_lengths():
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_heads = 1
     impl.head_size = 1
-    impl._launch_decode = MagicMock(side_effect=lambda _layer, step_query, _cache, _blocks, _seq_lens: step_query)
+
+    impl._launch_decode = MagicMock(side_effect=_copy_decode_output)
 
     impl._decode_attention(
         MagicMock(),
@@ -437,11 +444,9 @@ def test_turboquant_uniform_decode_clamps_padded_request_lengths():
         output,
     )
 
-    effective_seq_lens = [call.args[4].clone() for call in impl._launch_decode.call_args_list]
-    assert [seq_lens.tolist() for seq_lens in effective_seq_lens] == [
-        [4, 0],
-        [5, 0],
-    ]
+    for call in impl._launch_decode.call_args_list:
+        assert call.args[4].data_ptr() == metadata.seq_lens.data_ptr()
+    assert [call.kwargs["sequence_length_delta"] for call in impl._launch_decode.call_args_list] == [-1, 0]
 
 
 def test_turboquant_nonuniform_decode_uses_per_request_causal_lengths():
@@ -460,7 +465,8 @@ def test_turboquant_nonuniform_decode_uses_per_request_causal_lengths():
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_heads = 1
     impl.head_size = 1
-    impl._launch_decode = MagicMock(side_effect=lambda _layer, step_query, _cache, _blocks, _seq_lens: step_query)
+
+    impl._launch_decode = MagicMock(side_effect=_copy_decode_output)
 
     result = impl._decode_attention(
         MagicMock(),
@@ -471,13 +477,20 @@ def test_turboquant_nonuniform_decode_uses_per_request_causal_lengths():
     )
 
     torch.testing.assert_close(result, query)
-    effective_seq_lens = [call.args[4].clone() for call in impl._launch_decode.call_args_list]
-    assert [seq_len.tolist() for seq_len in effective_seq_lens] == [
-        [5],
+    calls = impl._launch_decode.call_args_list
+    assert [call.args[4].tolist() for call in calls] == [
         [6],
-        [7],
-        [8],
+        [6],
         [9],
+        [9],
+        [9],
+    ]
+    assert [call.kwargs["sequence_length_delta"] for call in calls] == [
+        -1,
+        0,
+        -2,
+        -1,
+        0,
     ]
 
 
@@ -549,7 +562,8 @@ def test_turboquant_small_continuation_uses_packed_decode():
     query = torch.arange(3, dtype=torch.float32).view(-1, 1, 1)
     output = torch.empty_like(query)
     impl = object.__new__(AscendTurboQuantAttentionImpl)
-    impl._launch_decode = MagicMock(side_effect=lambda _layer, step_query, _cache, _blocks, _seq_lens: step_query)
+
+    impl._launch_decode = MagicMock(side_effect=_copy_decode_output)
 
     impl._continuation_prefill(
         MagicMock(),
@@ -567,6 +581,7 @@ def test_turboquant_small_continuation_uses_packed_decode():
     call = impl._launch_decode.call_args
     assert call.args[3].shape == (3, 1)
     torch.testing.assert_close(call.args[4], torch.tensor([8, 9, 10], dtype=torch.int32))
+    assert call.kwargs["output"].data_ptr() == output.data_ptr()
 
 
 def test_turboquant_large_continuation_dequantizes_history_only():

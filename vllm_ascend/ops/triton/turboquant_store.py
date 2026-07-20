@@ -30,6 +30,7 @@ def _quantize_key_coordinates(
     vector_base,
     coordinate_offsets,
     coordinate_mask,
+    inverse_key_norm,
     KEY_BITS: tl.constexpr,
     NUM_CENTROIDS: tl.constexpr,
     PACK_SIZE: tl.constexpr,
@@ -38,7 +39,8 @@ def _quantize_key_coordinates(
         rotated_key_ptr + vector_base + coordinate_offsets,
         mask=coordinate_mask,
         other=0.0,
-    )
+    ).to(tl.float32)
+    rotated_key *= inverse_key_norm
     low = tl.zeros([PACK_SIZE], dtype=tl.int32)
     high = tl.full([PACK_SIZE], NUM_CENTROIDS - 1, dtype=tl.int32)
     for _ in range(KEY_BITS):
@@ -186,7 +188,7 @@ def _store_quantized_value(
 @triton.jit
 def _turboquant_store_kernel(
     rotated_key_ptr,
-    key_norm_ptr,
+    key_ptr,
     value_ptr,
     midpoint_ptr,
     cache_u8_ptr,
@@ -227,6 +229,24 @@ def _turboquant_store_kernel(
     vector_base = program_id * D
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < D
+    # Fusing the FP32 norm here removes two device kernels from every cache
+    # update while preserving zero-key behavior.
+    key_values = tl.load(
+        key_ptr + vector_base + d_offsets,
+        mask=d_mask,
+        other=0.0,
+    ).to(tl.float32)
+    key_norm = tl.sqrt(
+        tl.sum(
+            tl.where(d_mask, key_values * key_values, 0.0),
+            axis=0,
+        )
+    )
+    inverse_key_norm = tl.where(
+        key_norm > 0.0,
+        1.0 / (key_norm + 1e-8),
+        0.0,
+    )
 
     if KEY_BITS == 4:
         byte_offsets = tl.arange(0, BLOCK_D // 2)
@@ -238,6 +258,7 @@ def _turboquant_store_kernel(
             vector_base,
             even_offsets,
             even_offsets < D,
+            inverse_key_norm,
             KEY_BITS=KEY_BITS,
             NUM_CENTROIDS=NUM_CENTROIDS,
             PACK_SIZE=BLOCK_D // 2,
@@ -248,6 +269,7 @@ def _turboquant_store_kernel(
             vector_base,
             odd_offsets,
             odd_offsets < D,
+            inverse_key_norm,
             KEY_BITS=KEY_BITS,
             NUM_CENTROIDS=NUM_CENTROIDS,
             PACK_SIZE=BLOCK_D // 2,
@@ -270,6 +292,7 @@ def _turboquant_store_kernel(
                 vector_base,
                 coordinate_offsets,
                 group_mask,
+                inverse_key_norm,
                 KEY_BITS=KEY_BITS,
                 NUM_CENTROIDS=NUM_CENTROIDS,
                 PACK_SIZE=BLOCK_GROUPS,
@@ -293,7 +316,7 @@ def _turboquant_store_kernel(
 
     tl.store(
         cache_f16_ptr + (slot_base + MSE_BYTES) // 2,
-        tl.load(key_norm_ptr + program_id).to(tl.float16),
+        key_norm.to(tl.float16),
     )
 
     _store_quantized_value(
@@ -324,6 +347,7 @@ def triton_turboquant_store(
     key_bits: int,
     key_packed_size: int,
     value_bits: int,
+    compute_rotation: torch.Tensor | None = None,
 ) -> None:
     """Quantize post-RoPE K/V and scatter packed bytes into paged cache."""
     if key_bits not in (3, 4) or value_bits not in (3, 4):
@@ -340,14 +364,28 @@ def triton_turboquant_store(
         raise ValueError(f"TurboQuant Triton packing requires head_dim % 32 == 0, got {head_dim}.")
 
     num_vectors = num_tokens * num_kv_heads
-    key_float = key.float().reshape(num_vectors, head_dim)
-    key_norm = torch.linalg.vector_norm(
-        key_float,
-        dim=1,
-        keepdim=True,
-    )
-    normalized_key = key_float / (key_norm + 1e-8)
-    rotated_key = (normalized_key @ hadamard_transpose).contiguous()
+    key_vectors = key.reshape(num_vectors, head_dim).contiguous()
+    # Rotation is linear, so normalization can happen in the scatter kernel.
+    # The production path keeps this GEMM in the activation dtype for Cube.
+    if compute_rotation is None:
+        rotated_key = (key_vectors.float() @ hadamard_transpose).contiguous()
+    else:
+        if compute_rotation.dtype != key.dtype:
+            raise TypeError(
+                "TurboQuant compute rotation dtype must match K/V activations, "
+                f"got {compute_rotation.dtype} and {key.dtype}."
+            )
+        if compute_rotation.shape != (head_dim, head_dim):
+            raise ValueError(
+                "TurboQuant compute rotation must be square with the attention "
+                f"head dimension, got {compute_rotation.shape} for {head_dim}."
+            )
+        if compute_rotation.device != key.device:
+            raise ValueError(
+                "TurboQuant compute rotation must be on the K/V device, got "
+                f"{compute_rotation.device} and {key.device}."
+            )
+        rotated_key = (key_vectors @ compute_rotation).contiguous()
     value_contiguous = value.reshape(num_vectors, head_dim).contiguous()
 
     block_d = triton.next_power_of_2(head_dim)
@@ -367,7 +405,7 @@ def triton_turboquant_store(
     grid = (num_vectors,)
     _turboquant_store_kernel[grid](
         rotated_key,
-        key_norm.squeeze(1),
+        key_vectors,
         value_contiguous,
         midpoints,
         kv_cache,

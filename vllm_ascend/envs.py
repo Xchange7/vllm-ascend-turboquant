@@ -114,6 +114,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Select the TurboQuant packed-decode implementation. Valid values are
+    # "auto", "grouped_gqa", and "reference". "auto" uses grouped GQA and
+    # activation-dtype rotation when the shape is supported; "reference" uses
+    # the per-query-head kernel and FP32 rotation. This non-sensitive
+    # performance/debug option defaults to "auto" on all Ascend hardware.
+    "VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION": lambda: os.getenv(
+        "VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION",
+        "auto",
+    ).lower(),
 }
 
 # end-env-vars-definition
