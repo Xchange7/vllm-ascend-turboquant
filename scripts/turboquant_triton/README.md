@@ -292,6 +292,23 @@ This records pure decode and full decode-step timings for grouped `BLOCK_KV`
 the pure-decode cases. The script writes all reports and logs under
 `logs/turboquant/qwen3_32b_tp4_<timestamp>/`.
 
+When throughput collapses only at higher concurrency, sweep batch size and
+split count independently:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+bash scripts/turboquant_triton/performance/profile_concurrency_splits.sh
+```
+
+The default matrix uses the Qwen3-32B TP4 per-rank shape at 16K context and
+tests `B=1/2/4/8/16` with fixed split counts `1/2/4/8/16/32`. It also runs the
+production adaptive policy once per batch. Results and per-case
+`benchmark.json` files are archived under
+`logs/turboquant/concurrency_splits_<timestamp>.tar.gz`. Use the split with the
+lowest `decode.mean_ms` at each batch as the hardware evidence for tuning the
+policy; a large gap between every TurboQuant case and `native_decode` points
+to the packed paged-load kernel rather than split selection.
+
 Production serving selects grouped GQA and activation-dtype rotation
 automatically. To isolate either optimization without changing code, start the
 server with `reference`; this restores the per-query-head kernel and FP32

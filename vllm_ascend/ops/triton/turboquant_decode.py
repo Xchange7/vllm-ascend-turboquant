@@ -27,6 +27,14 @@ _GROUPED_GQA_MAX_HEAD_DIM = 128
 _GROUPED_GQA_BLOCK_KV = 16
 _GROUPED_GQA_BLOCK_KV_OPTIONS = (16, 32)
 
+# Keep enough stage-1 programs to occupy the NPU without multiplying tiny
+# split-KV programs at high concurrency. This mirrors upstream Triton MLA's
+# sequence-length heuristic, with an additional cap for already-parallel
+# batch/head rows. The constants are intentionally hardware-policy details,
+# not user-facing knobs; profiling should validate them before they change.
+_MIN_KV_TOKENS_PER_SPLIT = 512
+_TARGET_DECODE_PROGRAMS = 128
+
 
 @triton.jit
 def _tanh(value):
@@ -679,6 +687,58 @@ def _supports_grouped_gqa(
         and head_dim <= _GROUPED_GQA_MAX_HEAD_DIM
         and head_dim % 16 == 0
     )
+
+
+def select_turboquant_num_kv_splits(
+    batch_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    max_num_kv_splits: int,
+    max_sequence_length: int | None,
+    implementation: str = "auto",
+) -> int:
+    """Select split-KV parallelism without oversubscribing high batches.
+
+    The grouped kernel launches one stage-1 program per KV head and split;
+    the reference kernel launches one per query head and split. Once the
+    batch/head rows already expose enough parallel work, more splits only add
+    program scheduling, partial-buffer traffic, and stage-2 reduction work.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"TurboQuant batch_size must be positive, got {batch_size}.")
+    if num_query_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("TurboQuant query and KV head counts must be positive.")
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(f"Query heads ({num_query_heads}) must be divisible by KV heads ({num_kv_heads}).")
+    if max_num_kv_splits <= 0:
+        raise ValueError(f"TurboQuant max_num_kv_splits must be positive, got {max_num_kv_splits}.")
+    if max_sequence_length is not None and max_sequence_length <= 0:
+        raise ValueError(f"TurboQuant max_sequence_length must be positive when provided, got {max_sequence_length}.")
+    if implementation not in ("auto", "grouped_gqa", "reference"):
+        raise ValueError(
+            f"TurboQuant decode implementation must be auto, grouped_gqa, or reference; got {implementation}."
+        )
+
+    grouped = implementation != "reference" and _supports_grouped_gqa(
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+    )
+    program_heads = num_kv_heads if grouped else num_query_heads
+    parallel_rows = batch_size * program_heads
+    parallel_limit = max(1, _TARGET_DECODE_PROGRAMS // parallel_rows)
+
+    # Powers of two limit Triton specializations and produce balanced split
+    # ranges. Round the concurrency limit down so the target is never exceeded.
+    parallel_limit = 1 << (parallel_limit.bit_length() - 1)
+    split_limit = min(max_num_kv_splits, parallel_limit)
+    if max_sequence_length is None:
+        return max(1, split_limit)
+
+    ideal_splits = max(1, max_sequence_length // _MIN_KV_TOKENS_PER_SPLIT)
+    ideal_splits = triton.next_power_of_2(ideal_splits)
+    return max(1, min(split_limit, ideal_splits))
 
 
 def _get_compute_rotation(

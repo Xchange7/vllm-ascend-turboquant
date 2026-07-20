@@ -335,6 +335,7 @@ def test_turboquant_builder_routes_all_decode_tokens_to_packed_path():
         num_reqs=2,
         num_actual_tokens=8,
         seq_lens=torch.tensor([7, 9], dtype=torch.int32),
+        max_seq_len=16384,
     )
     builder = object.__new__(AscendTurboQuantMetadataBuilder)
 
@@ -347,6 +348,7 @@ def test_turboquant_builder_routes_all_decode_tokens_to_packed_path():
 
     assert result.attn_state is AscendAttentionState.DecodeOnly
     assert result.seq_lens.data_ptr() == common_attn_metadata.seq_lens.data_ptr()
+    assert result.max_seq_len == 16384
     torch.testing.assert_close(
         result.seq_lens,
         common_attn_metadata.seq_lens[: common_attn_metadata.num_reqs],
@@ -582,6 +584,52 @@ def test_turboquant_small_continuation_uses_packed_decode():
     assert call.args[3].shape == (3, 1)
     torch.testing.assert_close(call.args[4], torch.tensor([8, 9, 10], dtype=torch.int32))
     assert call.kwargs["output"].data_ptr() == output.data_ptr()
+    assert call.kwargs["max_sequence_length"] == 10
+
+
+def test_turboquant_launch_decode_reduces_splits_at_high_concurrency():
+    from vllm_ascend.attention.turboquant import AscendTurboQuantAttentionImpl
+
+    batch_size = 16
+    query = torch.empty(batch_size, 16, 128)
+    output = torch.empty_like(query)
+    layer = SimpleNamespace(
+        _tq_ascend_hadamard=torch.empty(128, 128),
+        _tq_ascend_compute_rotation=torch.empty(128, 128),
+        _tq_ascend_centroids=torch.empty(16),
+    )
+    impl = object.__new__(AscendTurboQuantAttentionImpl)
+    impl.num_heads = 16
+    impl.num_kv_heads = 2
+    impl.head_size = 128
+    impl.max_num_kv_splits = 32
+    impl.decode_implementation = "auto"
+    impl.scale = 1 / 128**0.5
+    impl.alibi_slopes = None
+    impl.logits_soft_cap = None
+    impl.tq_config = SimpleNamespace(
+        key_quant_bits=4,
+        key_packed_size=4,
+        value_quant_bits=4,
+        norm_correction=True,
+    )
+
+    with patch(
+        "vllm_ascend.attention.turboquant.triton_turboquant_decode_attention",
+        return_value=output,
+    ) as decode:
+        result = impl._launch_decode(
+            layer,
+            query,
+            torch.empty(1),
+            torch.empty(batch_size, 1, dtype=torch.int32),
+            torch.full((batch_size,), 16384, dtype=torch.int32),
+            output=output,
+            max_sequence_length=16384,
+        )
+
+    assert result is output
+    assert decode.call_args.kwargs["max_num_kv_splits"] == 4
 
 
 def test_turboquant_large_continuation_dequantizes_history_only():

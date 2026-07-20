@@ -39,6 +39,7 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
 from vllm_ascend.attention.turboquant import _build_hadamard
 from vllm_ascend.kv_cache.turboquant import get_turboquant_config
 from vllm_ascend.ops.triton.turboquant_decode import (
+    select_turboquant_num_kv_splits,
     triton_turboquant_decode_attention,
     triton_turboquant_dequant_paged_cache,
 )
@@ -116,6 +117,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--num-kv-splits", type=int, default=8)
+    parser.add_argument(
+        "--adaptive-splits",
+        action="store_true",
+        help="Use the production TurboQuant split selection policy.",
+    )
     parser.add_argument(
         "--decode-implementation",
         choices=("auto", "grouped_gqa", "reference"),
@@ -624,6 +630,21 @@ def print_result(result: BenchmarkResult) -> None:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    if args.adaptive_splits:
+        configured_max_splits = args.num_kv_splits
+        args.num_kv_splits = select_turboquant_num_kv_splits(
+            batch_size=args.batch_size,
+            num_query_heads=args.num_query_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            max_num_kv_splits=configured_max_splits,
+            max_sequence_length=args.sequence_length,
+            implementation=args.decode_implementation,
+        )
+        print(
+            f"Adaptive split selection: max={configured_max_splits}, selected={args.num_kv_splits}",
+            flush=True,
+        )
     if not torch.npu.is_available():
         raise RuntimeError("torch-npu cannot see an Ascend NPU.")
 

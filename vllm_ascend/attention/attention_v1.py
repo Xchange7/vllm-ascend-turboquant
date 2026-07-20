@@ -180,6 +180,10 @@ class AscendMetadata:
     seq_lens: torch.Tensor = None
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
+    # Actual batch maximum in eager mode and the configured capture maximum
+    # during ACLGraph construction. Backends can use it for static kernel
+    # policy without synchronizing a device sequence-length tensor.
+    max_seq_len: int | None = None
     actual_seq_lengths_q: list[int] = None  # type: ignore
 
     query_start_loc: torch.Tensor = None
@@ -319,6 +323,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens.tolist(),
+            max_seq_len=common_attn_metadata.max_seq_len,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
             slot_mapping=slot_mapping,

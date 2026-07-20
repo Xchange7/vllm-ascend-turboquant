@@ -31,6 +31,7 @@ from vllm_ascend.attention.turboquant import (
 from vllm_ascend.kv_cache.turboquant import get_turboquant_config
 from vllm_ascend.ops.triton.turboquant_decode import (
     _supports_grouped_gqa,
+    select_turboquant_num_kv_splits,
     triton_turboquant_decode_attention,
     triton_turboquant_dequant_paged_cache,
 )
@@ -84,6 +85,53 @@ def test_turboquant_grouped_gqa_dispatch(
     expected,
 ):
     assert _supports_grouped_gqa(num_query_heads, num_kv_heads, head_dim) is expected
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "sequence_length", "implementation", "expected"),
+    [
+        (1, 16384, "auto", 32),
+        (2, 16384, "auto", 32),
+        (4, 16384, "auto", 16),
+        (8, 16384, "auto", 8),
+        (16, 16384, "auto", 4),
+        (16, 16384, "reference", 1),
+        (1, 1024, "auto", 2),
+        (1, 128, "auto", 1),
+    ],
+)
+def test_turboquant_split_selection_for_qwen3_tp4(
+    batch_size,
+    sequence_length,
+    implementation,
+    expected,
+):
+    assert (
+        select_turboquant_num_kv_splits(
+            batch_size=batch_size,
+            num_query_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            max_num_kv_splits=32,
+            max_sequence_length=sequence_length,
+            implementation=implementation,
+        )
+        == expected
+    )
+
+
+def test_turboquant_split_selection_without_host_sequence_length():
+    assert (
+        select_turboquant_num_kv_splits(
+            batch_size=16,
+            num_query_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            max_num_kv_splits=32,
+            max_sequence_length=None,
+        )
+        == 4
+    )
 
 
 @npu_test(num_npus=1, npu_type="a2")

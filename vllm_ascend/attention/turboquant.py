@@ -44,6 +44,7 @@ from vllm_ascend.kv_cache.turboquant import (
     validate_turboquant_layout,
 )
 from vllm_ascend.ops.triton.turboquant_decode import (
+    select_turboquant_num_kv_splits,
     triton_turboquant_decode_attention,
     triton_turboquant_dequant_paged_cache,
 )
@@ -160,6 +161,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             fast_build,
         )
         metadata.seq_lens = common_attn_metadata.seq_lens[: common_attn_metadata.num_reqs]
+        metadata.max_seq_len = common_attn_metadata.max_seq_len
         if (
             metadata.attn_state != AscendAttentionState.PrefillNoCache
             and metadata.num_decodes == common_attn_metadata.num_reqs
@@ -600,6 +602,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
                     metadata.seq_lens[request_index : request_index + 1],
                     output=request_output[token_index : token_index + 1],
                     sequence_length_delta=-query_len + token_index + 1,
+                    max_sequence_length=metadata.max_seq_len,
                 )
             token_start += query_len
         return output
@@ -636,6 +639,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
                 final_seq_lens,
                 output=output_by_request[:, token_index],
                 sequence_length_delta=-query_len + token_index + 1,
+                max_sequence_length=metadata.max_seq_len,
             )
 
     def _launch_decode(
@@ -648,7 +652,17 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         *,
         output: torch.Tensor | None = None,
         sequence_length_delta: int = 0,
+        max_sequence_length: int | None = None,
     ) -> torch.Tensor:
+        num_kv_splits = select_turboquant_num_kv_splits(
+            batch_size=seq_lens.shape[0],
+            num_query_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_size,
+            max_num_kv_splits=self.max_num_kv_splits,
+            max_sequence_length=max_sequence_length,
+            implementation=self.decode_implementation,
+        )
         return triton_turboquant_decode_attention(
             query,
             kv_cache,
@@ -661,7 +675,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             key_packed_size=self.tq_config.key_packed_size,
             value_bits=self.tq_config.value_quant_bits,
             norm_correction=self.tq_config.norm_correction,
-            max_num_kv_splits=self.max_num_kv_splits,
+            max_num_kv_splits=num_kv_splits,
             buffer_holder=layer,
             alibi_slopes=self.alibi_slopes,
             logits_soft_cap=self.logits_soft_cap,
@@ -713,6 +727,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
                 expanded_block_table,
                 seq_lens,
                 output=output,
+                max_sequence_length=seq_len,
             )
             return
 
