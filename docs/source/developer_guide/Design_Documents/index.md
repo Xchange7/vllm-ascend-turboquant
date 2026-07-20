@@ -20,5 +20,6 @@ turboquant_code_walkthrough_zh
 turboquant_implementation_zh
 turboquant_limitations_zh
 turboquant_npu_validation_zh
+turboquant_triton_v0202rc_debug_zh
 npugraph_ex
 :::

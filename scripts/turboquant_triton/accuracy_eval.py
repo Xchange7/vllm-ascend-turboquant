@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     collect.add_argument("--model", required=True)
     collect.add_argument("--prompts", type=Path, required=True)
     collect.add_argument("--output", type=Path, required=True)
+    collect.add_argument(
+        "--text-output",
+        type=Path,
+        default=None,
+        help="Write prompts and unmodified model answers to a readable text file.",
+    )
     collect.add_argument("--label", required=True)
     collect.add_argument("--seed", type=int, default=0)
     collect.add_argument("--logprobs", type=int, default=5)
@@ -265,6 +271,49 @@ def evaluate_answer(
     }
 
 
+def answer_text_report(label: str, cases: list[dict[str, Any]]) -> str:
+    """Render model answers without applying evaluator normalization."""
+    lines = [f"TurboQuant accuracy raw answers: {label}", ""]
+    for case in cases:
+        evaluation_result = case.get("evaluation_result")
+        if case.get("error") is not None:
+            status = "ERROR"
+        elif isinstance(evaluation_result, dict):
+            status = "CORRECT" if evaluation_result.get("correct") else "WRONG"
+        else:
+            status = "NOT_GRADED"
+
+        request = case.get("request") or {}
+        prompt = request.get("prompt")
+        if prompt is None:
+            messages = request.get("messages") or []
+            prompt = "\n".join(
+                f"[{message.get('role', 'unknown')}] {message.get('content', '')}"
+                for message in messages
+                if isinstance(message, dict)
+            )
+        expected = (case.get("evaluation") or {}).get("expected")
+        answer = choice_text(first_choice(case))
+
+        lines.extend(
+            [
+                f"===== {case['id']} =====",
+                f"category: {case.get('category', 'uncategorized')}",
+                f"status: {status}",
+                "prompt:",
+                str(prompt or ""),
+                "expected:",
+                json.dumps(expected, ensure_ascii=False) if expected is not None else "<not graded>",
+                "answer:",
+                "<no model output>" if answer is None else answer,
+            ]
+        )
+        if case.get("error") is not None:
+            lines.extend(["error:", str(case["error"])])
+        lines.extend([f"===== end {case['id']} =====", ""])
+    return "\n".join(lines)
+
+
 def collect(args: argparse.Namespace) -> int:
     cases = []
     failures = 0
@@ -361,7 +410,11 @@ def collect(args: argparse.Namespace) -> int:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    text_output = args.text_output or args.output.with_name(f"{args.output.stem}_answers.txt")
+    text_output.parent.mkdir(parents=True, exist_ok=True)
+    text_output.write_text(answer_text_report(args.label, cases), encoding="utf-8")
     print(f"Report: {args.output}")
+    print(f"Raw answers: {text_output}")
     return 1 if failures else 0
 
 

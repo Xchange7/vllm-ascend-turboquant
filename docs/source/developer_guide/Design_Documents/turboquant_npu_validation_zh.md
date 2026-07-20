@@ -217,6 +217,8 @@ TurboQuant 运行错误。实际 token 数和总预算也会记录在 `base.json
 | --- | --- |
 | `base.json` | native 请求和完整响应 |
 | `test.json` | TurboQuant 请求和完整响应 |
+| `origin_answers.txt` | baseline/native 各题 prompt、期望值和未经规范化的原始输出 |
+| `turboquant_answers.txt` | TurboQuant 各题 prompt、期望值和未经规范化的原始输出 |
 | `comparison.json` | 每个 case 的文本、token prefix 和 logprob 差异 |
 | `summary.md` | 可直接阅读的汇总 |
 | `native_server.log` | native server 启动与运行日志 |

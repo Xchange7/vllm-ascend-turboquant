@@ -146,13 +146,16 @@ start_server() {
 }
 
 collect_results() {
-    local label="$1"
+    local role="$1"
+    local label="$2"
+    local text_output="$3"
     local collect_args=(
         collect
         --base-url "http://127.0.0.1:${PORT}"
         --model "${MODEL}"
         --prompts "${PROMPTS}"
-        --output "${OUTPUT_DIR}/${label}.json"
+        --output "${OUTPUT_DIR}/${role}.json"
+        --text-output "${OUTPUT_DIR}/${text_output}"
         --label "${label}"
         --timeout "${REQUEST_TIMEOUT}"
         --max-model-len "${MAX_MODEL_LEN}"
@@ -176,7 +179,7 @@ start_server \
     "${BASE_CACHE_DTYPE}" \
     "${BASE_ENFORCE_EAGER}" \
     "${BASE_SPECULATIVE_CONFIG}"
-collect_results base
+collect_results base "${BASE_LABEL}" origin_answers.txt
 stop_server
 
 start_server \
@@ -184,7 +187,7 @@ start_server \
     "${TEST_CACHE_DTYPE}" \
     "${TEST_ENFORCE_EAGER}" \
     "${TEST_SPECULATIVE_CONFIG}"
-collect_results test
+collect_results test "${TEST_LABEL}" turboquant_answers.txt
 stop_server
 
 COMPARE_ARGS=(
@@ -207,3 +210,5 @@ if [[ -n "${MAX_QUALITY_REGRESSIONS}" ]]; then
 fi
 python3 "${SCRIPT_DIR}/accuracy_eval.py" "${COMPARE_ARGS[@]}" | tee "${OUTPUT_DIR}/comparison.log"
 printf 'Accuracy report: %s\n' "${OUTPUT_DIR}/summary.md"
+printf 'Original answers: %s\n' "${OUTPUT_DIR}/origin_answers.txt"
+printf 'TurboQuant answers: %s\n' "${OUTPUT_DIR}/turboquant_answers.txt"

@@ -195,6 +195,43 @@ def test_accuracy_evaluates_exact_and_json_answers() -> None:
     assert structured["correct"] is True
 
 
+def test_accuracy_text_report_preserves_raw_model_answers() -> None:
+    accuracy = load_script("accuracy_eval.py")
+    cases = [
+        {
+            "id": "multiline",
+            "category": "factual",
+            "evaluation": {"type": "exact", "expected": "第一行\n  第二行"},
+            "evaluation_result": {"correct": False},
+            "request": {
+                "messages": [
+                    {"role": "system", "content": "只回答问题。"},
+                    {"role": "user", "content": "输出两行。"},
+                ]
+            },
+            "response": {"choices": [{"message": {"content": "第一行\n  第二行  "}}]},
+            "error": None,
+        },
+        {
+            "id": "failed",
+            "category": "factual",
+            "evaluation": None,
+            "evaluation_result": None,
+            "request": {"prompt": "unavailable"},
+            "response": None,
+            "error": "RuntimeError: request failed",
+        },
+    ]
+
+    report = accuracy.answer_text_report("turboquant", cases)
+
+    assert "TurboQuant accuracy raw answers: turboquant" in report
+    assert "[system] 只回答问题。\n[user] 输出两行。" in report
+    assert "answer:\n第一行\n  第二行  \n===== end multiline =====" in report
+    assert "answer:\n<no model output>" in report
+    assert "error:\nRuntimeError: request failed" in report
+
+
 def test_accuracy_marks_native_pass_turboquant_fail_as_regression() -> None:
     accuracy = load_script("accuracy_eval.py")
 
