@@ -476,6 +476,30 @@ at::Tensor npu_reshape_and_cache_bnsd_meta(const at::Tensor& hashq,
     return output;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant_meta(
+    const at::Tensor& query,
+    const at::Tensor& kvCache,
+    const at::Tensor& blockTable,
+    const at::Tensor& seqLens,
+    const at::Tensor& centroids,
+    int64_t maxSeqLen,
+    int64_t keyBits,
+    int64_t keyPackedSize,
+    int64_t valueBits,
+    bool normCorrection) {
+    (void)blockTable;
+    (void)seqLens;
+    (void)centroids;
+    (void)keyBits;
+    (void)keyPackedSize;
+    (void)valueBits;
+    (void)normCorrection;
+    const c10::SymDimVector outputShape = {
+        query.sym_size(0), kvCache.sym_size(2), maxSeqLen, query.sym_size(2)};
+    at::Tensor key = at::empty_symint(outputShape, query.options());
+    at::Tensor value = at::empty_symint(outputShape, query.options());
+    return std::make_tuple(key, value);
+}
 
 at::Tensor npu_hamming_dist_top_k_meta(const at::Tensor &hashq,
                                        const at::Tensor &hashkCache,
@@ -1607,6 +1631,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_hamming_dist_top_k", &vllm_ascend::meta::npu_hamming_dist_top_k_meta);
     // reshape_and_cache_bnsd
     ops.impl("npu_reshape_and_cache_bnsd", &vllm_ascend::meta::npu_reshape_and_cache_bnsd_meta);
+    // TurboQuant paged gather, unpack, and dequantization
+    ops.impl("npu_turboquant_paged_dequant", &vllm_ascend::meta::npu_turboquant_paged_dequant_meta);
     // npu_sign_bits_pack
     ops.impl("npu_sign_bits_pack", &vllm_ascend::meta::npu_sign_bits_pack_meta);
     // CopyAndExpandEagleInputs

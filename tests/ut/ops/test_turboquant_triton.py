@@ -36,6 +36,7 @@ from vllm_ascend.ops.triton.turboquant_decode import (
     triton_turboquant_dequant_paged_cache,
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
+from vllm_ascend.ops.turboquant import turboquant_paged_dequant
 
 _DECODE_CORRECTNESS_CASES = [
     (cache_dtype, query_len, torch.float16, 128, False, False, None, "auto")
@@ -66,6 +67,217 @@ def _constants(cache_dtype: str, head_dim: int):
     centroids, _ = centroids.sort()
     midpoints = (centroids[:-1] + centroids[1:]) / 2
     return config, hadamard, centroids, midpoints
+
+
+def _build_fused_dequant_inputs(
+    cache_dtype: str,
+    activation_dtype: torch.dtype,
+    *,
+    head_dim: int = 128,
+):
+    torch.manual_seed(7)
+    batch_size = 2
+    num_kv_heads = 2
+    seq_lens_list = [133, 65]
+    max_seq_len = max(seq_lens_list)
+    config, hadamard, centroids, midpoints = _constants(cache_dtype, head_dim)
+    block_table = torch.tensor(
+        [[2, 0], [3, 1]],
+        dtype=torch.int32,
+        device="npu",
+    )
+    cache = torch.zeros(
+        4,
+        128,
+        num_kv_heads,
+        config.slot_size_aligned,
+        dtype=torch.uint8,
+        device="npu",
+    )
+    key_parts = []
+    value_parts = []
+    slot_parts = []
+    for request_index, sequence_length in enumerate(seq_lens_list):
+        positions = torch.arange(sequence_length, dtype=torch.int64, device="npu")
+        physical_blocks = block_table[request_index, positions // 128]
+        slot_parts.append(physical_blocks.to(torch.int64) * 128 + positions % 128)
+        key_parts.append(
+            torch.randn(
+                sequence_length,
+                num_kv_heads,
+                head_dim,
+                dtype=activation_dtype,
+                device="npu",
+            )
+        )
+        value_parts.append(torch.randn_like(key_parts[-1]))
+
+    key = torch.cat(key_parts)
+    value = torch.cat(value_parts)
+    triton_turboquant_store(
+        key,
+        value,
+        cache,
+        torch.cat(slot_parts),
+        hadamard,
+        midpoints,
+        key_bits=config.key_quant_bits,
+        key_packed_size=config.key_packed_size,
+        value_bits=config.value_quant_bits,
+        compute_rotation=hadamard.to(activation_dtype),
+    )
+    torch.npu.synchronize()
+    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device="npu")
+    query = torch.randn(
+        batch_size,
+        16,
+        head_dim,
+        dtype=activation_dtype,
+        device="npu",
+    )
+    return (
+        config,
+        hadamard,
+        centroids,
+        cache,
+        block_table,
+        seq_lens,
+        seq_lens_list,
+        max_seq_len,
+        query,
+    )
+
+
+@npu_test(num_npus=1, npu_type="a2")
+@pytest.mark.parametrize(
+    ("cache_dtype", "activation_dtype"),
+    [
+        ("turboquant_4bit_nc", torch.float16),
+        ("turboquant_4bit_nc", torch.bfloat16),
+        ("turboquant_k3v4_nc", torch.float16),
+        ("turboquant_3bit_nc", torch.float16),
+    ],
+)
+def test_turboquant_ascend_fused_dequant_matches_triton(
+    cache_dtype,
+    activation_dtype,
+):
+    (
+        config,
+        _,
+        centroids,
+        cache,
+        block_table,
+        seq_lens,
+        seq_lens_list,
+        max_seq_len,
+        query,
+    ) = _build_fused_dequant_inputs(cache_dtype, activation_dtype)
+    key_bnsd, value_bnsd = turboquant_paged_dequant(
+        query,
+        cache,
+        block_table,
+        seq_lens,
+        centroids,
+        max_seq_len=max_seq_len,
+        key_bits=config.key_quant_bits,
+        key_packed_size=config.key_packed_size,
+        value_bits=config.value_quant_bits,
+        norm_correction=config.norm_correction,
+    )
+
+    total_tokens = sum(seq_lens_list)
+    key_reference = torch.empty(
+        total_tokens,
+        cache.shape[2],
+        query.shape[-1],
+        dtype=activation_dtype,
+        device="npu",
+    )
+    value_reference = torch.empty_like(key_reference)
+    triton_turboquant_dequant_paged_cache(
+        cache,
+        block_table,
+        seq_lens,
+        torch.tensor(
+            [0, seq_lens_list[0], total_tokens],
+            dtype=torch.int32,
+            device="npu",
+        ),
+        centroids,
+        key_reference,
+        value_reference,
+        max_seq_len=max_seq_len,
+        key_bits=config.key_quant_bits,
+        key_packed_size=config.key_packed_size,
+        value_bits=config.value_quant_bits,
+        norm_correction=config.norm_correction,
+    )
+    torch.npu.synchronize()
+
+    key_dense = torch.cat([key_bnsd[i, :, :seq_len].permute(1, 0, 2) for i, seq_len in enumerate(seq_lens_list)])
+    value_dense = torch.cat([value_bnsd[i, :, :seq_len].permute(1, 0, 2) for i, seq_len in enumerate(seq_lens_list)])
+    tolerance = 2e-2 if activation_dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(key_dense, key_reference, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(value_dense, value_reference, atol=tolerance, rtol=tolerance)
+
+
+@npu_test(num_npus=1, npu_type="a2")
+def test_turboquant_ascend_fused_decode_matches_packed_decode():
+    (
+        config,
+        hadamard,
+        centroids,
+        cache,
+        block_table,
+        seq_lens,
+        seq_lens_list,
+        max_seq_len,
+        query,
+    ) = _build_fused_dequant_inputs("turboquant_4bit_nc", torch.float16)
+    layer = SimpleNamespace(
+        _tq_ascend_centroids=centroids,
+        _tq_ascend_compute_rotation=hadamard.to(query.dtype),
+    )
+    impl = object.__new__(AscendTurboQuantAttentionImpl)
+    impl.num_kv_heads = cache.shape[2]
+    impl.num_heads = query.shape[1]
+    impl.scale = 1 / math.sqrt(query.shape[-1])
+    impl.tq_config = config
+    fused_output = impl._run_ascend_fused_decode(
+        layer,
+        query,
+        cache,
+        block_table,
+        seq_lens,
+        seq_lens_list,
+        torch.empty_like(query),
+        max_seq_len,
+    )
+    packed_output = triton_turboquant_decode_attention(
+        query,
+        cache,
+        block_table,
+        seq_lens,
+        hadamard,
+        centroids,
+        scale=1 / math.sqrt(query.shape[-1]),
+        key_bits=config.key_quant_bits,
+        key_packed_size=config.key_packed_size,
+        value_bits=config.value_quant_bits,
+        norm_correction=config.norm_correction,
+        max_num_kv_splits=4,
+        buffer_holder=SimpleNamespace(),
+        compute_rotation=hadamard.to(query.dtype),
+        implementation="auto",
+    )
+    torch.npu.synchronize()
+    torch.testing.assert_close(
+        fused_output,
+        packed_output,
+        atol=2e-2,
+        rtol=2e-2,
+    )
 
 
 @pytest.mark.parametrize(

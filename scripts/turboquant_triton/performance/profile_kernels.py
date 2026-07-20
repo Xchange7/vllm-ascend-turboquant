@@ -44,6 +44,7 @@ from vllm_ascend.ops.triton.turboquant_decode import (
     triton_turboquant_dequant_paged_cache,
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
+from vllm_ascend.ops.turboquant import turboquant_paged_dequant
 
 
 @dataclass
@@ -91,6 +92,8 @@ def parse_args() -> argparse.Namespace:
             "decode",
             "decode_step",
             "dequant",
+            "fused_dequant",
+            "fused_decode",
             "native_decode",
         ),
         default="all",
@@ -540,6 +543,65 @@ def build_dequant_case(args: argparse.Namespace, constants, paged_cache) -> Benc
     )
 
 
+def build_ascend_fused_case(
+    args: argparse.Namespace,
+    constants,
+    paged_cache,
+    *,
+    include_attention: bool,
+) -> BenchmarkCase:
+    config, _, centroids, _, compute_rotation = constants
+    cache, block_table, seq_lens, _, _ = paged_cache
+    device = torch.device(f"npu:{args.device}")
+    query = torch.randn(
+        args.batch_size,
+        args.num_query_heads,
+        args.head_dim,
+        dtype=activation_dtype(args),
+        device=device,
+    )
+    seq_lens_list = [args.sequence_length] * args.batch_size
+
+    def run():
+        key_bnsd, value_bnsd = turboquant_paged_dequant(
+            query,
+            cache,
+            block_table,
+            seq_lens,
+            centroids,
+            max_seq_len=args.sequence_length,
+            key_bits=config.key_quant_bits,
+            key_packed_size=config.key_packed_size,
+            value_bits=config.value_quant_bits,
+            norm_correction=config.norm_correction,
+        )
+        if not include_attention:
+            return key_bnsd, value_bnsd
+        query_rotated = (query @ compute_rotation).contiguous()
+        output, _ = torch_npu.npu_fused_infer_attention_score(
+            query=query_rotated.unsqueeze(2),
+            key=key_bnsd,
+            value=value_bnsd,
+            block_table=None,
+            input_layout="BNSD",
+            block_size=args.block_size,
+            actual_seq_lengths_kv=seq_lens_list,
+            num_key_value_heads=args.num_kv_heads,
+            num_heads=args.num_query_heads,
+            scale=1 / math.sqrt(args.head_dim),
+            sparse_mode=0,
+        )
+        return output
+
+    return BenchmarkCase(
+        name="fused_decode" if include_attention else "fused_dequant",
+        run=run,
+        work_per_iteration=(args.batch_size if include_attention else args.batch_size * args.sequence_length),
+        throughput_name=("generated_tokens_per_second" if include_attention else "cache_tokens_per_second"),
+        tensors=(query, compute_rotation, cache, block_table, seq_lens),
+    )
+
+
 def benchmark(case: BenchmarkCase, args: argparse.Namespace) -> BenchmarkResult:
     for _ in range(args.warmup):
         case.run()
@@ -660,7 +722,14 @@ def main() -> None:
     cases: list[BenchmarkCase] = []
     if args.operation in ("all", "store"):
         cases.append(build_store_case(args, constants))
-    if args.operation in ("all", "decode", "decode_step", "dequant"):
+    if args.operation in (
+        "all",
+        "decode",
+        "decode_step",
+        "dequant",
+        "fused_dequant",
+        "fused_decode",
+    ):
         paged_cache = build_paged_cache(args, constants)
         if args.operation in ("all", "decode"):
             cases.append(build_decode_case(args, constants, paged_cache))
@@ -675,6 +744,24 @@ def main() -> None:
             )
         if args.operation in ("all", "dequant"):
             cases.append(build_dequant_case(args, constants, paged_cache))
+        if args.operation in ("all", "fused_dequant"):
+            cases.append(
+                build_ascend_fused_case(
+                    args,
+                    constants,
+                    paged_cache,
+                    include_attention=False,
+                )
+            )
+        if args.operation in ("all", "fused_decode"):
+            cases.append(
+                build_ascend_fused_case(
+                    args,
+                    constants,
+                    paged_cache,
+                    include_attention=True,
+                )
+            )
     if args.operation == "native_decode" or (args.native_baseline and args.operation in ("all", "decode")):
         cases.append(build_native_decode_case(args))
 
@@ -717,6 +804,18 @@ def main() -> None:
             }
         )
         print(f"decode step: store_overhead={store_overhead_ms:.4f} ms total={decode_step['mean_ms']:.4f} ms")
+    if "decode" in result_by_operation and "fused_decode" in result_by_operation:
+        packed_decode = result_by_operation["decode"]
+        fused_decode = result_by_operation["fused_decode"]
+        fused_speedup = packed_decode["mean_ms"] / fused_decode["mean_ms"]
+        comparison["ascend_fused_speedup_vs_packed_decode"] = fused_speedup
+        print(f"Ascend fused compare: speedup_vs_packed_decode={fused_speedup:.3f}x")
+    if "dequant" in result_by_operation and "fused_dequant" in result_by_operation:
+        triton_dequant = result_by_operation["dequant"]
+        fused_dequant = result_by_operation["fused_dequant"]
+        dequant_speedup = triton_dequant["mean_ms"] / fused_dequant["mean_ms"]
+        comparison["ascend_fused_dequant_speedup_vs_triton"] = dequant_speedup
+        print(f"Ascend fused dequant compare: speedup_vs_triton={dequant_speedup:.3f}x")
 
     report = {
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},

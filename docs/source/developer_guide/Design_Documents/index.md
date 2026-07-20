@@ -16,6 +16,7 @@ add_custom_aclnn_op
 context_parallel
 dynamic_chunked_pipeline_parallel
 quantization
+turboquant_ascend_fused_operator_zh
 turboquant_code_walkthrough_zh
 turboquant_implementation_zh
 turboquant_limitations_zh

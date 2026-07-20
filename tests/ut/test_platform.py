@@ -743,6 +743,10 @@ class TestNPUPlatform(TestBase):
             "vllm_ascend.attention.turboquant.AscendTurboQuantAttentionBackend",
         )
 
+    @patch.dict(
+        "os.environ",
+        {"VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION": "auto"},
+    )
     def test_turboquant_supports_uniform_batch_graph_capture(self):
         from vllm_ascend.attention.turboquant import (
             AscendTurboQuantMetadataBuilder,
@@ -754,6 +758,23 @@ class TestNPUPlatform(TestBase):
                 MagicMock(),
             ),
             AttentionCGSupport.UNIFORM_BATCH,
+        )
+
+    @patch.dict(
+        "os.environ",
+        {"VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION": "ascend_fused"},
+    )
+    def test_turboquant_ascend_fused_disables_graph_capture(self):
+        from vllm_ascend.attention.turboquant import (
+            AscendTurboQuantMetadataBuilder,
+        )
+
+        self.assertEqual(
+            AscendTurboQuantMetadataBuilder.get_cudagraph_support(
+                MagicMock(),
+                MagicMock(),
+            ),
+            AttentionCGSupport.NEVER,
         )
 
     def test_get_punica_wrapper(self):

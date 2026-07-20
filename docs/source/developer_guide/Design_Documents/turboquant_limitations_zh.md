@@ -26,6 +26,7 @@ backend 通用化和社区可维护性时能够达到的范围。它不是当前
 | FP16/BF16 activation | 支持 | FP16/BF16 均稳定支持，packed cache 保持 `uint8` | BF16、零 key、常量 value 测试已补 |
 | MSE key/value presets | 支持 | 稳定支持 4-bit、K3V4 和 3-bit 三种 preset | 三 preset 的 1/2/4/8-token 算子矩阵已补；剩余模型精度 |
 | Eager decode | 支持 | 稳定支持单 token、mixed request batch 和非连续 block table | 跨 page/非连续 page 测试已补；剩余 preemption E2E |
+| AscendC 融合 decode | 实验性 | 单 token eager 下使用融合 paged dequant + CANN FIA，multi-token 回退 Triton | 已补算子和数值/性能脚本；剩余 910B4 correctness/profile |
 | 首次 prefill | 支持 | 稳定支持首次 prefill，并支持同批 decode + prefill | mixed metadata 和输出切分已实现 |
 | Continuation/chunked prefill | 分层支持 | 小 chunk 复用 packed multi-query decode；大 chunk 仅反量化历史再调用 FIA | workspace 容量检查和非持久 history scratch 已实现；剩余 910B4 性能门禁 |
 | Prefix cache | 实验性 | 同一 engine 内稳定支持命中、page copy、eviction、preemption/resume | overlap-safe page copy/swap 已实现；剩余 scheduler E2E |

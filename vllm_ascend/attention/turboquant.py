@@ -49,6 +49,7 @@ from vllm_ascend.ops.triton.turboquant_decode import (
     triton_turboquant_dequant_paged_cache,
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
+from vllm_ascend.ops.turboquant import turboquant_paged_dequant
 
 _TURBOQUANT_CACHE_DTYPES: list[CacheDType] = [
     "turboquant_4bit_nc",
@@ -147,6 +148,8 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         vllm_config,
         kv_cache_spec,
     ) -> AttentionCGSupport:
+        if envs.VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION == "ascend_fused":
+            return AttentionCGSupport.NEVER
         return cls._cudagraph_support
 
     def build(
@@ -190,7 +193,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
 
 
 class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
-    """Ascend backend backed by Triton-Ascend packed KV operators."""
+    """Ascend backend backed by packed KV operators and native FIA."""
 
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = False
@@ -319,11 +322,21 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         attention_config = get_current_vllm_config().attention_config
         self.max_num_kv_splits = attention_config.tq_max_kv_splits_for_cuda_graph
         self.decode_implementation = envs.VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION
-        if self.decode_implementation not in ("auto", "grouped_gqa", "reference"):
+        if self.decode_implementation not in (
+            "auto",
+            "ascend_fused",
+            "grouped_gqa",
+            "reference",
+        ):
             raise ValueError(
                 "VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION must be auto, "
-                f"grouped_gqa, or reference; got {self.decode_implementation}."
+                "ascend_fused, grouped_gqa, or reference; got "
+                f"{self.decode_implementation}."
             )
+        if self.decode_implementation == "ascend_fused" and (
+            self.alibi_slopes is not None or self.logits_soft_cap is not None
+        ):
+            raise NotImplementedError("Ascend TurboQuant fused decode does not support ALiBi or logits soft cap.")
 
     def _ensure_constants(
         self,
@@ -461,6 +474,63 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             )
         )
 
+    def _run_ascend_fused_decode(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_list: list[int],
+        output: torch.Tensor,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """Decode packed cache with AscendC dequantization followed by FIA."""
+        if len(seq_lens_list) != query.shape[0]:
+            raise ValueError(
+                "Ascend TurboQuant fused decode requires one sequence length "
+                f"per query, got {len(seq_lens_list)} and {query.shape[0]}."
+            )
+        if max_seq_len <= 0 or max_seq_len < max(seq_lens_list):
+            raise ValueError(
+                "Ascend TurboQuant fused decode max_seq_len must cover all "
+                f"sequences, got {max_seq_len} for {seq_lens_list}."
+            )
+
+        key_rotated, value = turboquant_paged_dequant(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            layer._tq_ascend_centroids,
+            max_seq_len=max_seq_len,
+            key_bits=self.tq_config.key_quant_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_bits=self.tq_config.value_quant_bits,
+            norm_correction=self.tq_config.norm_correction,
+        )
+        # K is stored in randomized Hadamard coordinates. Rotating Q preserves
+        # QK exactly and avoids materializing an inverse-rotated dense K tensor.
+        query_rotated = torch.matmul(
+            query,
+            layer._tq_ascend_compute_rotation,
+        ).contiguous()
+        attention_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query=query_rotated.unsqueeze(2),
+            key=key_rotated,
+            value=value,
+            block_table=None,
+            input_layout="BNSD",
+            block_size=kv_cache.shape[1],
+            actual_seq_lengths_kv=seq_lens_list,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            sparse_mode=0,
+        )
+        output.copy_(attention_output.squeeze(2))
+        return output
+
     def _run_feature_prefill(
         self,
         query: torch.Tensor,
@@ -578,6 +648,22 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         if not query_lens:
             return output
 
+        if self.decode_implementation == "ascend_fused" and all(query_len == 1 for query_len in query_lens):
+            max_seq_len = metadata.max_seq_len
+            if max_seq_len is None:
+                max_seq_len = max(metadata.seq_lens_list[:num_reqs])
+            self._run_ascend_fused_decode(
+                layer,
+                query[:num_reqs],
+                kv_cache,
+                metadata.block_tables[:num_reqs],
+                metadata.seq_lens[:num_reqs],
+                metadata.seq_lens_list[:num_reqs],
+                output[:num_reqs],
+                max_seq_len,
+            )
+            return output
+
         if all(query_len == query_lens[0] for query_len in query_lens):
             self._uniform_multi_token_decode(
                 layer,
@@ -654,6 +740,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         sequence_length_delta: int = 0,
         max_sequence_length: int | None = None,
     ) -> torch.Tensor:
+        triton_implementation = "auto" if self.decode_implementation == "ascend_fused" else self.decode_implementation
         num_kv_splits = select_turboquant_num_kv_splits(
             batch_size=seq_lens.shape[0],
             num_query_heads=self.num_heads,
@@ -661,7 +748,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             head_dim=self.head_size,
             max_num_kv_splits=self.max_num_kv_splits,
             max_sequence_length=max_sequence_length,
-            implementation=self.decode_implementation,
+            implementation=triton_implementation,
         )
         return triton_turboquant_decode_attention(
             query,
@@ -682,7 +769,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             output=output,
             sequence_length_delta=sequence_length_delta,
             compute_rotation=(None if self.decode_implementation == "reference" else layer._tq_ascend_compute_rotation),
-            implementation=self.decode_implementation,
+            implementation=triton_implementation,
         )
 
     def _continuation_prefill(

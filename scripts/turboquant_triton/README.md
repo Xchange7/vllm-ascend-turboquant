@@ -23,6 +23,18 @@ pip install -e .
 TurboQuant compresses only the runtime KV cache. It does not require a
 ModelSlim calibration artifact and does not quantize model weights.
 
+The experimental AscendC paged-dequant + CANN FIA decode path requires a
+rebuild and eager execution. Its design, memory tradeoff, and 910B4 validation
+procedure are documented in
+`docs/source/developer_guide/Design_Documents/turboquant_ascend_fused_operator_zh.md`.
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+pip install -e .
+ASCEND_RT_VISIBLE_DEVICES=0 \
+bash scripts/turboquant_triton/diagnostics/run_ascend_fused_validation.sh
+```
+
 ## Directory layout
 
 | Directory | Purpose |
