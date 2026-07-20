@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 RUN_ROOT="${RUN_ROOT:-${REPO_ROOT}/logs/turboquant/npu_validation_${TIMESTAMP}}"
@@ -47,7 +47,7 @@ if [[ "${RUN_CORRECTNESS}" == "1" ]]; then
     run_stage correctness env \
         LOG_ROOT="${RUN_ROOT}/correctness" \
         RUN_PROFILE=0 \
-        bash "${SCRIPT_DIR}/run_diagnostic_suite.sh"
+        bash "${TQ_DIAGNOSTICS_DIR}/run_diagnostic_suite.sh"
     if [[ -n "${MODEL:-}" ]]; then
         run_stage graph_e2e env \
             OUTPUT_DIR="${RUN_ROOT}/graph_e2e" \
@@ -57,7 +57,7 @@ if [[ "${RUN_CORRECTNESS}" == "1" ]]; then
             TEST_LABEL=turboquant_aclgraph \
             TEST_CACHE_DTYPE="${TQ_CACHE_DTYPE:-turboquant_4bit_nc}" \
             TEST_ENFORCE_EAGER=0 \
-            bash "${SCRIPT_DIR}/run_accuracy_comparison.sh"
+            bash "${TQ_CORRECTNESS_DIR}/run_accuracy_comparison.sh"
     else
         printf 'graph_e2e\tSKIP\t0\tMODEL is unset\n' >>"${RESULTS_FILE}"
     fi
@@ -74,7 +74,7 @@ if [[ "${RUN_ACCURACY}" == "1" ]]; then
     else
         run_stage accuracy env \
             OUTPUT_DIR="${RUN_ROOT}/accuracy" \
-            bash "${SCRIPT_DIR}/run_accuracy_comparison.sh"
+            bash "${TQ_CORRECTNESS_DIR}/run_accuracy_comparison.sh"
     fi
 else
     skip_stage accuracy
@@ -83,7 +83,7 @@ fi
 if [[ "${RUN_PERFORMANCE}" == "1" ]]; then
     run_stage performance env \
         OUTPUT_DIR="${RUN_ROOT}/performance" \
-        bash "${SCRIPT_DIR}/run_performance_validation.sh"
+        bash "${TQ_PERFORMANCE_DIR}/run_performance_validation.sh"
 else
     skip_stage performance
 fi

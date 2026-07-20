@@ -64,6 +64,33 @@ def test_turboquant_dtype_detection_does_not_match_normal_cache():
     assert not is_turboquant_kv_cache_dtype(None)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_turboquant_randomized_hadamard_is_orthogonal(head_dim):
+    from vllm_ascend.attention.turboquant import _build_hadamard
+
+    rotation = _build_hadamard(head_dim, "cpu")
+    identity = torch.eye(head_dim, dtype=torch.float32)
+
+    torch.testing.assert_close(rotation @ rotation.T, identity)
+
+
+def test_turboquant_randomized_hadamard_spreads_constant_vectors():
+    from vllm_ascend.attention.turboquant import _build_hadamard
+
+    head_dim = 128
+    rotation = _build_hadamard(head_dim, "cpu")
+    rotated = torch.ones(1, head_dim) @ rotation
+
+    # A plain Sylvester Hadamard maps this input to one coordinate with
+    # magnitude sqrt(D). Random signs before mixing keep the largest coordinate
+    # below 30% of the vector norm for the fixed production seed.
+    assert rotated.abs().amax() / torch.linalg.vector_norm(rotated) < 0.3
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(rotated),
+        torch.tensor(head_dim**0.5),
+    )
+
+
 def test_turboquant_rejects_unimplemented_fp8_key_path():
     with pytest.raises(NotImplementedError, match="FP8 keys"):
         validate_turboquant_layout("turboquant_k8v4", 128)

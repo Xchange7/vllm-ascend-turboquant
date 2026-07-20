@@ -3,7 +3,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/logs/turboquant}"
 RUN_DIR="${LOG_ROOT}/910b4_retest_${TIMESTAMP}"
@@ -81,7 +81,7 @@ run_stage "00_source" "branch and commit used by the retest" collect_source
 run_stage \
     "01_environment" \
     "vLLM core, vLLM Ascend, torch-npu, Triton-Ascend, and cache contract" \
-    python3 "${SCRIPT_DIR}/check_environment.py"
+    python3 "${TQ_COMMON_DIR}/check_environment.py"
 run_stage \
     "02_backend" \
     "Python cache layout, metadata, prefill, and decode routing" \
@@ -135,7 +135,7 @@ if [[ "${RUN_MODEL_SMOKE}" == "1" ]]; then
         TQ_CACHE_DTYPE="${TQ_CACHE_DTYPE}" \
         OUTPUT_DIR="${RUN_DIR}/model_eager" \
         WARM_PREFIX=0 \
-        bash "${SCRIPT_DIR}/run_accuracy_comparison.sh"
+        bash "${TQ_CORRECTNESS_DIR}/run_accuracy_comparison.sh"
 else
     skip_stage "06_qwen3_0_6b_eager" "RUN_MODEL_SMOKE=0"
 fi

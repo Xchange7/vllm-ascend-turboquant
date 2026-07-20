@@ -3,19 +3,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 PROFILE_ROOT="${PROFILE_ROOT:-${REPO_ROOT}/profiles/turboquant_matrix}"
 ITERATIONS="${ITERATIONS:-20}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-4096}"
 
 cd "${REPO_ROOT}"
-python3 scripts/turboquant_triton/check_environment.py
+python3 "${TQ_COMMON_DIR}/check_environment.py"
 mkdir -p "${PROFILE_ROOT}"
 
 run_case() {
     local name="$1"
     shift
-    python3 scripts/turboquant_triton/profile_kernels.py \
+    python3 "${TQ_PERFORMANCE_DIR}/profile_kernels.py" \
         --operation all \
         --native-baseline \
         --sequence-length "${SEQUENCE_LENGTH}" \

@@ -26,7 +26,9 @@
 | `serving_benchmark.py` | 采集流式请求计时并生成 native/TurboQuant 对比报告 |
 | `summarize_profiles.py` | 汇总所有 `benchmark.json` |
 
-所有脚本都位于 `scripts/turboquant_triton/`。
+所有脚本都位于 `scripts/turboquant_triton/`，并按用途分为 `common/`、
+`correctness/`、`performance/` 和 `diagnostics/` 四个子目录。完整入口和参数说明见该目录下
+的 `README.md`。
 
 ## 3. 环境准备
 
@@ -44,7 +46,7 @@
 
 ```bash
 pip install -e .
-python3 scripts/turboquant_triton/check_environment.py
+python3 scripts/turboquant_triton/common/check_environment.py
 ```
 
 ### 3.2 NPU 和模型参数
@@ -67,7 +69,7 @@ Qwen3-32B BF16 权重通常不适合在单张 64 GiB NPU 上完成有意义的 K
 ASCEND_RT_VISIBLE_DEVICES=0 \
 MODEL=/run/test_llm/Qwen3-0.6B-hf \
 TP_SIZE=1 \
-bash scripts/turboquant_triton/run_910b4_retest.sh
+bash scripts/turboquant_triton/diagnostics/run_910b4_retest.sh
 ```
 
 该脚本默认使用 `MAX_MODEL_LEN=2048`、`MAX_NUM_SEQS=2` 和
@@ -104,7 +106,7 @@ bash scripts/turboquant_triton/run_910b4_retest.sh
 ASCEND_RT_VISIBLE_DEVICES=0,1 \
 MODEL=/path/to/Qwen3-32B \
 TP_SIZE=2 \
-bash scripts/turboquant_triton/run_npu_validation.sh
+bash scripts/turboquant_triton/diagnostics/run_npu_validation.sh
 ```
 
 默认执行：
@@ -124,7 +126,7 @@ bash scripts/turboquant_triton/run_npu_validation.sh
 
 ```bash
 RUN_PROFILE=0 \
-bash scripts/turboquant_triton/run_diagnostic_suite.sh
+bash scripts/turboquant_triton/diagnostics/run_diagnostic_suite.sh
 ```
 
 阶段含义如下：
@@ -168,7 +170,7 @@ TEST_LABEL=turboquant_aclgraph \
 TEST_CACHE_DTYPE=turboquant_4bit_nc \
 TEST_ENFORCE_EAGER=0 \
 OUTPUT_DIR=logs/turboquant/graph_e2e \
-bash scripts/turboquant_triton/run_accuracy_comparison.sh
+bash scripts/turboquant_triton/correctness/run_accuracy_comparison.sh
 ```
 
 重点检查两个 server log 中 backend、graph capture 和 replay 信息，确认请求不是全部回退到
@@ -183,7 +185,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 \
 MODEL=/path/to/Qwen3-32B \
 TP_SIZE=2 \
 OUTPUT_DIR=logs/turboquant/accuracy_manual \
-bash scripts/turboquant_triton/run_accuracy_comparison.sh
+bash scripts/turboquant_triton/correctness/run_accuracy_comparison.sh
 ```
 
 默认顺序启动 native eager 和 `turboquant_4bit_nc` eager server。两个服务不会同时占用
@@ -241,7 +243,7 @@ kernel reference 测试通过，再结合任务准确率和长上下文数据判
 MIN_EXACT_MATCH_RATE=0.80 \
 MIN_TOKEN_PREFIX_RATE=0.90 \
 MAX_MEAN_LOGPROB_DIFF=0.30 \
-bash scripts/turboquant_triton/run_accuracy_comparison.sh
+bash scripts/turboquant_triton/correctness/run_accuracy_comparison.sh
 ```
 
 这些数值只是命令示例，不是当前项目承诺的验收标准。
@@ -264,7 +266,7 @@ JSONL 每行格式为：
 
 ```bash
 PROMPTS=/path/to/custom_prompts.jsonl \
-bash scripts/turboquant_triton/run_accuracy_comparison.sh
+bash scripts/turboquant_triton/correctness/run_accuracy_comparison.sh
 ```
 
 ### 6.5 客观质量与抗幻觉测试
@@ -276,7 +278,7 @@ bash scripts/turboquant_triton/run_accuracy_comparison.sh
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
 MODEL=/path/to/Qwen3-32B \
 TP_SIZE=4 \
-bash scripts/turboquant_triton/run_quality_comparison.sh
+bash scripts/turboquant_triton/correctness/run_quality_comparison.sh
 ```
 
 默认使用 `chat_template_kwargs={"enable_thinking": false}` 和贪心解码，覆盖：
@@ -307,7 +309,7 @@ bash scripts/turboquant_triton/run_quality_comparison.sh
 ASCEND_RT_VISIBLE_DEVICES=0 \
 MODEL=/run/test_llm/Qwen3-0.6B-hf \
 TP_SIZE=1 \
-bash scripts/turboquant_triton/run_serving_benchmark.sh
+bash scripts/turboquant_triton/performance/run_serving_benchmark.sh
 ```
 
 默认 workload 为 1024 个输入 token、128 个输出 token、2 次预热和 10 次正式
@@ -330,7 +332,7 @@ bytes/token 比率和 KV 内存减少百分比。原始逐请求数据保存在 
 INPUT_TOKENS=1536 OUTPUT_TOKENS=256 \
 WARMUP_REQUESTS=3 MEASURE_REQUESTS=20 \
 MAX_MODEL_LEN=2048 \
-bash scripts/turboquant_triton/run_serving_benchmark.sh
+bash scripts/turboquant_triton/performance/run_serving_benchmark.sh
 ```
 
 Qwen3-32B 可使用 4 卡 TP，并把客户端和服务端并发同时设为 16。建议至少运行一轮
@@ -342,7 +344,7 @@ MODEL=/path/to/Qwen3-32B \
 TP_SIZE=4 CONCURRENCY=16 MAX_NUM_SEQS=16 \
 WARMUP_REQUESTS=16 MEASURE_REQUESTS=64 \
 MAX_MODEL_LEN=2048 INPUT_TOKENS=1024 OUTPUT_TOKENS=128 \
-bash scripts/turboquant_triton/run_serving_benchmark.sh
+bash scripts/turboquant_triton/performance/run_serving_benchmark.sh
 ```
 
 `CONCURRENCY` 控制客户端同时在途的流式请求数；未显式设置 `MAX_NUM_SEQS` 时，
@@ -354,7 +356,7 @@ aggregate output token/s。
 ### 7.1 默认矩阵
 
 ```bash
-bash scripts/turboquant_triton/run_performance_validation.sh
+bash scripts/turboquant_triton/performance/run_performance_validation.sh
 ```
 
 默认遍历：
@@ -381,7 +383,7 @@ SEQUENCE_LENGTHS=1024 \
 NUM_KV_SPLITS_LIST=8 \
 ITERATIONS=5 \
 RUN_COMPONENT_PROFILE=0 \
-bash scripts/turboquant_triton/run_performance_validation.sh
+bash scripts/turboquant_triton/performance/run_performance_validation.sh
 ```
 
 ### 7.3 完整 preset 矩阵
@@ -392,7 +394,7 @@ BATCH_SIZES='1 4 8' \
 SEQUENCE_LENGTHS='1024 4096 8192 16384' \
 NUM_KV_SPLITS_LIST='8 16 32' \
 ITERATIONS=50 \
-bash scripts/turboquant_triton/run_performance_validation.sh
+bash scripts/turboquant_triton/performance/run_performance_validation.sh
 ```
 
 性能测试时不要设置 `ASCEND_LAUNCH_BLOCKING=1`，否则计时没有代表性。
@@ -416,13 +418,13 @@ bash scripts/turboquant_triton/run_performance_validation.sh
 
 ```bash
 RUN_CORRECTNESS=1 RUN_ACCURACY=0 RUN_PERFORMANCE=0 \
-bash scripts/turboquant_triton/run_npu_validation.sh
+bash scripts/turboquant_triton/diagnostics/run_npu_validation.sh
 ```
 
 ```bash
 RUN_CORRECTNESS=0 RUN_ACCURACY=1 RUN_PERFORMANCE=1 \
 MODEL=/path/to/Qwen3-32B \
-bash scripts/turboquant_triton/run_npu_validation.sh
+bash scripts/turboquant_triton/diagnostics/run_npu_validation.sh
 ```
 
 常用变量：
@@ -452,7 +454,7 @@ bash scripts/turboquant_triton/run_npu_validation.sh
 
 ```bash
 DEBUG_SYNC=1 RUN_PROFILE=0 \
-bash scripts/turboquant_triton/run_diagnostic_suite.sh
+bash scripts/turboquant_triton/diagnostics/run_diagnostic_suite.sh
 ```
 
 性能测试前必须取消 `ASCEND_LAUNCH_BLOCKING`。

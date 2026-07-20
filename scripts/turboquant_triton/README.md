@@ -23,12 +23,24 @@ pip install -e .
 TurboQuant compresses only the runtime KV cache. It does not require a
 ModelSlim calibration artifact and does not quantize model weights.
 
+## Directory layout
+
+| Directory | Purpose |
+| --- | --- |
+| `common/` | Environment checks, model server launcher, and request helper |
+| `correctness/` | Kernel, ACLGraph, output-quality, and accuracy comparisons |
+| `performance/` | Operator profiling, cache capacity, TTFT, TPOT, and throughput |
+| `diagnostics/` | Startup debugging, 910B4 retest, and combined validation suites |
+
+All shell entrypoints resolve the repository root through `common/paths.sh`,
+so they can be launched from any working directory.
+
 ## 1. Check environment and kernels
 
 Run from the repository root:
 
 ```bash
-bash scripts/turboquant_triton/run_kernel_smoke.sh
+bash scripts/turboquant_triton/correctness/run_kernel_smoke.sh
 ```
 
 This checks the exact vLLM interface, compiles the Triton-Ascend kernels,
@@ -38,7 +50,7 @@ against a dequantized attention reference.
 For a complete diagnostic run with logs suitable for offline debugging, use:
 
 ```bash
-bash scripts/turboquant_triton/run_diagnostic_suite.sh
+bash scripts/turboquant_triton/diagnostics/run_diagnostic_suite.sh
 ```
 
 The suite continues after individual failures and stores the environment,
@@ -56,7 +68,7 @@ kernel, ACLGraph, and model checks:
 ASCEND_RT_VISIBLE_DEVICES=0 \
 MODEL=/run/test_llm/Qwen3-0.6B-hf \
 TP_SIZE=1 \
-bash scripts/turboquant_triton/run_910b4_retest.sh
+bash scripts/turboquant_triton/diagnostics/run_910b4_retest.sh
 ```
 
 The retest uses port `18000` by default and refuses to start if any process is
@@ -71,7 +83,7 @@ native comparison and run one TurboQuant server with a startup watchdog:
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0 \
 MODEL=/run/test_llm/Qwen3-0.6B-hf \
-bash scripts/turboquant_triton/run_model_startup_debug.sh
+bash scripts/turboquant_triton/diagnostics/run_model_startup_debug.sh
 ```
 
 The watchdog prints the process state, child-process tree, latest server log,
@@ -88,7 +100,7 @@ accuracy comparison, and the kernel performance matrix in one command:
 ASCEND_RT_VISIBLE_DEVICES=0,1 \
 MODEL=/path/to/Qwen3-32B \
 TP_SIZE=2 \
-bash scripts/turboquant_triton/run_npu_validation.sh
+bash scripts/turboquant_triton/diagnostics/run_npu_validation.sh
 ```
 
 The combined suite writes one archive under `logs/turboquant/`. See
@@ -102,7 +114,7 @@ disabled, run the serving benchmark:
 ASCEND_RT_VISIBLE_DEVICES=0 \
 MODEL=/run/test_llm/Qwen3-0.6B-hf \
 TP_SIZE=1 \
-bash scripts/turboquant_triton/run_serving_benchmark.sh
+bash scripts/turboquant_triton/performance/run_serving_benchmark.sh
 ```
 
 It starts native and TurboQuant servers one at a time, performs two warmup and
@@ -121,7 +133,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
 MODEL=/path/to/Qwen3-32B \
 TP_SIZE=4 CONCURRENCY=16 MAX_NUM_SEQS=16 \
 WARMUP_REQUESTS=16 MEASURE_REQUESTS=64 \
-bash scripts/turboquant_triton/run_serving_benchmark.sh
+bash scripts/turboquant_triton/performance/run_serving_benchmark.sh
 ```
 
 To compare ground-truth quality and hallucination resistance, run the chat
@@ -132,7 +144,7 @@ native-correct/TurboQuant-wrong case as a quantization regression:
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
 MODEL=/path/to/Qwen3-32B \
 TP_SIZE=4 \
-bash scripts/turboquant_triton/run_quality_comparison.sh
+bash scripts/turboquant_triton/correctness/run_quality_comparison.sh
 ```
 
 The cases cover factual recall, arithmetic, reasoning, context retrieval,
@@ -150,7 +162,7 @@ do not leave useful KV-cache capacity on one 64 GB device:
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1 \
 MODEL=/path/to/Qwen3-32B \
-bash scripts/turboquant_triton/serve_qwen3_32b.sh
+bash scripts/turboquant_triton/common/serve_qwen3_32b.sh
 ```
 
 Use a small initial context while validating correctness. Parameters can be
@@ -159,7 +171,7 @@ overridden through the environment:
 ```bash
 TP_SIZE=4 MAX_MODEL_LEN=8192 MAX_NUM_SEQS=8 \
 KV_CACHE_DTYPE=turboquant_4bit_nc \
-bash scripts/turboquant_triton/serve_qwen3_32b.sh
+bash scripts/turboquant_triton/common/serve_qwen3_32b.sh
 ```
 
 The initial implementation supports `turboquant_4bit_nc`,
@@ -176,7 +188,7 @@ layers have passed end-to-end NPU coverage.
 First run the focused metadata and kernel capture/replay checks:
 
 ```bash
-bash scripts/turboquant_triton/run_aclgraph_smoke.sh
+bash scripts/turboquant_triton/correctness/run_aclgraph_smoke.sh
 ```
 
 Then start the server without `--enforce-eager`:
@@ -185,7 +197,7 @@ Then start the server without `--enforce-eager`:
 ASCEND_RT_VISIBLE_DEVICES=0,1 \
 MODEL=/path/to/Qwen3-32B \
 ENFORCE_EAGER=0 \
-bash scripts/turboquant_triton/serve_qwen3_32b.sh
+bash scripts/turboquant_triton/common/serve_qwen3_32b.sh
 ```
 
 When `ENFORCE_EAGER=0`, the script explicitly selects
@@ -199,7 +211,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 \
 MODEL=/path/to/Qwen3-32B \
 ENFORCE_EAGER=0 \
 SPECULATIVE_CONFIG='{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":1,"prompt_lookup_max":4}' \
-bash scripts/turboquant_triton/serve_qwen3_32b.sh
+bash scripts/turboquant_triton/common/serve_qwen3_32b.sh
 ```
 
 Use a prompt containing repeated token sequences so the n-gram proposer can
@@ -221,7 +233,7 @@ In a second shell:
 
 ```bash
 MODEL=/path/to/Qwen3-32B \
-bash scripts/turboquant_triton/smoke_request.sh
+bash scripts/turboquant_triton/common/smoke_request.sh
 ```
 
 For the first NPU run, set `ASCEND_LAUNCH_BLOCKING=1` only when diagnosing a
@@ -234,7 +246,7 @@ Profile store, packed decode, and the full-dequant fallback with Qwen3-style
 head dimensions:
 
 ```bash
-bash scripts/turboquant_triton/profile_kernels.sh \
+bash scripts/turboquant_triton/performance/profile_kernels.sh \
     --operation all \
     --cache-dtype turboquant_4bit_nc \
     --batch-size 4 \
@@ -248,7 +260,7 @@ Run the compact compatibility/performance matrix for all presets, FP16/BF16,
 head dimensions 64/128/256, and split counts 8/16/32:
 
 ```bash
-bash scripts/turboquant_triton/profile_matrix.sh
+bash scripts/turboquant_triton/performance/profile_matrix.sh
 ```
 
 Set `PROFILE_ROOT`, `ITERATIONS`, or `SEQUENCE_LENGTH` to override the matrix
@@ -271,7 +283,7 @@ Run only packed decode when comparing sequence lengths:
 
 ```bash
 for length in 1024 4096 8192 16384; do
-    bash scripts/turboquant_triton/profile_kernels.sh \
+    bash scripts/turboquant_triton/performance/profile_kernels.sh \
         --operation decode \
         --sequence-length "${length}" \
         --trace-dir "profiles/tq_decode_${length}"

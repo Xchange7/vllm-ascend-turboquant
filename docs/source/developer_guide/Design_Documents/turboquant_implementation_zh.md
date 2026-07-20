@@ -43,7 +43,7 @@ vllm serve MODEL \
 ```
 
 首次正确性验证建议加 `--enforce-eager`。完成
-`scripts/turboquant_triton/run_aclgraph_smoke.sh` 后可去掉该参数，TurboQuant backend 会仅对
+`scripts/turboquant_triton/correctness/run_aclgraph_smoke.sh` 后可去掉该参数，TurboQuant backend 会仅对
 uniform single/multi-token decode 声明 ACLGraph 支持；prefill 和不满足条件的 batch 不进入该图路径。
 
 vLLM core 将参数写入 `CacheConfig.cache_dtype`。在构造每个 attention layer 时，vLLM 会：
@@ -143,14 +143,15 @@ value_packed_size = value_data_bytes + 4
 
 1. 计算原始 key 的 L2 norm；
 2. 将 key 归一化；
-3. 乘正交 Hadamard matrix，得到旋转后的 key；
+3. 乘确定性的随机符号 Hadamard rotation `R = D @ H`，得到旋转后的 key；
 4. 使用相邻 centroids 的 midpoint 做二分查找；
 5. 得到每个维度的 Lloyd-Max centroid index；
 6. 将 3-bit 或 4-bit index 打包为 byte；
 7. 将原始 key norm 以 FP16 写入 key payload 末尾。
 
-Hadamard rotation 保持内积结构，同时让各维度分布更适合标量量化。原始 norm 单独保存，
-使 decode 时可以恢复 key 的尺度。
+随机符号 Hadamard rotation 保持内积结构，同时避免结构化 key 在纯 Sylvester Hadamard
+下发生能量集中，使各维度分布更适合标量量化。原始 norm 单独保存，使 decode 时可以恢复
+key 的尺度。
 
 ### 5.2 Value 处理
 
@@ -180,10 +181,10 @@ Decode 不会先创建完整 FP16 K/V tensor，而是直接读取 packed cache�
 
 ### 6.1 Query rotation
 
-Query 乘同一个 Hadamard matrix。由于 matrix 是正交的：
+Query 乘同一个 rotation `R`。由于 matrix 是正交的：
 
 ```text
-(QH) · (KH) = Q · K
+(QR) · (KR) = Q · K
 ```
 
 因此可以在旋转空间计算 attention score。
@@ -231,7 +232,7 @@ token。当前实现按 query chunk 大小选择：
 1. `query_len <= 128` 时，为每个 query token 构造递增的有效 KV 长度，直接复用 packed
    decode；
 2. 更大的 chunk 只根据 block table 反量化历史 prefix，本轮 K/V 保持原始 dtype；
-3. 对历史旋转空间 K 乘 Hadamard matrix，再与当前 K/V 拼接并调用 NPU FIA；
+3. 对历史旋转空间 K 乘 inverse rotation `R.T`，再与当前 K/V 拼接并调用 NPU FIA；
 4. 历史反量化使用 eager-only 临时 buffer，不在每个 layer 上长期保留；
 5. mixed batch 显式切分 decode 和 prefill token ranges，分别写回输出。
 
@@ -271,7 +272,7 @@ sequence length 描述所有历史读取。
 先执行算子正确性 smoke test：
 
 ```bash
-bash scripts/turboquant_triton/run_kernel_smoke.sh
+bash scripts/turboquant_triton/correctness/run_kernel_smoke.sh
 ```
 
 该测试覆盖 packed layout、负 slot、store/dequant round trip，以及 packed decode 与
@@ -280,7 +281,7 @@ bash scripts/turboquant_triton/run_kernel_smoke.sh
 执行算子 profiling：
 
 ```bash
-bash scripts/turboquant_triton/profile_kernels.sh \
+bash scripts/turboquant_triton/performance/profile_kernels.sh \
     --operation all \
     --batch-size 4 \
     --sequence-length 4096 \

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/logs/turboquant}"
 RUN_DIR="${LOG_ROOT}/diagnostic_${TIMESTAMP}"
@@ -122,7 +122,7 @@ run_stage "01_source" "branch, commit, and working-tree state" collect_source_in
 run_stage \
     "02_environment" \
     "vLLM, vLLM-Ascend, torch-npu, Triton-Ascend, and TurboQuant API checks" \
-    python3 scripts/turboquant_triton/check_environment.py
+    python3 "${TQ_COMMON_DIR}/check_environment.py"
 run_stage \
     "03_platform" \
     "TurboQuant backend selection and uniform ACLGraph capability" \
@@ -165,7 +165,7 @@ if [[ "${RUN_PROFILE}" == "1" ]]; then
     run_stage \
         "07_profile" \
         "short store/decode/dequant latency and memory profile" \
-        python3 scripts/turboquant_triton/profile_kernels.py "${PROFILE_ARGS[@]}"
+        python3 "${TQ_PERFORMANCE_DIR}/profile_kernels.py" "${PROFILE_ARGS[@]}"
 else
     printf '07_profile\tSKIP\t0\tRUN_PROFILE=0\n' >>"${RESULTS_FILE}"
 fi

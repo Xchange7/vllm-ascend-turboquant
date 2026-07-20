@@ -275,7 +275,9 @@ H(2n) = [H(n)   H(n)]
         [H(n)  -H(n)]
 ```
 
-最后除以 `sqrt(head_dim)`，得到正交矩阵。`functools.cache` 使用
+最后除以 `sqrt(head_dim)`，并在 Hadamard 混合前加入固定 seed 生成的 Rademacher
+符号对角矩阵，得到 `R = D @ H`。随机符号避免常量、分块同号等结构化 key 在纯
+Sylvester Hadamard 下集中到极少数坐标。`functools.cache` 使用
 `(head_dim, device_string)` 作为 key，同一设备和 head dimension 只构造一次。
 
 当前实现使用 dense matrix multiplication。它保持逻辑正确，但未来可以替换为 FWT
@@ -490,8 +492,8 @@ history_len = final_seq_len - query_len
 2. `query_len <= 128`：构造递增 `seq_lens`，把每个 query token 当成一个 packed decode；
 3. 大于 128：只反量化历史 cache，和当前原始 K/V 合并后调用 FIA。
 
-大 continuation 中，反量化 kernel 输出的是旋转空间 key。Hadamard 矩阵满足
-`H^-1 = H`，因此再乘一次 Hadamard 恢复原 key 空间。
+大 continuation 中，反量化 kernel 输出的是旋转空间 key。随机化旋转通常不再对称，
+因此必须乘 `R.T` 恢复原 key 空间，不能再次乘 `R`。
 
 历史和合并 buffer 都是 eager-only 临时 tensor，不挂到每层长期保存。这样不会在
 Qwen3-32B 的每个 layer 上保留一份最大上下文大小的临时 K/V。
@@ -641,7 +643,7 @@ physical_page = block_table[request, logical_page]
 5. 与旋转后的 query 做 dot product；
 6. 乘 cache 中保存的原 key norm 和 attention scale。
 
-query 和 key 使用同一个正交 Hadamard，因此旋转空间内积等价于原空间内积。
+query 和 key 使用同一个随机化正交 Hadamard，因此旋转空间内积等价于原空间内积。
 
 随后按顺序应用 soft cap 和 ALiBi。decode query 位于当前 sequence 末尾，ALiBi 相对位置为：
 

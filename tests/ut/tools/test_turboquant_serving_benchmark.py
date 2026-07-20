@@ -24,10 +24,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+SCRIPT_CATEGORIES = {
+    "accuracy_eval.py": "correctness",
+    "serving_benchmark.py": "performance",
+}
 
 
 def load_script(name: str):
-    path = REPO_ROOT / "scripts" / "turboquant_triton" / name
+    path = REPO_ROOT / "scripts" / "turboquant_triton" / SCRIPT_CATEGORIES[name] / name
     spec = importlib.util.spec_from_file_location(f"test_{path.stem}", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -261,7 +265,7 @@ def test_accuracy_marks_native_pass_turboquant_fail_as_regression() -> None:
 
 def test_quality_case_file_has_valid_ground_truth() -> None:
     accuracy = load_script("accuracy_eval.py")
-    cases = accuracy.load_prompts(REPO_ROOT / "scripts" / "turboquant_triton" / "quality_cases.jsonl")
+    cases = accuracy.load_prompts(REPO_ROOT / "scripts" / "turboquant_triton" / "correctness" / "quality_cases.jsonl")
     assert len(cases) >= 15
     assert {case["category"] for case in cases} >= {
         "arithmetic",

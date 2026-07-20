@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 MODEL="${MODEL:?Set MODEL to the local model path or served model ID}"
@@ -140,7 +140,7 @@ start_server() {
         KV_CACHE_DTYPE="${cache_dtype}" \
         ENFORCE_EAGER="${enforce_eager}" \
         SPECULATIVE_CONFIG="${speculative_config}" \
-        bash "${SCRIPT_DIR}/serve_qwen3_32b.sh" >"${log_file}" 2>&1 &
+        bash "${TQ_COMMON_DIR}/serve_qwen3_32b.sh" >"${log_file}" 2>&1 &
     SERVER_PID=$!
     wait_for_server "${log_file}"
 }
@@ -172,7 +172,7 @@ if port_is_listening; then
     printf 'Port %s is already in use; refusing to test the wrong process.\n' "${PORT}"
     exit 2
 fi
-python3 "${SCRIPT_DIR}/check_environment.py" | tee "${OUTPUT_DIR}/environment.log"
+python3 "${TQ_COMMON_DIR}/check_environment.py" | tee "${OUTPUT_DIR}/environment.log"
 
 start_server \
     "${BASE_LABEL}" \

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/logs/turboquant/performance_${TIMESTAMP}}"
@@ -74,7 +74,7 @@ run_case() {
 }
 
 cd "${REPO_ROOT}"
-python3 "${SCRIPT_DIR}/check_environment.py" | tee "${OUTPUT_DIR}/environment.log"
+python3 "${TQ_COMMON_DIR}/check_environment.py" | tee "${OUTPUT_DIR}/environment.log"
 
 for cache_dtype in ${CACHE_DTYPES}; do
     for activation_dtype in ${ACTIVATION_DTYPES}; do

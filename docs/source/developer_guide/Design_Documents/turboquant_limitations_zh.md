@@ -131,7 +131,7 @@ Uniform multi-token 不会把 query tokens 展平后一次性扩大 split worksp
 
 910B4 验证顺序为：
 
-1. 运行 `scripts/turboquant_triton/run_aclgraph_smoke.sh`，确保 kernel 在 capture 前完成 JIT；
+1. 运行 `scripts/turboquant_triton/correctness/run_aclgraph_smoke.sh`，确保 kernel 在 capture 前完成 JIT；
 2. 先使用 eager server 建立确定性正确率基线；
 3. 设置 `ENFORCE_EAGER=0` 启动 decode-only ACLGraph；
 4. 覆盖不同 batch size、sequence length、preemption 和 prefix hit；
@@ -344,7 +344,7 @@ ACLGraph replay 期间 grid 需要固定，因此不能在同一张图中按实�
 数量。可采用“每个 capture bucket 固定 split 配置”或保持固定最大 grid、让空 split 提前
 返回。近期应先 profile `8/16/32` 三档；只有收益明确时再引入多 graph split bucket。
 
-`scripts/turboquant_triton/profile_matrix.sh` 已提供 `8/16/32` splits、FP16/BF16、三 preset
+`scripts/turboquant_triton/performance/profile_matrix.sh` 已提供 `8/16/32` splits、FP16/BF16、三 preset
 和 `head_dim=64/128/256` 的无 trace 批量基线，并在相同 batch/context/head shape 下调用
 native Ascend paged attention。报告直接给出 decode speedup 和理论 cache 压缩比；它不会在
 没有 910B4 数据时写死启发式规则。
@@ -481,7 +481,7 @@ FP16/BF16、三种常用 head dimension、跨 page、ALiBi/soft cap、零 key �
 可以使用：
 
 ```bash
-bash scripts/turboquant_triton/profile_kernels.sh --operation all
+bash scripts/turboquant_triton/performance/profile_kernels.sh --operation all
 ```
 
 输出的 `benchmark.json` 会记录参数、软件版本、延迟分位数、吞吐、显存变化、native decode

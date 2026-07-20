@@ -252,7 +252,7 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
         norm_correction=config.norm_correction,
     )
     torch.npu.synchronize()
-    key_dense = (key_rotated.float().reshape(-1, head_dim) @ hadamard).view_as(key_rotated)
+    key_dense = (key_rotated.float().reshape(-1, head_dim) @ hadamard.T).view_as(key_rotated)
 
     num_splits = 4
     # A continuation chunk can be larger than max_num_seqs. Exercise the

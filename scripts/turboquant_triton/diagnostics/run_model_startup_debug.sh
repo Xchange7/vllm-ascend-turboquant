@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 MODEL="${MODEL:-/run/test_llm/Qwen3-0.6B-hf}"
@@ -117,7 +117,7 @@ fi
     git rev-parse HEAD
 } | tee "${DIAGNOSTIC_LOG}"
 
-python3 "${SCRIPT_DIR}/check_environment.py" | tee -a "${DIAGNOSTIC_LOG}"
+python3 "${TQ_COMMON_DIR}/check_environment.py" | tee -a "${DIAGNOSTIC_LOG}"
 timeout "${GLOO_PROBE_TIMEOUT}s" python3 -c '
 import datetime
 import socket
@@ -164,7 +164,7 @@ env -u ASCEND_LAUNCH_BLOCKING \
     MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
     KV_CACHE_DTYPE="${KV_CACHE_DTYPE}" \
     ENFORCE_EAGER=1 \
-    bash "${SCRIPT_DIR}/serve_qwen3_32b.sh" >"${SERVER_LOG}" 2>&1 &
+    bash "${TQ_COMMON_DIR}/serve_qwen3_32b.sh" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
 deadline=$((SECONDS + SERVER_TIMEOUT))
@@ -177,7 +177,7 @@ while ((SECONDS < deadline)); do
     fi
     if curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null; then
         printf 'vLLM is healthy; sending one TurboQuant completion.\n'
-        MODEL="${MODEL}" PORT="${PORT}" bash "${SCRIPT_DIR}/smoke_request.sh" | tee "${OUTPUT_DIR}/response.txt"
+        MODEL="${MODEL}" PORT="${PORT}" bash "${TQ_COMMON_DIR}/smoke_request.sh" | tee "${OUTPUT_DIR}/response.txt"
         exit 0
     fi
     snapshot

@@ -3,10 +3,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 
 cd "${REPO_ROOT}"
-python3 scripts/turboquant_triton/check_environment.py
+python3 "${TQ_COMMON_DIR}/check_environment.py"
 pytest -sv \
     tests/ut/test_turboquant_kv_cache.py::test_turboquant_graph_capture_metadata_uses_device_sequence_lengths \
     tests/ut/test_turboquant_kv_cache.py::test_turboquant_uniform_multi_token_decode_reuses_request_workspace \

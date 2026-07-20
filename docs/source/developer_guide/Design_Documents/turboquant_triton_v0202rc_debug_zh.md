@@ -39,8 +39,9 @@ prefix cache、单请求和确定性采样。ACLGraph、spec decode、并发和�
 
 1. 当前实现并不是论文中的完整 TurboQuant。vLLM core 中的配置明确省略了 QJL residual，
    Ascend 侧也没有 QJL 和 outlier path。
-2. Key 只使用固定 Sylvester Hadamard 旋转，没有随机符号矩阵。对于常量、分块和高相关
-   Key，能量可能集中到少数坐标，随后进行 3/4-bit scalar quantization 会产生很大误差。
+2. 静态检查已确认旧实现只使用固定 Sylvester Hadamard。CPU oracle 显示常量、分块同号和
+   线性结构 key 的相对重建误差可达到约 48%、48% 和 57%。当前工作树已改为固定 seed 的
+   `diag(random_sign) @ H`，对应误差降至约 9%、9% 和 10%，仍需在 910B4 上做模型级验证。
 3. 现有 NPU kernel 测试主要验证实现内部自洽：使用同一个 store kernel 写 cache，再用同
    一套布局进行 dequant/decode。共同的 layout 或量化错误可能同时存在于两侧而不被发现。
 4. 高性能工作树另外把 Hadamard 和 PV 的部分计算从 FP32 降到了 FP16/BF16，并默认选择
@@ -123,7 +124,7 @@ PY
 
 ```bash
 cd "${TQ_REF_ROOT}"
-python3 scripts/turboquant_triton/check_environment.py \
+python3 scripts/turboquant_triton/common/check_environment.py \
   2>&1 | tee logs/tq_ref_environment.log
 ```
 
@@ -180,7 +181,7 @@ MAX_NUM_SEQS=1 \
 KV_CACHE_DTYPE=auto \
 ENFORCE_EAGER=1 \
 PORT=18010 \
-bash scripts/turboquant_triton/serve_qwen3_32b.sh \
+bash scripts/turboquant_triton/common/serve_qwen3_32b.sh \
   --no-enable-prefix-caching \
   > logs/tq_ref_native_server.log 2>&1 &
 echo $! > logs/tq_ref_native_server.pid
@@ -237,7 +238,7 @@ MAX_NUM_SEQS=1 \
 KV_CACHE_DTYPE=turboquant_4bit_nc \
 ENFORCE_EAGER=1 \
 PORT=18011 \
-bash scripts/turboquant_triton/serve_qwen3_32b.sh \
+bash scripts/turboquant_triton/common/serve_qwen3_32b.sh \
   --no-enable-prefix-caching \
   --kv-cache-dtype-skip-layers ${ALL_LAYERS} \
   > logs/tq_ref_all_skipped_server.log 2>&1 &
@@ -335,21 +336,22 @@ max_attention_logit_error
 top1_token_changed
 ```
 
-### 重点假设：固定 Hadamard
+### 已修复：固定 Hadamard
 
-reference 实现在 `vllm_ascend/attention/turboquant.py` 的 `_build_hadamard()` 中构造固定
-Sylvester Hadamard。应增加以下 A/B：
+旧 reference 实现在 `vllm_ascend/attention/turboquant.py` 的 `_build_hadamard()` 中构造固定
+Sylvester Hadamard。本轮静态 debug 已完成以下 A/B：
 
 ```text
-H                  # 当前实现
-diag(random_sign) @ H  # 对行向量 x，随机符号在 Hadamard 混合前生效
+H                       # 旧实现
+diag(random_sign) @ H   # 当前实现；对行向量 x，随机符号在 Hadamard 混合前生效
 ```
 
 对 Q 和 K 必须使用匹配的变换，且 continuation prefill 的 inverse path 必须同步修改。随机
 符号不能只加在旋转之后，因为那不会改变能量集中的位置。
 
-如果 structured K 在固定 Hadamard 下误差显著高于 signed Hadamard，而随机高斯用例差距很
-小，则模型端精度崩溃的主要原因是旋转设计，不是 NPU bit packing。
+结果符合该判断：structured K 在固定 Hadamard 下误差显著高于 signed Hadamard，而随机高斯
+用例差距很小。该结果证明旧旋转设计存在高风险，但不能单独排除 NPU bit packing 问题；后者
+仍需要独立 CPU packer 和真实模型 layer dump 验证。
 
 ## 11. Gate 6：reference 与高性能工作树做严格 A/B
 
@@ -446,7 +448,7 @@ check_environment.py 是否通过？
 1. 先在 `turboquant-triton-v0.20.2rc` 完成 native、all-skip、1/2/4/16-token 四组实验；
 2. 给 accuracy collector 增加 chat token logprobs、原始答案和首个分歧 token输出；
 3. 增加独立 CPU packer 和 raw FP32 attention oracle；
-4. 使用真实 Qwen3 layer dump 验证固定 Hadamard，并实现 deterministic signed Hadamard A/B；
+4. 使用真实 Qwen3 layer dump 验证 deterministic signed Hadamard，并与旧固定 Hadamard A/B；
 5. 明确产品目标是简化的 `TurboQuant_mse`，还是包含 QJL/outlier path 的完整 TurboQuant；
 6. reference 精度门禁通过后，再启用 grouped-GQA 和低精度计算；
 7. 最后测试 ACLGraph、并发 16、16K context 和 Qwen3-32B TP=4。

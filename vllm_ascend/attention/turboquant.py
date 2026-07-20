@@ -62,9 +62,21 @@ _CONTINUATION_DECODE_THRESHOLD = 128
 # logits soft cap. The K dimension remains full so each tile is exact.
 _FEATURE_PREFILL_QUERY_TILE_SIZE = 32
 
+# The Lloyd-Max codebook models coordinates produced by a randomized
+# orthogonal transform. Keep the seed stable so cache writes and reads use the
+# same transform across workers and graph captures.
+_ROTATION_SEED = 42
+
 
 @functools.cache
 def _build_hadamard(head_dim: int, device_string: str) -> torch.Tensor:
+    """Build a deterministic randomized Hadamard rotation ``D @ H``.
+
+    The random sign diagonal must precede Hadamard mixing for row vectors.
+    Applying signs after ``H`` would leave structured inputs such as constant
+    vectors concentrated in one coordinate and invalidate the Gaussian
+    assumption used to construct the scalar quantizer.
+    """
     matrix = torch.ones(1, 1, dtype=torch.float32)
     while matrix.shape[0] < head_dim:
         matrix = torch.cat(
@@ -75,6 +87,17 @@ def _build_hadamard(head_dim: int, device_string: str) -> torch.Tensor:
             dim=0,
         )
     matrix /= math.sqrt(head_dim)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(_ROTATION_SEED)
+    signs = torch.randint(
+        0,
+        2,
+        (head_dim,),
+        generator=generator,
+        dtype=torch.int8,
+    ).to(torch.float32)
+    signs.mul_(2).sub_(1)
+    matrix.mul_(signs[:, None])
     return matrix.to(torch.device(device_string))
 
 
@@ -290,8 +313,8 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
     ) -> None:
         if hasattr(layer, "_tq_ascend_constants_ready"):
             return
-        hadamard = _build_hadamard(self.head_size, str(device))
-        layer._tq_ascend_hadamard = hadamard
+        rotation = _build_hadamard(self.head_size, str(device))
+        layer._tq_ascend_hadamard = rotation
         centroids = layer._tq_centroids.to(  # type: ignore[attr-defined]
             device=device,
             dtype=torch.float32,
@@ -695,7 +718,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         key_history = (
             key_rotated.float()
             .reshape(-1, self.head_size)
-            .matmul(layer._tq_ascend_hadamard)
+            .matmul(layer._tq_ascend_hadamard.T)
             .to(query.dtype)
             .view(history_len, self.num_kv_heads, self.head_size)
         )
