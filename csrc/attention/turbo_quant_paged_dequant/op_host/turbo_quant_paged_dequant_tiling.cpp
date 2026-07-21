@@ -84,26 +84,31 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
             OPS_LOG_E(nodeName, "headDim must be a multiple of 32 in [32, 256]"), return ge::GRAPH_FAILED);
   OPS_CHECK((*keyBits != 3 && *keyBits != 4) || (*valueBits != 3 && *valueBits != 4),
             OPS_LOG_E(nodeName, "only 3-bit and 4-bit TurboQuant layouts are supported"), return ge::GRAPH_FAILED);
-  OPS_CHECK(*maxSeqLen <= 0 || *maxSeqLen > maxPages * blockSize,
-            OPS_LOG_E(nodeName, "maxSeqLen exceeds block-table capacity"), return ge::GRAPH_FAILED);
+  OPS_CHECK(*maxSeqLen <= 0, OPS_LOG_E(nodeName, "maxSeqLen must be positive"), return ge::GRAPH_FAILED);
+  const int64_t activePages = (*maxSeqLen - 1) / blockSize + 1;
+  OPS_CHECK(activePages > maxPages, OPS_LOG_E(nodeName, "maxSeqLen exceeds block-table capacity"),
+            return ge::GRAPH_FAILED);
 
   const int64_t keyDataBytes = (headDim * *keyBits + 7) / 8;
   const int64_t valueDataBytes = (headDim * *valueBits + 7) / 8;
-  const int64_t minimumSlotSize = *keyPackedSize + valueDataBytes + VALUE_METADATA_BYTES;
-  OPS_CHECK(*keyPackedSize != keyDataBytes + METADATA_BYTES || slotSize < minimumSlotSize,
+  OPS_CHECK(*keyPackedSize != keyDataBytes + METADATA_BYTES,
             OPS_LOG_E(nodeName, "packed cache layout does not match TurboQuant attributes"), return ge::GRAPH_FAILED);
+  const int64_t minimumSlotSize = keyDataBytes + METADATA_BYTES + valueDataBytes + VALUE_METADATA_BYTES;
+  OPS_CHECK(slotSize < minimumSlotSize, OPS_LOG_E(nodeName, "packed cache slot is smaller than the TurboQuant payload"),
+            return ge::GRAPH_FAILED);
   const int64_t centroidCount = int64_t{1} << *keyBits;
   OPS_CHECK(centroidsShape.GetDim(0) < centroidCount,
             OPS_LOG_E(nodeName, "centroid table is smaller than the key codebook"), return ge::GRAPH_FAILED);
 
   TurboQuantPagedDequantTilingData tiling;
-  const int64_t activePages = (*maxSeqLen + blockSize - 1) / blockSize;
-  const int64_t totalTasks = batchSize * activePages * numKvHeads;
   constexpr int64_t UINT32_MAX_VALUE = std::numeric_limits<uint32_t>::max();
   OPS_CHECK(batchSize > UINT32_MAX_VALUE || *maxSeqLen > UINT32_MAX_VALUE || maxPages > UINT32_MAX_VALUE ||
                 activePages > UINT32_MAX_VALUE || numBlocks > UINT32_MAX_VALUE || blockSize > UINT32_MAX_VALUE ||
-                numKvHeads > UINT32_MAX_VALUE || slotSize > UINT32_MAX_VALUE || totalTasks > UINT32_MAX_VALUE,
+                numKvHeads > UINT32_MAX_VALUE || slotSize > UINT32_MAX_VALUE,
             OPS_LOG_E(nodeName, "TurboQuant dimensions exceed the uint32 tiling range"), return ge::GRAPH_FAILED);
+  OPS_CHECK(batchSize > UINT32_MAX_VALUE / activePages || numKvHeads > UINT32_MAX_VALUE / (batchSize * activePages),
+            OPS_LOG_E(nodeName, "TurboQuant task count exceeds the uint32 tiling range"), return ge::GRAPH_FAILED);
+  const int64_t totalTasks = batchSize * activePages * numKvHeads;
   tiling.set_batchSize(static_cast<uint32_t>(batchSize));
   tiling.set_maxSeqLen(static_cast<uint32_t>(*maxSeqLen));
   tiling.set_maxPages(static_cast<uint32_t>(maxPages));
@@ -122,14 +127,21 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   tiling.set_normCorrection(*normCorrection ? 1U : 0U);
   tiling.set_totalTasks(static_cast<uint32_t>(totalTasks));
 
-  auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-  const uint32_t blockDim = std::min(static_cast<uint32_t>(totalTasks), platform.GetCoreNumAiv());
+  const auto* platformInfo = context->GetPlatformInfo();
+  OPS_CHECK(platformInfo == nullptr, OPS_LOG_E(nodeName, "platform info is nullptr"), return ge::GRAPH_FAILED);
+  auto platform = platform_ascendc::PlatformAscendC(platformInfo);
+  const uint32_t aivCoreCount = platform.GetCoreNumAiv();
+  OPS_CHECK(aivCoreCount == 0, OPS_LOG_E(nodeName, "no AIV core is available"), return ge::GRAPH_FAILED);
+  const uint32_t blockDim = std::min(static_cast<uint32_t>(totalTasks), aivCoreCount);
   context->SetTilingKey(0);
   context->SetBlockDim(blockDim);
   size_t* workspaceSizes = context->GetWorkspaceSizes(1);
+  auto* rawTilingData = context->GetRawTilingData();
+  OPS_CHECK(workspaceSizes == nullptr || rawTilingData == nullptr,
+            OPS_LOG_E(nodeName, "workspace or raw tiling buffer is nullptr"), return ge::GRAPH_FAILED);
   workspaceSizes[0] = 0;
-  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+  tiling.SaveToBuffer(rawTilingData->GetData(), rawTilingData->GetCapacity());
+  rawTilingData->SetDataSize(tiling.GetDataSize());
   return ge::GRAPH_SUCCESS;
 }
 

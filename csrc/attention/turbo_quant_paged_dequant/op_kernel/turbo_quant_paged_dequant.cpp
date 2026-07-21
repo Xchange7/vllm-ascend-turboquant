@@ -13,17 +13,13 @@
 
 using namespace AscendC;
 
-namespace {
-constexpr uint32_t DATA_BLOCK_BYTES = 32;
-constexpr uint32_t HALF_BYTES = 2;
+namespace turbo_quant_detail {
+constexpr uint32_t DATA_BLOCK_BYTES = 32U;
+constexpr uint32_t FLOAT_BYTES = static_cast<uint32_t>(sizeof(float));
+constexpr uint32_t INT32_BYTES = static_cast<uint32_t>(sizeof(int32_t));
+constexpr uint32_t HALF_BYTES = 2U;
 constexpr float NORM_EPSILON = 1.0e-16F;
-
-__aicore__ inline uint32_t AlignBufferBytes(uint32_t value, uint32_t alignment) {
-  return (value + alignment - 1U) / alignment * alignment;
-}
-
-__aicore__ inline uint32_t MinValue(uint32_t lhs, uint32_t rhs) { return lhs < rhs ? lhs : rhs; }
-}  // namespace
+}  // namespace turbo_quant_detail
 
 template <typename T>
 class KernelTurboQuantPagedDequant {
@@ -56,16 +52,17 @@ class KernelTurboQuantPagedDequant {
     keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(key));
     valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(value));
 
-    pipe_.InitBuffer(slotBuffer_, AlignBufferBytes(slotSize_, DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(centroidBuffer_, AlignBufferBytes(centroidCount_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(indexBuffer_, AlignBufferBytes(headDim_ * sizeof(int32_t), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(keyFloatBuffer_, AlignBufferBytes(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(valueFloatBuffer_, AlignBufferBytes(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(squaredBuffer_, AlignBufferBytes(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(reduceBuffer_, AlignBufferBytes(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(normBuffer_, DATA_BLOCK_BYTES);
-    pipe_.InitBuffer(keyOutputBuffer_, AlignBufferBytes(headDim_ * sizeof(T), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(valueOutputBuffer_, AlignBufferBytes(headDim_ * sizeof(T), DATA_BLOCK_BYTES));
+    // TPipe::InitBuffer pads byte lengths to a 32-byte data block.
+    pipe_.InitBuffer(slotBuffer_, slotSize_);
+    pipe_.InitBuffer(centroidBuffer_, centroidCount_ * turbo_quant_detail::FLOAT_BYTES);
+    pipe_.InitBuffer(indexBuffer_, headDim_ * turbo_quant_detail::INT32_BYTES);
+    pipe_.InitBuffer(keyFloatBuffer_, headDim_ * turbo_quant_detail::FLOAT_BYTES);
+    pipe_.InitBuffer(valueFloatBuffer_, headDim_ * turbo_quant_detail::FLOAT_BYTES);
+    pipe_.InitBuffer(squaredBuffer_, headDim_ * turbo_quant_detail::FLOAT_BYTES);
+    pipe_.InitBuffer(reduceBuffer_, headDim_ * turbo_quant_detail::FLOAT_BYTES);
+    pipe_.InitBuffer(normBuffer_, turbo_quant_detail::DATA_BLOCK_BYTES);
+    pipe_.InitBuffer(keyOutputBuffer_, headDim_ * static_cast<uint32_t>(sizeof(T)));
+    pipe_.InitBuffer(valueOutputBuffer_, headDim_ * static_cast<uint32_t>(sizeof(T)));
 
     slotLocal_ = slotBuffer_.Get<uint8_t>();
     centroidLocal_ = centroidBuffer_.Get<float>();
@@ -91,7 +88,7 @@ class KernelTurboQuantPagedDequant {
  private:
   __aicore__ inline void LoadCentroids() {
     DataCopyExtParams params{
-        1, static_cast<uint32_t>(centroidCount_ * sizeof(float)), 0, 0, 0,
+        1, centroidCount_ * turbo_quant_detail::FLOAT_BYTES, 0, 0, 0,
     };
     DataCopyPadExtParams<float> padParams{false, 0, 0, 0};
     DataCopyPad(centroidLocal_, centroidsGm_, params, padParams);
@@ -116,8 +113,10 @@ class KernelTurboQuantPagedDequant {
     if (physicalBlockValue < 0 || static_cast<uint32_t>(physicalBlockValue) >= numBlocks_) {
       return;
     }
-    const uint32_t sequenceLength = MinValue(static_cast<uint32_t>(sequenceLengthValue), maxSeqLen_);
-    const uint32_t tokenCount = MinValue(blockSize_, sequenceLength - pageStart);
+    const uint32_t sequenceLengthValueUnsigned = static_cast<uint32_t>(sequenceLengthValue);
+    const uint32_t sequenceLength = sequenceLengthValueUnsigned < maxSeqLen_ ? sequenceLengthValueUnsigned : maxSeqLen_;
+    const uint32_t remainingTokens = sequenceLength - pageStart;
+    const uint32_t tokenCount = blockSize_ < remainingTokens ? blockSize_ : remainingTokens;
     for (uint32_t pageOffset = 0; pageOffset < tokenCount; ++pageOffset) {
       const uint64_t slotIndex =
           (static_cast<uint64_t>(physicalBlockValue) * blockSize_ + pageOffset) * numKvHeads_ + headIndex;
@@ -147,15 +146,16 @@ class KernelTurboQuantPagedDequant {
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
 
     LocalTensor<half> slotHalf = slotLocal_.ReinterpretCast<half>();
-    const float originalNorm = static_cast<float>(slotHalf.GetValue(keyDataBytes_ / HALF_BYTES));
+    const float originalNorm = static_cast<float>(slotHalf.GetValue(keyDataBytes_ / turbo_quant_detail::HALF_BYTES));
     const uint32_t valueBase = keyPackedSize_;
     const uint32_t valueMetadataBase = valueBase + valueDataBytes_;
-    const float valueScale = static_cast<float>(slotHalf.GetValue(valueMetadataBase / HALF_BYTES));
-    const float valueMinimum = static_cast<float>(slotHalf.GetValue(valueMetadataBase / HALF_BYTES + 1U));
+    const float valueScale = static_cast<float>(slotHalf.GetValue(valueMetadataBase / turbo_quant_detail::HALF_BYTES));
+    const float valueMinimum =
+        static_cast<float>(slotHalf.GetValue(valueMetadataBase / turbo_quant_detail::HALF_BYTES + 1U));
 
     for (uint32_t dimension = 0; dimension < headDim_; ++dimension) {
       const uint32_t centroidIndex = UnpackIndex(dimension, keyBits_, 0);
-      indexLocal_.SetValue(dimension, static_cast<int32_t>(centroidIndex * sizeof(float)));
+      indexLocal_.SetValue(dimension, static_cast<int32_t>(centroidIndex * turbo_quant_detail::FLOAT_BYTES));
     }
     SetFlag<HardEvent::S_V>(EVENT_ID0);
     WaitFlag<HardEvent::S_V>(EVENT_ID0);
@@ -168,7 +168,7 @@ class KernelTurboQuantPagedDequant {
       PipeBarrier<PIPE_V>();
       ReduceSum(normLocal_, squaredLocal_, reduceLocal_, headDim_);
       PipeBarrier<PIPE_V>();
-      Adds(normLocal_, normLocal_, NORM_EPSILON, 1);
+      Adds(normLocal_, normLocal_, turbo_quant_detail::NORM_EPSILON, 1);
       PipeBarrier<PIPE_V>();
       Sqrt(normLocal_, normLocal_, 1);
       SetFlag<HardEvent::V_S>(EVENT_ID0);
@@ -207,7 +207,7 @@ class KernelTurboQuantPagedDequant {
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     DataCopyExtParams outputCopyParams{
-        1, static_cast<uint32_t>(headDim_ * sizeof(T)), 0, 0, 0,
+        1, headDim_ * static_cast<uint32_t>(sizeof(T)), 0, 0, 0,
     };
     DataCopyPad(keyGm_[outputOffset], keyOutputLocal_, outputCopyParams);
     DataCopyPad(valueGm_[outputOffset], valueOutputLocal_, outputCopyParams);
