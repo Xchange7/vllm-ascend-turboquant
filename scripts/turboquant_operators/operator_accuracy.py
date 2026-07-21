@@ -235,7 +235,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("torch-npu cannot see an Ascend NPU.")
     if not has_turboquant_paged_dequant():
         raise RuntimeError(
-            "npu_turboquant_paged_dequant is unavailable; clean and rebuild vLLM Ascend with SOC_VERSION=ascend910b4."
+            "TurboQuant paged-dequant return/out schemas are unavailable; "
+            "clean and rebuild vLLM Ascend with SOC_VERSION=ascend910b4."
         )
 
     torch.npu.set_device(args.device)
@@ -280,11 +281,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     negative_slot_mapping_passed = torch.equal(cache, cache_before_invalid_store)
     del cache_before_invalid_store
 
+    page_table = torch.tensor(
+        [
+            (request_index, page_index)
+            for request_index, seq_len in enumerate(args.sequence_lengths)
+            for page_index in range((seq_len + cache.shape[1] - 1) // cache.shape[1])
+        ],
+        dtype=torch.int32,
+        device=query.device,
+    )
     key_ascend, value_ascend = turboquant_paged_dequant(
         query,
         cache,
         block_table,
         seq_lens,
+        page_table,
         centroids,
         max_seq_len=max_seq_len,
         key_bits=config.key_quant_bits,

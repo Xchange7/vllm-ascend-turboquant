@@ -68,9 +68,53 @@ log_selected_ops() {
     done
 }
 
+apply_custom_ops_override() {
+    local requested_ops=${VLLM_ASCEND_BUILD_CUSTOM_OPS:-}
+    local requested_op
+    local supported_op
+    local found
+    local -a requested_ops_array
+    local -a selected_ops_array=()
+
+    if [[ -z "${requested_ops}" ]]; then
+        return
+    fi
+
+    requested_ops=${requested_ops//,/;}
+    IFS=';' read -r -a requested_ops_array <<< "${requested_ops}"
+    for requested_op in "${requested_ops_array[@]}"; do
+        requested_op=${requested_op//[[:space:]]/}
+        if [[ -z "${requested_op}" ]]; then
+            continue
+        fi
+        found=0
+        for supported_op in "${CUSTOM_OPS_ARRAY[@]}"; do
+            if [[ "${requested_op}" == "${supported_op}" ]]; then
+                found=1
+                break
+            fi
+        done
+        if ((found == 0)); then
+            log "ERROR: requested custom op is not supported for ${SOC_VERSION}: ${requested_op}"
+            exit 2
+        fi
+        selected_ops_array+=("${requested_op}")
+    done
+
+    if ((${#selected_ops_array[@]} == 0)); then
+        log "ERROR: VLLM_ASCEND_BUILD_CUSTOM_OPS did not contain a valid operator name"
+        exit 2
+    fi
+    CUSTOM_OPS_ARRAY=("${selected_ops_array[@]}")
+    CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
+    log "developer custom-op allowlist enabled: ${CUSTOM_OPS}"
+}
+
 log "start: ROOT_DIR=${ROOT_DIR:-<unset>} SOC_VERSION=${SOC_VERSION:-<unset>} cwd=$(pwd)"
 log "env: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-<unset>}"
 log "env: MAX_JOBS=${MAX_JOBS:-<unset>} CPATH=${CPATH:-<unset>}"
+log "env: VLLM_ASCEND_BUILD_CUSTOM_OPS=${VLLM_ASCEND_BUILD_CUSTOM_OPS:-<unset>}"
+log "env: VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD=${VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD:-0}"
 
 CURRENT_STAGE="SoC and operator selection"
 
@@ -282,6 +326,7 @@ else
     exit 0
 fi
 
+apply_custom_ops_override
 log_selected_ops
 
 
@@ -299,8 +344,12 @@ log_selected_ops
   log "build cwd before cd=$(pwd)"
   cd "${SCRIPT_DIR}"
   log "build cwd after cd=$(pwd)"
-  log "cleaning csrc build dirs"
-  rm -rf -- build output build_out
+  if [[ "${VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD:-0}" == "1" ]]; then
+    log "incremental developer build: reusing csrc/build, output, and build_out"
+  else
+    log "cleaning csrc build dirs"
+    rm -rf -- build output build_out
+  fi
 
   : "${ROOT_DIR:?ROOT_DIR is not set}"
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"

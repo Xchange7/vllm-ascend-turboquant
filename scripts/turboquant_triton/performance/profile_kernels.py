@@ -44,7 +44,7 @@ from vllm_ascend.ops.triton.turboquant_decode import (
     triton_turboquant_dequant_paged_cache,
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
-from vllm_ascend.ops.turboquant import turboquant_paged_dequant
+from vllm_ascend.ops.turboquant import turboquant_paged_dequant_out
 
 
 @dataclass
@@ -561,14 +561,61 @@ def build_ascend_fused_case(
         device=device,
     )
     seq_lens_list = [args.sequence_length] * args.batch_size
+    page_table = torch.tensor(
+        [
+            (request_index, page_index)
+            for request_index in range(args.batch_size)
+            for page_index in range((args.sequence_length + args.block_size - 1) // args.block_size)
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    key_bnsd = torch.empty(
+        args.batch_size,
+        args.num_kv_heads,
+        args.sequence_length,
+        args.head_dim,
+        dtype=query.dtype,
+        device=device,
+    )
+    value_bnsd = torch.empty_like(key_bnsd)
+    query_rotated = torch.empty_like(query)
+    attention_output = torch.empty(
+        args.batch_size,
+        args.num_query_heads,
+        1,
+        args.head_dim,
+        dtype=query.dtype,
+        device=device,
+    )
+    softmax_lse = torch.empty(1, dtype=query.dtype, device=device)
+    fia_kwargs = dict(
+        query=query_rotated.unsqueeze(2),
+        key=key_bnsd,
+        value=value_bnsd,
+        block_table=None,
+        input_layout="BNSD",
+        block_size=args.block_size,
+        actual_seq_lengths_kv=seq_lens_list,
+        num_key_value_heads=args.num_kv_heads,
+        num_heads=args.num_query_heads,
+        scale=1 / math.sqrt(args.head_dim),
+        sparse_mode=0,
+    )
+    fia_workspace = (
+        torch_npu._npu_fused_infer_attention_score_get_max_workspace(**fia_kwargs) if include_attention else None
+    )
 
     def run():
-        key_bnsd, value_bnsd = turboquant_paged_dequant(
+        turboquant_paged_dequant_out(
             query,
             cache,
             block_table,
             seq_lens,
+            page_table,
             centroids,
+            key_bnsd,
+            value_bnsd,
             max_seq_len=args.sequence_length,
             key_bits=config.key_quant_bits,
             key_packed_size=config.key_packed_size,
@@ -577,28 +624,33 @@ def build_ascend_fused_case(
         )
         if not include_attention:
             return key_bnsd, value_bnsd
-        query_rotated = (query @ compute_rotation).contiguous()
-        output, _ = torch_npu.npu_fused_infer_attention_score(
-            query=query_rotated.unsqueeze(2),
-            key=key_bnsd,
-            value=value_bnsd,
-            block_table=None,
-            input_layout="BNSD",
-            block_size=args.block_size,
-            actual_seq_lengths_kv=seq_lens_list,
-            num_key_value_heads=args.num_kv_heads,
-            num_heads=args.num_query_heads,
-            scale=1 / math.sqrt(args.head_dim),
-            sparse_mode=0,
+        torch.matmul(query, compute_rotation, out=query_rotated)
+        torch_npu.npu_fused_infer_attention_score.out(
+            **fia_kwargs,
+            workspace=fia_workspace,
+            out=[attention_output, softmax_lse],
         )
-        return output
+        return attention_output
 
     return BenchmarkCase(
         name="fused_decode" if include_attention else "fused_dequant",
         run=run,
         work_per_iteration=(args.batch_size if include_attention else args.batch_size * args.sequence_length),
         throughput_name=("generated_tokens_per_second" if include_attention else "cache_tokens_per_second"),
-        tensors=(query, compute_rotation, cache, block_table, seq_lens),
+        tensors=(
+            query,
+            compute_rotation,
+            cache,
+            block_table,
+            seq_lens,
+            page_table,
+            key_bnsd,
+            value_bnsd,
+            query_rotated,
+            attention_output,
+            softmax_lse,
+            fia_workspace,
+        ),
     )
 
 

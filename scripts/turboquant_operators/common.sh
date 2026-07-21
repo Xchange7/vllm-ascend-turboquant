@@ -54,10 +54,10 @@ from vllm_ascend.ops.turboquant import has_turboquant_paged_dequant
 
 if not has_turboquant_paged_dequant():
     raise RuntimeError(
-        "npu_turboquant_paged_dequant is not registered. Set "
+        "TurboQuant paged-dequant return/out schemas are not registered. Set "
         "SOC_VERSION=ascend910b4, clean build/csrc/build, and reinstall."
     )
-print("npu_turboquant_paged_dequant=registered")
+print("npu_turboquant_paged_dequant=registered (return+out)")
 PY
 
     if command -v npu-smi >/dev/null 2>&1; then

@@ -22,7 +22,8 @@ constexpr size_t QUERY_INPUT_INDEX = 0;
 constexpr size_t KV_CACHE_INPUT_INDEX = 1;
 constexpr size_t BLOCK_TABLE_INPUT_INDEX = 2;
 constexpr size_t SEQ_LENS_INPUT_INDEX = 3;
-constexpr size_t CENTROIDS_INPUT_INDEX = 4;
+constexpr size_t PAGE_TABLE_INPUT_INDEX = 4;
+constexpr size_t CENTROIDS_INPUT_INDEX = 5;
 constexpr size_t MAX_SEQ_LEN_ATTR_INDEX = 0;
 constexpr size_t KEY_BITS_ATTR_INDEX = 1;
 constexpr size_t KEY_PACKED_SIZE_ATTR_INDEX = 2;
@@ -32,6 +33,11 @@ constexpr int64_t METADATA_BYTES = 2;
 constexpr int64_t VALUE_METADATA_BYTES = 4;
 constexpr int64_t MIN_HEAD_DIM = 32;
 constexpr int64_t MAX_HEAD_DIM = 256;
+
+constexpr uint64_t MakeTilingKey(int64_t keyBits, int64_t valueBits, bool normCorrection, int64_t headDim) {
+  return static_cast<uint64_t>(keyBits) * 100000U + static_cast<uint64_t>(valueBits) * 10000U +
+         static_cast<uint64_t>(normCorrection) * 1000U + static_cast<uint64_t>(headDim);
+}
 }  // namespace
 
 namespace optiling {
@@ -43,14 +49,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   const auto* cacheInputShape = context->GetInputShape(KV_CACHE_INPUT_INDEX);
   const auto* blockTableInputShape = context->GetInputShape(BLOCK_TABLE_INPUT_INDEX);
   const auto* seqLensInputShape = context->GetInputShape(SEQ_LENS_INPUT_INDEX);
+  const auto* pageTableInputShape = context->GetInputShape(PAGE_TABLE_INPUT_INDEX);
   const auto* centroidsInputShape = context->GetInputShape(CENTROIDS_INPUT_INDEX);
   OPS_CHECK(queryInputShape == nullptr || cacheInputShape == nullptr || blockTableInputShape == nullptr ||
-                seqLensInputShape == nullptr || centroidsInputShape == nullptr,
+                seqLensInputShape == nullptr || pageTableInputShape == nullptr || centroidsInputShape == nullptr,
             OPS_LOG_E(nodeName, "required TurboQuant input shape is missing"), return ge::GRAPH_FAILED);
   const auto queryShape = queryInputShape->GetStorageShape();
   const auto cacheShape = cacheInputShape->GetStorageShape();
   const auto blockTableShape = blockTableInputShape->GetStorageShape();
   const auto seqLensShape = seqLensInputShape->GetStorageShape();
+  const auto pageTableShape = pageTableInputShape->GetStorageShape();
   const auto centroidsShape = centroidsInputShape->GetStorageShape();
   auto attrs = context->GetAttrs();
   OPS_CHECK(attrs == nullptr, OPS_LOG_E(nodeName, "attrs is nullptr"), return ge::GRAPH_FAILED);
@@ -65,7 +73,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
             OPS_LOG_E(nodeName, "required TurboQuant attribute is missing"), return ge::GRAPH_FAILED);
 
   OPS_CHECK(queryShape.GetDimNum() != 3 || cacheShape.GetDimNum() != 4 || blockTableShape.GetDimNum() != 2 ||
-                seqLensShape.GetDimNum() != 1 || centroidsShape.GetDimNum() != 1,
+                seqLensShape.GetDimNum() != 1 || pageTableShape.GetDimNum() != 2 || centroidsShape.GetDimNum() != 1,
             OPS_LOG_E(nodeName, "invalid TurboQuant input rank"), return ge::GRAPH_FAILED);
 
   const int64_t batchSize = queryShape.GetDim(0);
@@ -76,18 +84,23 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   const int64_t numKvHeads = cacheShape.GetDim(2);
   const int64_t slotSize = cacheShape.GetDim(3);
   const int64_t maxPages = blockTableShape.GetDim(1);
+  const int64_t activePageCount = pageTableShape.GetDim(0);
   OPS_CHECK(batchSize <= 0 || numQueryHeads <= 0 || numBlocks <= 0 || blockSize <= 0 || numKvHeads <= 0 ||
                 slotSize <= 0 || maxPages <= 0 || blockTableShape.GetDim(0) != batchSize ||
-                seqLensShape.GetDim(0) != batchSize,
+                seqLensShape.GetDim(0) != batchSize || activePageCount <= 0 || pageTableShape.GetDim(1) != 2,
             OPS_LOG_E(nodeName, "TurboQuant input dimensions are invalid or inconsistent"), return ge::GRAPH_FAILED);
   OPS_CHECK(headDim < MIN_HEAD_DIM || headDim > MAX_HEAD_DIM || (headDim & (headDim - 1)) != 0,
             OPS_LOG_E(nodeName, "headDim must be a power of two in [32, 256]"), return ge::GRAPH_FAILED);
   OPS_CHECK((*keyBits != 3 && *keyBits != 4) || (*valueBits != 3 && *valueBits != 4),
             OPS_LOG_E(nodeName, "only 3-bit and 4-bit TurboQuant layouts are supported"), return ge::GRAPH_FAILED);
   OPS_CHECK(*maxSeqLen <= 0, OPS_LOG_E(nodeName, "maxSeqLen must be positive"), return ge::GRAPH_FAILED);
-  const int64_t activePages = (*maxSeqLen - 1) / blockSize + 1;
-  OPS_CHECK(activePages > maxPages, OPS_LOG_E(nodeName, "maxSeqLen exceeds block-table capacity"),
+  const int64_t maximumActivePages = (*maxSeqLen - 1) / blockSize + 1;
+  OPS_CHECK(maximumActivePages > maxPages, OPS_LOG_E(nodeName, "maxSeqLen exceeds block-table capacity"),
             return ge::GRAPH_FAILED);
+  OPS_CHECK(maximumActivePages > std::numeric_limits<int64_t>::max() / batchSize,
+            OPS_LOG_E(nodeName, "dense page-grid size exceeds int64 range"), return ge::GRAPH_FAILED);
+  OPS_CHECK(activePageCount > batchSize * maximumActivePages,
+            OPS_LOG_E(nodeName, "pageTable contains more entries than the dense page grid"), return ge::GRAPH_FAILED);
 
   const int64_t keyDataBytes = (headDim * *keyBits + 7) / 8;
   const int64_t valueDataBytes = (headDim * *valueBits + 7) / 8;
@@ -105,37 +118,29 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   TurboQuantPagedDequantTilingData tiling;
   constexpr int64_t UINT32_MAX_VALUE = std::numeric_limits<uint32_t>::max();
   OPS_CHECK(batchSize > UINT32_MAX_VALUE || *maxSeqLen > UINT32_MAX_VALUE || maxPages > UINT32_MAX_VALUE ||
-                activePages > UINT32_MAX_VALUE || numBlocks > UINT32_MAX_VALUE || blockSize > UINT32_MAX_VALUE ||
+                activePageCount > UINT32_MAX_VALUE || numBlocks > UINT32_MAX_VALUE || blockSize > UINT32_MAX_VALUE ||
                 numKvHeads > UINT32_MAX_VALUE || slotSize > UINT32_MAX_VALUE,
             OPS_LOG_E(nodeName, "TurboQuant dimensions exceed the uint32 tiling range"), return ge::GRAPH_FAILED);
-  OPS_CHECK(batchSize > UINT32_MAX_VALUE / activePages || numKvHeads > UINT32_MAX_VALUE / (batchSize * activePages),
+  OPS_CHECK(numKvHeads > UINT32_MAX_VALUE / activePageCount,
             OPS_LOG_E(nodeName, "TurboQuant task count exceeds the uint32 tiling range"), return ge::GRAPH_FAILED);
-  const int64_t totalTasks = batchSize * activePages * numKvHeads;
+  const int64_t totalTasks = activePageCount * numKvHeads;
   tiling.set_batchSize(static_cast<uint32_t>(batchSize));
   tiling.set_maxSeqLen(static_cast<uint32_t>(*maxSeqLen));
   tiling.set_maxPages(static_cast<uint32_t>(maxPages));
-  tiling.set_activePages(static_cast<uint32_t>(activePages));
   tiling.set_numBlocks(static_cast<uint32_t>(numBlocks));
   tiling.set_blockSize(static_cast<uint32_t>(blockSize));
   tiling.set_numKvHeads(static_cast<uint32_t>(numKvHeads));
-  tiling.set_headDim(static_cast<uint32_t>(headDim));
   tiling.set_slotSize(static_cast<uint32_t>(slotSize));
-  tiling.set_keyBits(static_cast<uint32_t>(*keyBits));
-  tiling.set_keyDataBytes(static_cast<uint32_t>(keyDataBytes));
-  tiling.set_keyPackedSize(static_cast<uint32_t>(*keyPackedSize));
-  tiling.set_valueBits(static_cast<uint32_t>(*valueBits));
-  tiling.set_valueDataBytes(static_cast<uint32_t>(valueDataBytes));
-  tiling.set_centroidCount(static_cast<uint32_t>(centroidCount));
-  tiling.set_normCorrection(*normCorrection ? 1U : 0U);
+  tiling.set_activePageCount(static_cast<uint32_t>(activePageCount));
   tiling.set_totalTasks(static_cast<uint32_t>(totalTasks));
 
-  auto* platformInfo = context->GetPlatformInfo();
+  auto* platformInfo = const_cast<fe::PlatFormInfos*>(context->GetPlatformInfo());
   OPS_CHECK(platformInfo == nullptr, OPS_LOG_E(nodeName, "platform info is nullptr"), return ge::GRAPH_FAILED);
   auto platform = platform_ascendc::PlatformAscendC(platformInfo);
   const uint32_t aivCoreCount = platform.GetCoreNumAiv();
   OPS_CHECK(aivCoreCount == 0, OPS_LOG_E(nodeName, "no AIV core is available"), return ge::GRAPH_FAILED);
   const uint32_t blockDim = std::min(static_cast<uint32_t>(totalTasks), aivCoreCount);
-  context->SetTilingKey(0);
+  context->SetTilingKey(MakeTilingKey(*keyBits, *valueBits, *normCorrection, headDim));
   context->SetBlockDim(blockDim);
   size_t* workspaceSizes = context->GetWorkspaceSizes(1);
   auto* rawTilingData = context->GetRawTilingData();

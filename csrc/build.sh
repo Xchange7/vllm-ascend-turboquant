@@ -343,6 +343,12 @@ function set_env()
 
 function clean()
 {
+    if [ "${VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD:-0}" = "1" ]; then
+        log "Info: incremental ACLNN build, preserving ${BUILD_DIR} and ${OUTPUT_DIR}"
+        mkdir -p ${BUILD_DIR} ${OUTPUT_DIR}
+        return
+    fi
+
     if [ -n "${BUILD_DIR}" ];then
         rm -rf ${BUILD_DIR}
     fi

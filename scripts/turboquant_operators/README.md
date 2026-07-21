@@ -4,6 +4,7 @@
 
 - Triton 量化写入，包括负 `slot_mapping` 不写 Cache；
 - AscendC paged-dequant 与 Triton dequant 的数值一致性；
+- 紧凑 active-page 调度、四档 head dimension tiling key 和 out-style 输出别名；
 - AscendC dequant + FIA 与直接读取压缩 Cache 的 Triton decode 一致性；
 - Key/Value 量化误差，包括 MSE、NMSE、MAE、最大绝对误差和余弦相似度；
 - store、decode、dequant、dequant + FIA 和原生 paged attention 的时延、吞吐及峰值显存；
@@ -25,6 +26,47 @@ pip install -v -e . 2>&1 | tee build_910b4.log
 `OPS_PRODUCT_NAME="ascend910b;"` 是正常现象。CANN 自定义算子按 910B 产品族构建，
 而顶层 `SOC_VERSION` 仍然是 `ascend910b4`。
 
+## 日常开发构建
+
+完成过一次全量安装后，修改 TurboQuant 的 AscendC、tiling、OpDef 或 PyTorch binding 时，使用：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+SOC_VERSION=ascend910b4 MAX_JOBS=8 \
+bash scripts/turboquant_operators/build_dev.sh
+```
+
+该入口仍会重编译 `vllm_ascend_C`，因此新增或修改 PyTorch schema 能够生效，但 ACLNN 部分只构建
+`turbo_quant_paged_dequant`，不会等待其余 35 个自定义算子。构建日志保存在
+`logs/turboquant/build_dev_<timestamp>/build.log`。默认保留 `csrc/build` 中的 CMake、protobuf 和
+未变化目标，后续 kernel/tiling 修改使用增量构建。
+
+如果 CANN 报告生成文件、旧 tiling data 或 kernel binary 不一致，执行一次单算子 clean build：
+
+```bash
+SOC_VERSION=ascend910b4 MAX_JOBS=8 \
+bash scripts/turboquant_operators/build_dev.sh --clean
+```
+
+CANN 的单算子安装包会替换聚合的 `op_impl` 和 `op_api` 目录。脚本会在第一次进入开发模式前，
+把现有完整算子包保存到 `.cache/turboquant_build_dev/full_cann_ops_custom`；构建失败时自动恢复。
+开发安装只用于当前 TurboQuant/Qwen 调试，其他依赖 vLLM Ascend 自定义 ACLNN 算子的模型可能不可用。
+
+恢复进入开发模式前的完整算子包：
+
+```bash
+bash scripts/turboquant_operators/build_dev.sh --restore-full
+```
+
+准备提交或发布时，仍需清除开发模式并执行一次全量构建：
+
+```bash
+unset VLLM_ASCEND_BUILD_CUSTOM_OPS
+unset VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD
+rm -rf build csrc/build
+SOC_VERSION=ascend910b4 MAX_JOBS=8 pip install -v -e .
+```
+
 脚本默认使用单张 NPU 0。算子微基准不包含 TP/HCCL 通信，单卡测试能更准确地定位
 算子本身。设置了 `ASCEND_RT_VISIBLE_DEVICES=2` 时，进程内可见设备通常会重新编号为
 0，此时仍使用 `DEVICE=0`。
@@ -37,6 +79,7 @@ bash scripts/turboquant_operators/run_smoke.sh
 ```
 
 该入口测试三个 Cache preset 的 FP16 正确性，并运行一个 B=2、S=512 的短性能用例。
+算子注册检查会同时要求 return-style 和 out-style 两个 schema，因此拉取本次改动后必须重新编译。
 
 ## 完整性能矩阵
 

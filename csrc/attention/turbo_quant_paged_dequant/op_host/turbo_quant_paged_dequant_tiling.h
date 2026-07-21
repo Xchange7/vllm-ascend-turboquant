@@ -19,19 +19,11 @@ BEGIN_TILING_DATA_DEF(TurboQuantPagedDequantTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, batchSize);
 TILING_DATA_FIELD_DEF(uint32_t, maxSeqLen);
 TILING_DATA_FIELD_DEF(uint32_t, maxPages);
-TILING_DATA_FIELD_DEF(uint32_t, activePages);
 TILING_DATA_FIELD_DEF(uint32_t, numBlocks);
 TILING_DATA_FIELD_DEF(uint32_t, blockSize);
 TILING_DATA_FIELD_DEF(uint32_t, numKvHeads);
-TILING_DATA_FIELD_DEF(uint32_t, headDim);
 TILING_DATA_FIELD_DEF(uint32_t, slotSize);
-TILING_DATA_FIELD_DEF(uint32_t, keyBits);
-TILING_DATA_FIELD_DEF(uint32_t, keyDataBytes);
-TILING_DATA_FIELD_DEF(uint32_t, keyPackedSize);
-TILING_DATA_FIELD_DEF(uint32_t, valueBits);
-TILING_DATA_FIELD_DEF(uint32_t, valueDataBytes);
-TILING_DATA_FIELD_DEF(uint32_t, centroidCount);
-TILING_DATA_FIELD_DEF(uint32_t, normCorrection);
+TILING_DATA_FIELD_DEF(uint32_t, activePageCount);
 TILING_DATA_FIELD_DEF(uint32_t, totalTasks);
 END_TILING_DATA_DEF;
 

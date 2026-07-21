@@ -184,6 +184,10 @@ class AscendMetadata:
     # during ACLGraph construction. Backends can use it for static kernel
     # policy without synchronizing a device sequence-length tensor.
     max_seq_len: int | None = None
+    # TurboQuant fused decode state is owned by its metadata builder and
+    # shared by every attention layer in a model step.
+    turboquant_page_table: torch.Tensor | None = None
+    turboquant_workspace: object | None = None
     actual_seq_lengths_q: list[int] = None  # type: ignore
 
     query_start_loc: torch.Tensor = None

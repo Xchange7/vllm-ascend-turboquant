@@ -805,22 +805,37 @@ at::Tensor npu_reshape_and_cache_bnsd(const at::Tensor& hashq,
     return hashkCacheOut;
 }
 
-std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant(
+namespace {
+std::vector<int64_t> turboquant_output_shape(const at::Tensor& query,
+                                             const at::Tensor& kvCache,
+                                             int64_t maxSeqLen) {
+    TORCH_CHECK(query.dim() == 3, "TurboQuant query must have shape [B, N, D].");
+    TORCH_CHECK(kvCache.dim() == 4,
+                "TurboQuant KV cache must have shape [blocks, block_size, N, slot_size].");
+    TORCH_CHECK(maxSeqLen > 0, "TurboQuant maxSeqLen must be positive.");
+    return {query.size(0), kvCache.size(2), maxSeqLen, query.size(2)};
+}
+}  // namespace
+
+std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant_out(
     const at::Tensor& query,
     const at::Tensor& kvCache,
     const at::Tensor& blockTable,
     const at::Tensor& seqLens,
+    const at::Tensor& pageTable,
     const at::Tensor& centroids,
     int64_t maxSeqLen,
     int64_t keyBits,
     int64_t keyPackedSize,
     int64_t valueBits,
-    bool normCorrection) {
-    TORCH_CHECK(query.dim() == 3, "TurboQuant query must have shape [B, N, D].");
-    TORCH_CHECK(kvCache.dim() == 4,
-                "TurboQuant KV cache must have shape [blocks, block_size, N, slot_size].");
+    bool normCorrection,
+    at::Tensor& key,
+    at::Tensor& value) {
+    const std::vector<int64_t> outputShape = turboquant_output_shape(query, kvCache, maxSeqLen);
     TORCH_CHECK(blockTable.dim() == 2, "TurboQuant block table must be two-dimensional.");
     TORCH_CHECK(seqLens.dim() == 1, "TurboQuant sequence lengths must be one-dimensional.");
+    TORCH_CHECK(pageTable.dim() == 2 && pageTable.size(1) == 2,
+                "TurboQuant page table must have shape [active_pages, 2].");
     TORCH_CHECK(centroids.dim() == 1, "TurboQuant centroids must be one-dimensional.");
     TORCH_CHECK(query.size(0) == blockTable.size(0) && query.size(0) == seqLens.size(0),
                 "TurboQuant batch dimensions must match.");
@@ -829,6 +844,7 @@ std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant(
     TORCH_CHECK(kvCache.scalar_type() == at::kByte, "TurboQuant KV cache must use uint8.");
     TORCH_CHECK(blockTable.scalar_type() == at::kInt, "TurboQuant block table must use int32.");
     TORCH_CHECK(seqLens.scalar_type() == at::kInt, "TurboQuant sequence lengths must use int32.");
+    TORCH_CHECK(pageTable.scalar_type() == at::kInt, "TurboQuant page table must use int32.");
     TORCH_CHECK(centroids.scalar_type() == at::kFloat, "TurboQuant centroids must use float32.");
     TORCH_CHECK(query.size(0) > 0 && query.size(1) > 0 && query.size(2) > 0,
                 "TurboQuant query dimensions must be positive.");
@@ -836,8 +852,12 @@ std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant(
                 "TurboQuant KV cache dimensions must be positive.");
     const auto queryDevice = query.device();
     TORCH_CHECK(kvCache.device() == queryDevice && blockTable.device() == queryDevice &&
-                    seqLens.device() == queryDevice && centroids.device() == queryDevice,
+                    seqLens.device() == queryDevice && pageTable.device() == queryDevice &&
+                    centroids.device() == queryDevice && key.device() == queryDevice &&
+                    value.device() == queryDevice,
                 "TurboQuant inputs must be on the same device.");
+    TORCH_CHECK(pageTable.size(0) > 0,
+                "TurboQuant page table must contain at least one active page.");
     TORCH_CHECK(maxSeqLen > 0 && maxSeqLen <= blockTable.size(1) * kvCache.size(1),
                 "TurboQuant maxSeqLen must be positive and fit in the block table.");
     TORCH_CHECK(keyBits == 3 || keyBits == 4, "TurboQuant keyBits must be 3 or 4.");
@@ -861,13 +881,35 @@ std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant(
     TORCH_CHECK(centroids.size(0) >= (int64_t{1} << keyBits),
                 "TurboQuant centroid table is smaller than the key codebook.");
 
-    const std::vector<int64_t> outputShape = {
-        query.size(0), kvCache.size(2), maxSeqLen, query.size(2)};
-    at::Tensor key = at::empty(outputShape, query.options());
-    at::Tensor value = at::empty(outputShape, query.options());
-    EXEC_NPU_CMD(aclnnTurboQuantPagedDequant, query, kvCache, blockTable, seqLens, centroids,
+    TORCH_CHECK(key.sizes().vec() == outputShape && value.sizes().vec() == outputShape,
+                "TurboQuant output tensors must have shape [B, Nkv, max_seq_len, D].");
+    TORCH_CHECK(key.scalar_type() == query.scalar_type() && value.scalar_type() == query.scalar_type(),
+                "TurboQuant output tensors must match the query dtype.");
+    TORCH_CHECK(key.is_contiguous() && value.is_contiguous(),
+                "TurboQuant output tensors must be contiguous.");
+    EXEC_NPU_CMD(aclnnTurboQuantPagedDequant, query, kvCache, blockTable, seqLens, pageTable, centroids,
                  maxSeqLen, keyBits, keyPackedSize, valueBits, normCorrection, key, value);
     return std::make_tuple(key, value);
+}
+
+std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant(
+    const at::Tensor& query,
+    const at::Tensor& kvCache,
+    const at::Tensor& blockTable,
+    const at::Tensor& seqLens,
+    const at::Tensor& pageTable,
+    const at::Tensor& centroids,
+    int64_t maxSeqLen,
+    int64_t keyBits,
+    int64_t keyPackedSize,
+    int64_t valueBits,
+    bool normCorrection) {
+    const std::vector<int64_t> outputShape = turboquant_output_shape(query, kvCache, maxSeqLen);
+    at::Tensor key = at::empty(outputShape, query.options());
+    at::Tensor value = at::empty(outputShape, query.options());
+    return npu_turboquant_paged_dequant_out(query, kvCache, blockTable, seqLens, pageTable, centroids,
+                                            maxSeqLen, keyBits, keyPackedSize, valueBits, normCorrection,
+                                            key, value);
 }
 
 at::Tensor npu_sign_bits_pack(const at::Tensor& input,
@@ -2612,11 +2654,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "npu_turboquant_paged_dequant(Tensor query, Tensor kv_cache, Tensor block_table, "
-        "Tensor seq_lens, Tensor centroids, int max_seq_len, int key_bits, "
+        "Tensor seq_lens, Tensor page_table, Tensor centroids, int max_seq_len, int key_bits, "
         "int key_packed_size, int value_bits, bool norm_correction) -> (Tensor, Tensor)"
     );
     ops.impl("npu_turboquant_paged_dequant", torch::kPrivateUse1,
              &vllm_ascend::npu_turboquant_paged_dequant);
+    ops.def(
+        "npu_turboquant_paged_dequant_out(Tensor query, Tensor kv_cache, Tensor block_table, "
+        "Tensor seq_lens, Tensor page_table, Tensor centroids, int max_seq_len, int key_bits, "
+        "int key_packed_size, int value_bits, bool norm_correction, Tensor(a!) key_out, "
+        "Tensor(b!) value_out) -> (Tensor(a!), Tensor(b!))"
+    );
+    ops.impl("npu_turboquant_paged_dequant_out", torch::kPrivateUse1,
+             &vllm_ascend::npu_turboquant_paged_dequant_out);
 
     ops.def("npu_sign_bits_pack(Tensor input, int size) -> Tensor");
     ops.impl("npu_sign_bits_pack", torch::kPrivateUse1, &vllm_ascend::npu_sign_bits_pack);

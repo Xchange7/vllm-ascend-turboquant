@@ -92,6 +92,89 @@ def test_turboquant_ascend_fused_rejects_unsupported_head_dim(head_dim):
         _validate_ascend_fused_head_dim(head_dim)
 
 
+def test_turboquant_compact_page_table_tracks_only_active_pages():
+    from vllm_ascend.attention.turboquant import (
+        _build_turboquant_page_table_cpu,
+    )
+
+    page_table = _build_turboquant_page_table_cpu([1, 128, 129], 128)
+
+    torch.testing.assert_close(
+        page_table,
+        torch.tensor(
+            [[0, 0], [1, 0], [2, 0], [2, 1]],
+            dtype=torch.int32,
+        ),
+    )
+
+
+@pytest.mark.parametrize(("seq_lens", "block_size"), [([], 128), ([0], 128), ([-1], 128), ([1], 0)])
+def test_turboquant_compact_page_table_rejects_invalid_input(seq_lens, block_size):
+    from vllm_ascend.attention.turboquant import (
+        _build_turboquant_page_table_cpu,
+    )
+
+    with pytest.raises(ValueError):
+        _build_turboquant_page_table_cpu(seq_lens, block_size)
+
+
+def test_turboquant_fused_workspace_reuses_dense_storage():
+    from vllm_ascend.attention.turboquant import _TurboQuantFusedWorkspace
+
+    workspace = _TurboQuantFusedWorkspace()
+    query = torch.empty(2, 4, 32)
+    buffers = workspace.dense_buffers(query, 2, 128, 256)
+    pointers = tuple(tensor.data_ptr() for tensor in (buffers.key, buffers.value, buffers.query, buffers.softmax_lse))
+
+    smaller_query = torch.empty(1, 4, 32)
+    reused = workspace.dense_buffers(smaller_query, 2, 64, 128)
+
+    assert (
+        tuple(tensor.data_ptr() for tensor in (reused.key, reused.value, reused.query, reused.softmax_lse)) == pointers
+    )
+    assert reused.key.shape == (1, 2, 64, 32)
+    assert reused.value.shape == (1, 2, 64, 32)
+
+
+def test_turboquant_fia_workspace_factory_runs_once_per_shape():
+    from vllm_ascend.attention.turboquant import _TurboQuantFusedWorkspace
+
+    workspace = _TurboQuantFusedWorkspace()
+    calls = 0
+
+    def factory():
+        nonlocal calls
+        calls += 1
+        return torch.empty(32, dtype=torch.uint8)
+
+    first = workspace.get_fia_workspace((1, 4, 32, 128), factory)
+    second = workspace.get_fia_workspace((1, 4, 32, 128), factory)
+
+    assert first.data_ptr() == second.data_ptr()
+    assert calls == 1
+
+
+def test_turboquant_fia_workspace_invalidates_shapes_when_storage_type_changes():
+    from vllm_ascend.attention.turboquant import _TurboQuantFusedWorkspace
+
+    workspace = _TurboQuantFusedWorkspace()
+    calls = 0
+
+    def uint8_factory():
+        nonlocal calls
+        calls += 1
+        return torch.empty(32, dtype=torch.uint8)
+
+    workspace.get_fia_workspace(("fp16-shape",), uint8_factory)
+    workspace.get_fia_workspace(
+        ("bf16-shape",),
+        lambda: torch.empty(32, dtype=torch.float32),
+    )
+    workspace.get_fia_workspace(("fp16-shape",), uint8_factory)
+
+    assert calls == 2
+
+
 def test_turboquant_operator_probe_loads_custom_extension(monkeypatch):
     from vllm_ascend import utils
     from vllm_ascend.ops.turboquant import has_turboquant_paged_dequant

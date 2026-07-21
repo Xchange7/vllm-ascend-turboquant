@@ -32,6 +32,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
+    # Optional comma- or semicolon-separated custom-op allowlist for developer
+    # builds. An empty value builds the complete platform operator set. This
+    # non-sensitive build-only option must not be used for release packages.
+    "VLLM_ASCEND_BUILD_CUSTOM_OPS": lambda: os.getenv(
+        "VLLM_ASCEND_BUILD_CUSTOM_OPS",
+        "",
+    ),
+    # Reuse the ACLNN CMake/protobuf build tree during local operator
+    # development. Release builds default to a clean build. This non-sensitive
+    # build-only option accepts 0 or 1.
+    "VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD": lambda: bool(int(os.getenv("VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD", "0"))),
     # The build type of the package. It can be one of the following values:
     # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.
     "CMAKE_BUILD_TYPE": lambda: os.getenv("CMAKE_BUILD_TYPE"),

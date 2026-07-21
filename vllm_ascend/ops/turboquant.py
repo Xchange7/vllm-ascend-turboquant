@@ -24,7 +24,9 @@ def has_turboquant_paged_dequant() -> bool:
 
     if not enable_custom_op():
         return False
-    return hasattr(torch.ops._C_ascend, "npu_turboquant_paged_dequant")
+    return hasattr(torch.ops._C_ascend, "npu_turboquant_paged_dequant") and hasattr(
+        torch.ops._C_ascend, "npu_turboquant_paged_dequant_out"
+    )
 
 
 def turboquant_paged_dequant(
@@ -32,6 +34,7 @@ def turboquant_paged_dequant(
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
     centroids: torch.Tensor,
     *,
     max_seq_len: int,
@@ -51,10 +54,50 @@ def turboquant_paged_dequant(
         kv_cache,
         block_table,
         seq_lens,
+        page_table,
         centroids,
         max_seq_len,
         key_bits,
         key_packed_size,
         value_bits,
         norm_correction,
+    )
+
+
+def turboquant_paged_dequant_out(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    centroids: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    *,
+    max_seq_len: int,
+    key_bits: int,
+    key_packed_size: int,
+    value_bits: int,
+    norm_correction: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize paged TurboQuant cache into caller-owned dense buffers."""
+    if not has_turboquant_paged_dequant():
+        raise RuntimeError(
+            "The Ascend TurboQuant fused operator is not installed. Rebuild "
+            "vllm-ascend with `pip install -e .` after sourcing the CANN environment."
+        )
+    return torch.ops._C_ascend.npu_turboquant_paged_dequant_out(
+        query,
+        kv_cache,
+        block_table,
+        seq_lens,
+        page_table,
+        centroids,
+        max_seq_len,
+        key_bits,
+        key_packed_size,
+        value_bits,
+        norm_correction,
+        key_out,
+        value_out,
     )

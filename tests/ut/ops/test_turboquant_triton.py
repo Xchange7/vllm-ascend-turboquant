@@ -27,6 +27,8 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetad
 from vllm_ascend.attention.turboquant import (
     AscendTurboQuantAttentionImpl,
     _build_hadamard,
+    _build_turboquant_page_table_cpu,
+    _TurboQuantFusedWorkspace,
 )
 from vllm_ascend.kv_cache.turboquant import get_turboquant_config
 from vllm_ascend.ops.triton.turboquant_decode import (
@@ -36,7 +38,10 @@ from vllm_ascend.ops.triton.turboquant_decode import (
     triton_turboquant_dequant_paged_cache,
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
-from vllm_ascend.ops.turboquant import turboquant_paged_dequant
+from vllm_ascend.ops.turboquant import (
+    turboquant_paged_dequant,
+    turboquant_paged_dequant_out,
+)
 
 _DECODE_CORRECTNESS_CASES = [
     (cache_dtype, query_len, torch.float16, 128, False, False, None, "auto")
@@ -150,17 +155,23 @@ def _build_fused_dequant_inputs(
 
 @npu_test(num_npus=1, npu_type="a2")
 @pytest.mark.parametrize(
-    ("cache_dtype", "activation_dtype"),
+    ("cache_dtype", "activation_dtype", "head_dim", "norm_correction"),
     [
-        ("turboquant_4bit_nc", torch.float16),
-        ("turboquant_4bit_nc", torch.bfloat16),
-        ("turboquant_k3v4_nc", torch.float16),
-        ("turboquant_3bit_nc", torch.float16),
+        ("turboquant_4bit_nc", torch.float16, 32, True),
+        ("turboquant_4bit_nc", torch.float16, 64, True),
+        ("turboquant_4bit_nc", torch.float16, 128, True),
+        ("turboquant_4bit_nc", torch.float16, 128, False),
+        ("turboquant_4bit_nc", torch.float16, 256, True),
+        ("turboquant_4bit_nc", torch.bfloat16, 128, True),
+        ("turboquant_k3v4_nc", torch.float16, 128, True),
+        ("turboquant_3bit_nc", torch.float16, 128, True),
     ],
 )
 def test_turboquant_ascend_fused_dequant_matches_triton(
     cache_dtype,
     activation_dtype,
+    head_dim,
+    norm_correction,
 ):
     (
         config,
@@ -172,18 +183,20 @@ def test_turboquant_ascend_fused_dequant_matches_triton(
         seq_lens_list,
         max_seq_len,
         query,
-    ) = _build_fused_dequant_inputs(cache_dtype, activation_dtype)
+    ) = _build_fused_dequant_inputs(cache_dtype, activation_dtype, head_dim=head_dim)
+    page_table = _build_turboquant_page_table_cpu(seq_lens_list, cache.shape[1]).to(query.device)
     key_bnsd, value_bnsd = turboquant_paged_dequant(
         query,
         cache,
         block_table,
         seq_lens,
+        page_table,
         centroids,
         max_seq_len=max_seq_len,
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
-        norm_correction=config.norm_correction,
+        norm_correction=norm_correction,
     )
 
     total_tokens = sum(seq_lens_list)
@@ -211,7 +224,7 @@ def test_turboquant_ascend_fused_dequant_matches_triton(
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
-        norm_correction=config.norm_correction,
+        norm_correction=norm_correction,
     )
     torch.npu.synchronize()
 
@@ -220,6 +233,30 @@ def test_turboquant_ascend_fused_dequant_matches_triton(
     tolerance = 2e-2 if activation_dtype == torch.bfloat16 else 3e-3
     torch.testing.assert_close(key_dense, key_reference, atol=tolerance, rtol=tolerance)
     torch.testing.assert_close(value_dense, value_reference, atol=tolerance, rtol=tolerance)
+
+    key_out = torch.empty_like(key_bnsd)
+    value_out = torch.empty_like(value_bnsd)
+    returned_key, returned_value = turboquant_paged_dequant_out(
+        query,
+        cache,
+        block_table,
+        seq_lens,
+        page_table,
+        centroids,
+        key_out,
+        value_out,
+        max_seq_len=max_seq_len,
+        key_bits=config.key_quant_bits,
+        key_packed_size=config.key_packed_size,
+        value_bits=config.value_quant_bits,
+        norm_correction=norm_correction,
+    )
+    assert returned_key.data_ptr() == key_out.data_ptr()
+    assert returned_value.data_ptr() == value_out.data_ptr()
+    key_out_dense = torch.cat([key_out[i, :, :seq_len].permute(1, 0, 2) for i, seq_len in enumerate(seq_lens_list)])
+    value_out_dense = torch.cat([value_out[i, :, :seq_len].permute(1, 0, 2) for i, seq_len in enumerate(seq_lens_list)])
+    torch.testing.assert_close(key_out_dense, key_dense)
+    torch.testing.assert_close(value_out_dense, value_dense)
 
 
 @npu_test(num_npus=1, npu_type="a2")
@@ -244,15 +281,18 @@ def test_turboquant_ascend_fused_decode_matches_packed_decode():
     impl.num_heads = query.shape[1]
     impl.scale = 1 / math.sqrt(query.shape[-1])
     impl.tq_config = config
+    page_table = _build_turboquant_page_table_cpu(seq_lens_list, cache.shape[1]).to(query.device)
     fused_output = impl._run_ascend_fused_decode(
         layer,
         query,
         cache,
         block_table,
         seq_lens,
+        page_table,
         seq_lens_list,
         torch.empty_like(query),
         max_seq_len,
+        _TurboQuantFusedWorkspace(),
     )
     packed_output = triton_turboquant_decode_attention(
         query,

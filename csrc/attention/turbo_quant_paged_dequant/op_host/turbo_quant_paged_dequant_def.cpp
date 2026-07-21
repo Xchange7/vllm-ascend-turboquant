@@ -35,6 +35,11 @@ class TurboQuantPagedDequant : public OpDef {
         .DataType({ge::DT_INT32, ge::DT_INT32})
         .Format({ge::FORMAT_ND, ge::FORMAT_ND})
         .AutoContiguous();
+    this->Input("pageTable")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_INT32, ge::DT_INT32})
+        .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+        .AutoContiguous();
     this->Input("centroids")
         .ParamType(REQUIRED)
         .DataType({ge::DT_FLOAT, ge::DT_FLOAT})

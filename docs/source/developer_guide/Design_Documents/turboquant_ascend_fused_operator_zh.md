@@ -38,7 +38,7 @@ unpack、paged addressing、标量控制和 split-KV 调度，高并发吞吐可
 4. 为后续真正融合的 Ascend TurboQuant attention 积累 layout、tiling 和算子注册基础。
 
 该设计是性能实验路径，不应预设它一定更快。它减少了 Triton packed attention 的控制开销，
-但引入了 dense K/V 分配和 HBM 写回。
+但引入了 dense K/V 工作区和 HBM 写回；当前实现会复用工作区，不能消除 dense 带宽成本。
 
 ## 3. 端到端调用链
 
@@ -47,13 +47,12 @@ unpack、paged addressing、标量控制和 split-KV 调度，高并发吞吐可
 ```text
 AscendTurboQuantAttentionImpl._decode_attention()
   -> _run_ascend_fused_decode()
-     -> turboquant_paged_dequant()
-        -> torch.ops._C_ascend.npu_turboquant_paged_dequant()
+     -> turboquant_paged_dequant_out(caller-owned dense K/V)
+        -> torch.ops._C_ascend.npu_turboquant_paged_dequant_out()
            -> ACLNN TurboQuantPagedDequant
               -> AscendC turbo_quant_paged_dequant kernel
-     -> query @ compute_rotation
-     -> torch_npu.npu_fused_infer_attention_score()
-     -> output.copy_()
+     -> torch.matmul(..., out=query_workspace)
+     -> torch_npu.npu_fused_infer_attention_score.out(..., out=vLLM output)
 ```
 
 Cache 写入不经过该 AscendC 算子：
@@ -93,6 +92,7 @@ do_kv_cache_update()
 | `kv_cache` | `[num_blocks, block_size, Nkv, slot_size]` | UINT8 | 持久化 packed TurboQuant Cache |
 | `block_table` | `[B, max_pages]` | INT32 | logical page 到 physical block 的映射 |
 | `seq_lens` | `[B]` | INT32 | 每个请求当前有效 KV 长度 |
+| `page_table` | `[active_pages, 2]` | INT32 | 紧凑的 `(request, logical_page)` 调度表 |
 | `centroids` | `[C]` | FP32 | Key Lloyd-Max codebook，至少包含 `2 ** key_bits` 个值 |
 
 属性：
@@ -172,12 +172,15 @@ shift      = bit_offset % 8
 ```
 
 4-bit 模式下每两个 index 放进一个 byte；3-bit 模式下每八个 index 连续占 24 bit，部分 index
-会跨 byte。AscendC 的 `UnpackIndex()` 同时读取当前 byte 和必要时的下一个 byte，再通过 mask
-提取 index：
+会跨 byte。kernel 不再为每个维度重复读取 packed byte，而是分组解包：
 
 ```text
-index = (packed >> shift) & ((1 << bits) - 1)
+4-bit: 1 byte  -> 2 indices
+3-bit: 3 bytes -> 8 indices
 ```
+
+分组后 bit order 与上述公式完全一致，但 4-bit 的 scalar byte load 数约减半，3-bit 从每维最多
+两次 load 降为每八维三次 load。
 
 ## 7. Host 侧实现
 
@@ -187,7 +190,7 @@ index = (packed >> shift) & ((1 << bits) - 1)
 
 - `query` 和输出支持 FP16/BF16；
 - Cache 为 UINT8；
-- block table 和 sequence length 为 INT32；
+- block table、sequence length 和紧凑 page table 为 INT32；
 - centroid table 为 FP32；
 - 所有输入使用 ND format 和 `AutoContiguous()`；
 - AICore config 注册到 `ascend910b` 和 `ascend910_93` 产品族。
@@ -220,9 +223,9 @@ out  = [B, Nkv, S, D]
 `TilingFunc()` 在生成 kernel 参数之前建立完整的运行时防线：
 
 1. 所有 shape、attribute、platform 和 workspace 指针必须存在；
-2. 输入 rank 必须分别为 3、4、2、1、1；
+2. 输入 rank 必须分别为 3、4、2、1、2、1；
 3. batch、block、head 和 slot 维度必须为正；
-4. query、block table 和 sequence lengths 的 batch 必须相等；
+4. query、block table 和 sequence lengths 的 batch 必须相等，page table 必须为 `[P, 2]`；
 5. `D` 必须是 `[32, 256]` 内的 2 的幂；
 6. Key/Value 只接受 3-bit 或 4-bit；
 7. `max_seq_len` 不能超过 block table 的 page 容量；
@@ -239,23 +242,31 @@ out  = [B, Nkv, S, D]
 `TurboQuantPagedDequantTilingData` 向 kernel 传递：
 
 ```text
-batchSize, maxSeqLen, maxPages, activePages,
-numBlocks, blockSize, numKvHeads, headDim, slotSize,
-keyBits, keyDataBytes, keyPackedSize,
-valueBits, valueDataBytes, centroidCount,
-normCorrection, totalTasks
+batchSize, maxSeqLen, maxPages,
+numBlocks, blockSize, numKvHeads, slotSize,
+activePageCount, totalTasks
 ```
+
+`head_dim`、Key/Value 位宽和 NC 不再作为热路径中的普通 tiling field 读取，它们已编码进 tiling
+key，并成为 kernel 模板参数；packed offset 和 centroid 数量由模板在编译期计算。
 
 其中：
 
 ```text
-active_pages = ceil(max_seq_len / block_size)
-total_tasks  = B * active_pages * Nkv
+active_page_count = sum(ceil(seq_lens[b] / block_size) for b in requests)
+total_tasks       = active_page_count * Nkv
 block_dim    = min(total_tasks, available_aiv_cores)
 ```
 
 每个 task 对应一个 `(batch, logical_page, kv_head)`，而不是一个 token。task 内部顺序处理该 page
-上的有效 token，减少 task 数量和重复 page-table 查询。
+上的有效 token。page table 由 metadata builder 使用已有 CPU sequence lengths 构造，一次 H2D 后被
+所有层共享；只要各请求的 page count 没有跨过下一个 block 边界，后续 token 继续复用同一张表，
+不再 H2D。长短请求混合时也不再为短请求遍历全局 `max_seq_len` 对应的空 page。
+page table 的 pinned host staging buffer 由 NPU event 保护；动态批次改变、需要重写 staging buffer
+时，builder 会先确认上一笔 non-blocking H2D 已完成，避免高并发请求进出时发生异步覆盖。
+
+tiling key 同时编码 `key_bits`、`value_bits`、`norm_correction` 和 `head_dim`。kernel 入口据此分派
+编译期模板，避免 slot 热循环中的位宽、NC 和维度分支。
 
 ### 7.5 Platform API 兼容性
 
@@ -263,7 +274,7 @@ CANN 9.0 的 `PlatformAscendC` 构造函数接收可写的 `fe::PlatFormInfos*`�
 `GetPlatformInfo()` 的 mutable pointer：
 
 ```cpp
-auto* platformInfo = context->GetPlatformInfo();
+auto* platformInfo = const_cast<fe::PlatFormInfos*>(context->GetPlatformInfo());
 ```
 
 不能先声明为 `const auto*`，否则会在 host 编译阶段触发 const conversion error。
@@ -318,14 +329,14 @@ GM centroids -> DataCopyPad -> UB centroidBuffer
 线性 task index 按以下方式还原：
 
 ```text
-head_index  = task % Nkv
-batch_page  = task // Nkv
-page_index  = batch_page % active_pages
-batch_index = batch_page // active_pages
-page_start  = page_index * block_size
+head_index       = task % Nkv
+active_page_index = task // Nkv
+batch_index, page_index = page_table[active_page_index]
+page_start       = page_index * block_size
 ```
 
-若该 page 已经超过 `seq_lens[batch]`，task 直接返回。否则读取：
+kernel 会再次校验 page table 中的 batch/page 范围。若该 page 已经超过 `seq_lens[batch]`，task
+直接返回。否则读取：
 
 ```text
 physical_block = block_table[batch, page_index]
@@ -371,7 +382,8 @@ host 和 Torch binding 已经保证这些 offset 为偶数且位于 slot 内。
 
 ### 8.7 Key 解包、查表和 norm correction
 
-每个维度先通过 `UnpackIndex()` 得到 centroid index。AscendC `Gather()` 的 index 表示 byte
+`UnpackIndices<KEY_BITS>()` 按 4-bit byte group 或 3-bit 24-bit group 生成 centroid index。
+AscendC `Gather()` 的 index 表示 byte
 offset，不是元素下标，因此 kernel 写入：
 
 ```text
@@ -447,6 +459,8 @@ K/V 全部在 FP32 UB buffer 中完成反量化，然后根据 `DTYPE_QUERY` 转
 
 ```text
 _C_ascend::npu_turboquant_paged_dequant(...) -> (Tensor, Tensor)
+_C_ascend::npu_turboquant_paged_dequant_out(..., Tensor(a!) key, Tensor(b!) value)
+    -> (Tensor(a!), Tensor(b!))
 ```
 
 进入 ACLNN 前，binding 会检查：
@@ -463,14 +477,15 @@ PyTorch wrapper 的 ACLNN 调用。
 
 ### 9.2 输出分配和 ACLNN 调用
 
-binding 使用 `query.options()` 分配两个 dense 输出，再调用：
+返回式 schema 为独立算子测试保留。服务热路径使用 out-style schema，检查调用方提供的输出
+shape、dtype、device 和 contiguous layout 后直接调用：
 
 ```text
 EXEC_NPU_CMD(aclnnTurboQuantPagedDequant, ..., key, value)
 ```
 
-`torch_binding_meta.cpp` 使用相同 shape 公式创建 Meta tensor，但不会执行真实数据搬运。这样
-PyTorch tracing、compile 和 fake tensor 流程可以知道输出结构。
+`torch_binding_meta.cpp` 同时注册返回式和 alias-preserving out-style Meta 实现。这样 PyTorch
+tracing、compile 和 fake tensor 流程可以知道输出结构及写入语义。
 
 ### 9.3 自定义扩展的延迟加载
 
@@ -495,7 +510,8 @@ Attention 初始化时会校验：
 
 - 值必须为 `auto`、`ascend_fused`、`grouped_gqa` 或 `reference`；
 - `ascend_fused` 不支持 ALiBi 和 logits soft cap；
-- head dimension 满足 AscendC 契约。
+- head dimension 满足 AscendC 契约；
+- 扩展同时包含返回式和 out-style paged-dequant schema，否则在模型初始化阶段直接失败。
 
 `ascend_fused` 只在所有请求都是单 token decode 时进入
 `_run_ascend_fused_decode()`。multi-token decode、continuation prefill 等其他场景会把实现名转换为
@@ -524,7 +540,7 @@ query_rotated = query @ compute_rotation
 AscendC 返回 K/V 后，backend 调用：
 
 ```text
-npu_fused_infer_attention_score(
+npu_fused_infer_attention_score.out(
     query=query_rotated.unsqueeze(2),
     key=key_rotated,
     value=value,
@@ -534,6 +550,8 @@ npu_fused_infer_attention_score(
     num_heads=Nq,
     scale=attention_scale,
     sparse_mode=0,
+    workspace=fia_workspace,
+    out=[vllm_output.unsqueeze(2), softmax_lse_workspace],
 )
 ```
 
@@ -583,7 +601,7 @@ Key 使用非均匀 centroid quantization，Value 使用 uniform affine quantiza
 
 ### 12.2 临时 dense K/V
 
-每次单 token decode 会临时分配：
+单 token decode 需要以下共享工作区容量：
 
 ```text
 temporary_bytes = 2 * B * Nkv * max_seq_len * D * activation_element_size
@@ -592,8 +610,12 @@ temporary_bytes = 2 * B * Nkv * max_seq_len * D * activation_element_size
 前面的 `2` 表示 Key 和 Value。例如 Qwen3-32B TP4 的本地 `Nkv=2`，当 `B=16`、
 `S=16384`、`D=128`、BF16 时，临时 K/V 约为 256 MiB。
 
-这些 tensor 不保存在每层对象上，但会进入 NPU caching allocator。观察 `npu-smi` 时，allocated
-tensor 释放后进程保留显存不一定立即下降。
+metadata builder 持有一组 flat dense K/V buffer，并按历史最大需求扩容；同一 model step 的所有层
+按 stream 顺序复用，后续 step 继续复用。因此不会为每层永久保存一份，也不会在每层 forward
+重复申请。Q rotation、FIA workspace 和 softmax placeholder 使用同一策略。观察 `npu-smi` 时，
+工作区按历史峰值保留属于预期行为。底层 flat storage 和 FIA workspace 查询按 1024-token 容量
+档位增长并受 block-table 容量限制，避免 decode 每增加一个 token 就重新申请；实际
+paged-dequant/FIA tensor view 仍使用精确 `max_seq_len`，不会把 attention 计算长度补到容量档位。
 
 ### 12.3 可能更快的条件
 
@@ -607,7 +629,7 @@ tensor 释放后进程保留显存不一定立即下降。
 
 - 每步展开全部历史 K/V；
 - dense K/V 的 HBM 写回和再次读取；
-- 每层两个大 tensor 的分配/allocator 开销；
+- dense 工作区的峰值显存常驻；
 - 上下文越长，dequant 工作量线性增长。
 
 因此性能结论必须分别报告 `fused_dequant` 和 `fused_dequant + FIA`，不能只看整个服务的 token/s。
@@ -641,10 +663,14 @@ from vllm_ascend.utils import enable_custom_op
 print("extension loaded:", enable_custom_op())
 print(
     "TurboQuant registered:",
-    hasattr(torch.ops._C_ascend, "npu_turboquant_paged_dequant"),
+    hasattr(torch.ops._C_ascend, "npu_turboquant_paged_dequant")
+    and hasattr(torch.ops._C_ascend, "npu_turboquant_paged_dequant_out"),
 )
 print(torch._C._dispatch_find_schema_or_throw(
     "_C_ascend::npu_turboquant_paged_dequant", ""
+))
+print(torch._C._dispatch_find_schema_or_throw(
+    "_C_ascend::npu_turboquant_paged_dequant_out", ""
 ))
 PY
 ```
@@ -661,10 +687,11 @@ PY
 - AscendC 遇到无效 sequence/page/physical block 不越界读取；
 - Python、Torch binding 和 ACLNN tiling 使用一致的 head/layout 校验；
 - 所有地址乘法在关键位置升级为 64 bit；
+- page task 只覆盖实际有效 page，并在 kernel 内再次检查 batch/page/physical block；
 - tiling 写入 `uint32_t` 前检查范围和 task count 溢出；
 - UB buffer 按 32 bytes 对齐；
 - CANN helper 使用私有名称，避免 `AlignUp` 等 API 冲突；
-- `GetPlatformInfo()` 保持 mutable pointer，兼容 CANN 9.0；
+- `GetPlatformInfo()` 显式去除 CANN 9.0 API 返回值的 const 限定；
 - 自定义算子探测先触发延迟加载，避免 fresh process 误报未注册。
 
 仍需注意：AscendC 和 Triton dequant 读取同一份 store 结果，只能证明两个 reader 与当前 writer
@@ -685,6 +712,7 @@ bash scripts/turboquant_operators/run_smoke.sh
 - 三个 3/4-bit preset；
 - Triton store 和负 `slot_mapping`；
 - AscendC dequant 对 Triton dequant；
+- 四个 head dimension tiling key 和 out-style storage alias；
 - AscendC dequant + FIA 对 packed Triton decode；
 - 一组短延迟 benchmark。
 

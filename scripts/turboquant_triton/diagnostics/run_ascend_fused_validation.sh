@@ -42,9 +42,10 @@ from vllm_ascend.ops.turboquant import has_turboquant_paged_dequant
 
 if not has_turboquant_paged_dequant():
     raise RuntimeError(
-        "npu_turboquant_paged_dequant is missing; source CANN and rerun `pip install -e .`."
+        "TurboQuant paged-dequant return/out schemas are missing; "
+        "source CANN and rerun `pip install -e .`."
     )
-print("Ascend TurboQuant fused operator is registered.")
+print("Ascend TurboQuant fused operator is registered (return+out).")
 PY
 
 printf '\n== Fused correctness ==\n'

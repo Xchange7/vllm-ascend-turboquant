@@ -481,6 +481,7 @@ std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant_meta(
     const at::Tensor& kvCache,
     const at::Tensor& blockTable,
     const at::Tensor& seqLens,
+    const at::Tensor& pageTable,
     const at::Tensor& centroids,
     int64_t maxSeqLen,
     int64_t keyBits,
@@ -489,6 +490,7 @@ std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant_meta(
     bool normCorrection) {
     (void)blockTable;
     (void)seqLens;
+    (void)pageTable;
     (void)centroids;
     (void)keyBits;
     (void)keyPackedSize;
@@ -498,6 +500,34 @@ std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant_meta(
         query.sym_size(0), kvCache.sym_size(2), maxSeqLen, query.sym_size(2)};
     at::Tensor key = at::empty_symint(outputShape, query.options());
     at::Tensor value = at::empty_symint(outputShape, query.options());
+    return std::make_tuple(key, value);
+}
+
+std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant_out_meta(
+    const at::Tensor& query,
+    const at::Tensor& kvCache,
+    const at::Tensor& blockTable,
+    const at::Tensor& seqLens,
+    const at::Tensor& pageTable,
+    const at::Tensor& centroids,
+    int64_t maxSeqLen,
+    int64_t keyBits,
+    int64_t keyPackedSize,
+    int64_t valueBits,
+    bool normCorrection,
+    at::Tensor& key,
+    at::Tensor& value) {
+    (void)query;
+    (void)kvCache;
+    (void)blockTable;
+    (void)seqLens;
+    (void)pageTable;
+    (void)centroids;
+    (void)maxSeqLen;
+    (void)keyBits;
+    (void)keyPackedSize;
+    (void)valueBits;
+    (void)normCorrection;
     return std::make_tuple(key, value);
 }
 
@@ -1633,6 +1663,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_reshape_and_cache_bnsd", &vllm_ascend::meta::npu_reshape_and_cache_bnsd_meta);
     // TurboQuant paged gather, unpack, and dequantization
     ops.impl("npu_turboquant_paged_dequant", &vllm_ascend::meta::npu_turboquant_paged_dequant_meta);
+    ops.impl("npu_turboquant_paged_dequant_out", &vllm_ascend::meta::npu_turboquant_paged_dequant_out_meta);
     // npu_sign_bits_pack
     ops.impl("npu_sign_bits_pack", &vllm_ascend::meta::npu_sign_bits_pack_meta);
     // CopyAndExpandEagleInputs
