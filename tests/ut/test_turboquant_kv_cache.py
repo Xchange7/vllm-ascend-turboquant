@@ -92,6 +92,23 @@ def test_turboquant_ascend_fused_rejects_unsupported_head_dim(head_dim):
         _validate_ascend_fused_head_dim(head_dim)
 
 
+def test_turboquant_operator_probe_loads_custom_extension(monkeypatch):
+    from vllm_ascend import utils
+    from vllm_ascend.ops.turboquant import has_turboquant_paged_dequant
+
+    load_attempts = 0
+
+    def disable_custom_ops():
+        nonlocal load_attempts
+        load_attempts += 1
+        return False
+
+    monkeypatch.setattr(utils, "enable_custom_op", disable_custom_ops)
+
+    assert not has_turboquant_paged_dequant()
+    assert load_attempts == 1
+
+
 def test_turboquant_dtype_detection_does_not_match_normal_cache():
     assert is_turboquant_kv_cache_dtype("turboquant_4bit_nc")
     assert not is_turboquant_kv_cache_dtype("auto")

@@ -20,6 +20,10 @@ import torch
 
 def has_turboquant_paged_dequant() -> bool:
     """Return whether the installed extension contains the AscendC kernel."""
+    from vllm_ascend.utils import enable_custom_op
+
+    if not enable_custom_op():
+        return False
     return hasattr(torch.ops._C_ascend, "npu_turboquant_paged_dequant")
 
 
