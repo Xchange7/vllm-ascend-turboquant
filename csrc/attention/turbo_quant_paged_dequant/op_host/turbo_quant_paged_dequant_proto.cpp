@@ -31,6 +31,7 @@ static ge::graphStatus InferShapeTurboQuantPagedDequant(gert::InferShapeContext*
   OPS_LOG_E_IF_NULL(context, attrs, return ge::GRAPH_FAILED);
   const int64_t* maxSeqLen = attrs->GetAttrPointer<int64_t>(MAX_SEQ_LEN_ATTR_INDEX);
   OPS_LOG_E_IF_NULL(context, maxSeqLen, return ge::GRAPH_FAILED);
+  OPS_ERR_IF(*maxSeqLen <= 0, OPS_LOG_E(context, "maxSeqLen must be positive"), return ge::GRAPH_FAILED);
 
   OPS_ERR_IF(queryShape->GetDimNum() != 3, OPS_LOG_E(context, "query must have shape [B, N, D]"),
              return ge::GRAPH_FAILED);

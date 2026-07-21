@@ -67,6 +67,12 @@ namespace vllm_ascend {
 
 namespace {
 
+constexpr int64_t TURBOQUANT_MIN_HEAD_DIM = 32;
+constexpr int64_t TURBOQUANT_MAX_HEAD_DIM = 256;
+constexpr int64_t TURBOQUANT_KEY_METADATA_BYTES = 2;
+constexpr int64_t TURBOQUANT_VALUE_METADATA_BYTES = 4;
+constexpr int64_t TURBOQUANT_SLOT_ALIGNMENT_BYTES = 2;
+
 struct DevicePrintPayload {
     std::string message;
     at::Tensor host_tensor_snapshot;
@@ -828,11 +834,32 @@ std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant(
                 "TurboQuant query dimensions must be positive.");
     TORCH_CHECK(kvCache.size(0) > 0 && kvCache.size(1) > 0 && kvCache.size(2) > 0 && kvCache.size(3) > 0,
                 "TurboQuant KV cache dimensions must be positive.");
+    const auto queryDevice = query.device();
+    TORCH_CHECK(kvCache.device() == queryDevice && blockTable.device() == queryDevice &&
+                    seqLens.device() == queryDevice && centroids.device() == queryDevice,
+                "TurboQuant inputs must be on the same device.");
     TORCH_CHECK(maxSeqLen > 0 && maxSeqLen <= blockTable.size(1) * kvCache.size(1),
                 "TurboQuant maxSeqLen must be positive and fit in the block table.");
     TORCH_CHECK(keyBits == 3 || keyBits == 4, "TurboQuant keyBits must be 3 or 4.");
     TORCH_CHECK(valueBits == 3 || valueBits == 4, "TurboQuant valueBits must be 3 or 4.");
-    TORCH_CHECK(keyPackedSize > 0, "TurboQuant keyPackedSize must be positive.");
+
+    const int64_t headDim = query.size(2);
+    TORCH_CHECK(headDim >= TURBOQUANT_MIN_HEAD_DIM && headDim <= TURBOQUANT_MAX_HEAD_DIM &&
+                    (headDim & (headDim - 1)) == 0,
+                "TurboQuant head dimension must be a power of two in [32, 256].");
+    const int64_t keyDataBytes = (headDim * keyBits + 7) / 8;
+    const int64_t valueDataBytes = (headDim * valueBits + 7) / 8;
+    const int64_t expectedKeyPackedSize = keyDataBytes + TURBOQUANT_KEY_METADATA_BYTES;
+    const int64_t payloadSize = expectedKeyPackedSize + valueDataBytes + TURBOQUANT_VALUE_METADATA_BYTES;
+    const int64_t expectedSlotSize =
+        (payloadSize + TURBOQUANT_SLOT_ALIGNMENT_BYTES - 1) / TURBOQUANT_SLOT_ALIGNMENT_BYTES *
+        TURBOQUANT_SLOT_ALIGNMENT_BYTES;
+    TORCH_CHECK(keyPackedSize == expectedKeyPackedSize,
+                "TurboQuant keyPackedSize does not match the requested head dimension and key bit width.");
+    TORCH_CHECK(kvCache.size(3) == expectedSlotSize,
+                "TurboQuant KV cache slot size does not match the requested packed layout.");
+    TORCH_CHECK(centroids.size(0) >= (int64_t{1} << keyBits),
+                "TurboQuant centroid table is smaller than the key codebook.");
 
     const std::vector<int64_t> outputShape = {
         query.size(0), kvCache.size(2), maxSeqLen, query.size(2)};

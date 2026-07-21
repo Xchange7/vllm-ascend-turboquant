@@ -143,14 +143,10 @@ def _query_lens_from_cumulative(
 
 
 def _validate_ascend_fused_head_dim(head_dim: int) -> None:
-    if (
-        head_dim < _ASCEND_FUSED_MIN_HEAD_DIM
-        or head_dim > _ASCEND_FUSED_MAX_HEAD_DIM
-        or head_dim % _ASCEND_FUSED_MIN_HEAD_DIM != 0
-    ):
+    if head_dim < _ASCEND_FUSED_MIN_HEAD_DIM or head_dim > _ASCEND_FUSED_MAX_HEAD_DIM or head_dim & (head_dim - 1):
         raise NotImplementedError(
             "Ascend TurboQuant fused decode requires head_dim to be a "
-            f"multiple of 32 in [32, 256], got {head_dim}. Use the default "
+            f"power of two in [32, 256], got {head_dim}. Use the default "
             "auto decode implementation for other supported head dimensions."
         )
 

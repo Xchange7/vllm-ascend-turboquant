@@ -82,13 +82,13 @@ def test_turboquant_ascend_fused_accepts_supported_head_dim(head_dim):
     _validate_ascend_fused_head_dim(head_dim)
 
 
-@pytest.mark.parametrize("head_dim", [16, 48, 512])
+@pytest.mark.parametrize("head_dim", [16, 48, 96, 160, 192, 224, 512])
 def test_turboquant_ascend_fused_rejects_unsupported_head_dim(head_dim):
     from vllm_ascend.attention.turboquant import (
         _validate_ascend_fused_head_dim,
     )
 
-    with pytest.raises(NotImplementedError, match="multiple of 32 in"):
+    with pytest.raises(NotImplementedError, match="power of two in"):
         _validate_ascend_fused_head_dim(head_dim)
 
 

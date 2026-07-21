@@ -80,8 +80,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
                 slotSize <= 0 || maxPages <= 0 || blockTableShape.GetDim(0) != batchSize ||
                 seqLensShape.GetDim(0) != batchSize,
             OPS_LOG_E(nodeName, "TurboQuant input dimensions are invalid or inconsistent"), return ge::GRAPH_FAILED);
-  OPS_CHECK(headDim < MIN_HEAD_DIM || headDim > MAX_HEAD_DIM || headDim % MIN_HEAD_DIM != 0,
-            OPS_LOG_E(nodeName, "headDim must be a multiple of 32 in [32, 256]"), return ge::GRAPH_FAILED);
+  OPS_CHECK(headDim < MIN_HEAD_DIM || headDim > MAX_HEAD_DIM || (headDim & (headDim - 1)) != 0,
+            OPS_LOG_E(nodeName, "headDim must be a power of two in [32, 256]"), return ge::GRAPH_FAILED);
   OPS_CHECK((*keyBits != 3 && *keyBits != 4) || (*valueBits != 3 && *valueBits != 4),
             OPS_LOG_E(nodeName, "only 3-bit and 4-bit TurboQuant layouts are supported"), return ge::GRAPH_FAILED);
   OPS_CHECK(*maxSeqLen <= 0, OPS_LOG_E(nodeName, "maxSeqLen must be positive"), return ge::GRAPH_FAILED);
