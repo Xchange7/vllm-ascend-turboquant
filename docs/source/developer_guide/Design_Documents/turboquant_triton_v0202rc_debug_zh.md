@@ -445,6 +445,26 @@ check_environment.py 是否通过？
 
 ## 15. 当前建议的修复顺序
 
+### 已确认根因：Ascend ForwardContext 丢失 slot mapping
+
+端到端实验出现“首 token 基本正常，从第二个 token 开始乱码”的直接原因已经确认。TurboQuant
+backend 设置了 `forward_includes_kv_cache_update = False`，因此 vLLM 会在 attention forward 前
+调用 `unified_kv_cache_update()` 写入压缩 cache。该 custom op 不读取 `AscendMetadata.slot_mapping`，
+而是读取 upstream `ForwardContext.slot_mapping`。
+
+此前 `set_ascend_forward_context()` 没有把 Ascend runner 已经按 cache group 构建好的 per-layer
+mapping 传给 upstream `set_forward_context()`。结果是 `unified_kv_cache_update()` 得到 `None` 后
+静默跳过 store：首次 prefill 仍使用原始 K/V，所以首 token 正常；后续 decode 开始读取没有写入
+有效数据的 TurboQuant cache，因此输出迅速失真。独立 store/decode 算子测试无法发现该问题，
+因为这些测试会直接调用 store kernel。
+
+当前修复在 Ascend forward-context 边界提取每层 metadata 中的 `slot_mapping`，并原样传给 vLLM。
+不同 KV cache group 的 mapping 不会合并或复用。`check_environment.py` 同时检查当前 vLLM core 的
+`set_forward_context()` 是否支持 `slot_mapping` 参数，避免 core 版本不匹配时再次静默失败。
+
+修复后必须重新运行 eager 端到端对照。这个修复证明了 cache 未写入问题，但 NPU 实测通过前，
+不能据此宣称量化精度已经达标。
+
 1. 先在 `turboquant-triton-v0.20.2rc` 完成 native、all-skip、1/2/4/16-token 四组实验；
 2. 给 accuracy collector 增加 chat token logprobs、原始答案和首个分歧 token输出；
 3. 增加独立 CPU packer 和 raw FP32 attention oracle；

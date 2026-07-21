@@ -25,6 +25,7 @@ import torch_npu  # noqa: F401
 import triton  # type: ignore[import-untyped]
 import vllm
 from packaging.version import Version
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.quantization.turboquant.config import (
     TurboQuantConfig,
@@ -88,6 +89,14 @@ def main() -> None:
             f"workspaces: {', '.join(missing_workspaces)}."
         )
 
+    forward_context_parameters = inspect.signature(set_forward_context).parameters
+    if "slot_mapping" not in forward_context_parameters:
+        raise RuntimeError(
+            "The loaded vLLM forward context does not accept per-layer slot "
+            "mappings. TurboQuant cache updates would be skipped; install the "
+            "matching vLLM 0.20.2 core checkout."
+        )
+
     print(f"vLLM:          {vllm.__version__}")
     print(f"vLLM source:   {vllm.__file__}")
     print(f"vLLM commit:   {_source_commit(vllm.__file__)}")
@@ -102,6 +111,7 @@ def main() -> None:
     print(f"Backend:       {AscendTurboQuantAttentionBackend.get_name()}")
     print(f"TQ slot bytes: {config.slot_size_aligned}")
     print(f"TQ page bytes: {spec.page_size_bytes}")
+    print("TQ slot mapping: compatible")
     print("TQ core API:    compatible")
 
 

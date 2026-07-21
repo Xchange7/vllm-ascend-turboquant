@@ -33,6 +33,28 @@ class MoECommType(Enum):
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 
 
+def _get_attention_slot_mapping(
+    attn_metadata: Any,
+) -> dict[str, torch.Tensor]:
+    """Collect the per-layer cache addresses used by split cache updates.
+
+    Backends whose attention forward does not write KV cache use vLLM's
+    ``unified_kv_cache_update`` custom op. That op reads its slot mapping from
+    ``ForwardContext``, not from the layer's attention metadata. Ascend V1
+    already builds the correct mapping for every KV cache group, so preserve
+    those per-layer tensors when entering the upstream forward context.
+    """
+    if not isinstance(attn_metadata, dict):
+        return {}
+
+    slot_mapping: dict[str, torch.Tensor] = {}
+    for layer_name, layer_metadata in attn_metadata.items():
+        layer_slot_mapping = getattr(layer_metadata, "slot_mapping", None)
+        if layer_slot_mapping is not None:
+            slot_mapping[layer_name] = layer_slot_mapping
+    return slot_mapping
+
+
 @contextmanager
 def override_mrv2_in_profile_run(enabled: bool):
     """Override MRv2's extra profile-run marker for one forward path.
@@ -70,6 +92,7 @@ def set_ascend_forward_context(
     draft_attn_metadatas=None,
     has_sinks=False,
     input_ids=None,
+    slot_mapping: dict[str, torch.Tensor] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -83,6 +106,7 @@ def set_ascend_forward_context(
         "cudagraph_runtime_mode": aclgraph_runtime_mode,
         "batch_descriptor": batch_descriptor,
         "skip_compiled": skip_compiled,
+        "slot_mapping": (slot_mapping if slot_mapping is not None else _get_attention_slot_mapping(attn_metadata)),
     }
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
