@@ -104,6 +104,16 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark native BF16/FP16 paged attention beside TurboQuant decode.",
     )
     parser.add_argument(
+        "--native-backend",
+        choices=("fia", "paged_attention"),
+        default="fia",
+        help=(
+            "Native baseline backend. 'fia' matches the default vLLM-Ascend "
+            "decode path; 'paged_attention' directly exercises the optional "
+            "ATB PagedAttentionOperation path."
+        ),
+    )
+    parser.add_argument(
         "--cache-dtype",
         choices=(
             "turboquant_4bit_nc",
@@ -224,7 +234,7 @@ def build_store_case(args: argparse.Namespace, constants) -> BenchmarkCase:
         dtype=activation_dtype(args),
         device=device,
     )
-    value = torch.randn_like(key)
+    value = torch.randn(key.shape, dtype=key.dtype, device=key.device)
     num_blocks = math.ceil(args.store_tokens / args.block_size)
     cache = torch.empty(
         num_blocks,
@@ -300,7 +310,7 @@ def build_paged_cache(args: argparse.Namespace, constants):
         dtype=activation_dtype(args),
         device=device,
     )
-    value = torch.randn_like(key)
+    value = torch.randn(key.shape, dtype=key.dtype, device=key.device)
     active_rotation = None if args.decode_implementation == "reference" else compute_rotation
     triton_turboquant_store(
         key,
@@ -372,7 +382,11 @@ def build_decode_case(
             dtype=activation_dtype(args),
             device=device,
         )
-        current_value = torch.randn_like(current_key)
+        current_value = torch.randn(
+            current_key.shape,
+            dtype=current_key.dtype,
+            device=current_key.device,
+        )
         current_slots = slot_mapping.view(args.batch_size, args.sequence_length)[:, -1].contiguous()
 
     def run() -> torch.Tensor:
@@ -451,7 +465,11 @@ def build_native_decode_case(args: argparse.Namespace) -> BenchmarkCase:
         dtype=activation_dtype(args),
         device=device,
     )
-    value_cache = torch.randn_like(key_cache)
+    value_cache = torch.randn(
+        key_cache.shape,
+        dtype=key_cache.dtype,
+        device=key_cache.device,
+    )
     query = torch.randn(
         args.batch_size,
         args.num_query_heads,
@@ -466,20 +484,61 @@ def build_native_decode_case(args: argparse.Namespace) -> BenchmarkCase:
         device=device,
     )
     output = torch.empty_like(query)
+    softmax_lse = None
+    workspace = None
 
-    def run() -> torch.Tensor:
-        torch_npu._npu_paged_attention(
+    if args.native_backend == "paged_attention":
+
+        def run() -> torch.Tensor:
+            torch_npu._npu_paged_attention(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                num_kv_heads=args.num_kv_heads,
+                num_heads=args.num_query_heads,
+                scale_value=1 / math.sqrt(args.head_dim),
+                block_table=block_table,
+                context_lens=seq_lens,
+                out=output,
+            )
+            return output
+
+    else:
+        # vLLM-Ascend uses paged FIA for decode unless the runtime shape is
+        # explicitly allowlisted for the optional ATB paged-attention path.
+        key_fia = key_cache.view(total_blocks, args.block_size, -1)
+        value_fia = value_cache.view(total_blocks, args.block_size, -1)
+        actual_seq_lengths = list(range(1, args.batch_size + 1))
+        actual_seq_lengths_kv = [args.sequence_length] * args.batch_size
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=device)
+        fia_kwargs = dict(
             query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            num_kv_heads=args.num_kv_heads,
-            num_heads=args.num_query_heads,
-            scale_value=1 / math.sqrt(args.head_dim),
+            key=key_fia,
+            value=value_fia,
+            atten_mask=None,
             block_table=block_table,
-            context_lens=seq_lens,
-            out=output,
+            input_layout="TND",
+            block_size=args.block_size,
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            num_key_value_heads=args.num_kv_heads,
+            num_heads=args.num_query_heads,
+            scale=1 / math.sqrt(args.head_dim),
+            sparse_mode=0,
         )
-        return output
+        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            **fia_kwargs,
+        )
+
+        def run() -> torch.Tensor:
+            torch_npu.npu_fused_infer_attention_score.out(
+                **fia_kwargs,
+                workspace=workspace,
+                out=[output, softmax_lse],
+            )
+            return output
+
+    print(f"Native baseline backend: {args.native_backend}", flush=True)
 
     return BenchmarkCase(
         name="native_decode",
@@ -493,6 +552,8 @@ def build_native_decode_case(args: argparse.Namespace) -> BenchmarkCase:
             block_table,
             seq_lens,
             output,
+            softmax_lse,
+            workspace,
         ),
     )
 
@@ -819,7 +880,13 @@ def main() -> None:
 
     results = []
     for case in cases:
-        result = benchmark(case, args)
+        print(f"Running benchmark case: {case.name}", flush=True)
+        try:
+            result = benchmark(case, args)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Benchmark case '{case.name}' failed. Set ASCEND_LAUNCH_BLOCKING=1 for synchronous NPU diagnostics."
+            ) from exc
         print_result(result)
         collect_trace(case, args, trace_dir)
         results.append(asdict(result))
