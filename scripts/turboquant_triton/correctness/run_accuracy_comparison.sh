@@ -27,9 +27,16 @@ PROMPTS="${PROMPTS:-${SCRIPT_DIR}/accuracy_prompts.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/logs/turboquant/accuracy_${TIMESTAMP}}"
 SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-600}"
+LOGPROBS="${LOGPROBS:-20}"
+PROMPT_LOGPROBS="${PROMPT_LOGPROBS:-0}"
 MIN_EXACT_MATCH_RATE="${MIN_EXACT_MATCH_RATE:-0.0}"
 MIN_TOKEN_PREFIX_RATE="${MIN_TOKEN_PREFIX_RATE:-0.0}"
 MAX_MEAN_LOGPROB_DIFF="${MAX_MEAN_LOGPROB_DIFF:-}"
+MAX_PROMPT_MEAN_ABS_LOGPROB_DIFF="${MAX_PROMPT_MEAN_ABS_LOGPROB_DIFF:-}"
+MAX_PROMPT_P95_ABS_LOGPROB_DIFF="${MAX_PROMPT_P95_ABS_LOGPROB_DIFF:-}"
+MAX_PROMPT_ABS_MEAN_NLL_DELTA="${MAX_PROMPT_ABS_MEAN_NLL_DELTA:-}"
+MIN_FIRST_TOKEN_TOP1_MATCH_RATE="${MIN_FIRST_TOKEN_TOP1_MATCH_RATE:-}"
+MIN_FIRST_TOKEN_TOPK_OVERLAP="${MIN_FIRST_TOKEN_TOPK_OVERLAP:-}"
 MIN_TURBOQUANT_ACCURACY="${MIN_TURBOQUANT_ACCURACY:-}"
 MAX_QUALITY_REGRESSIONS="${MAX_QUALITY_REGRESSIONS:-}"
 WARM_PREFIX="${WARM_PREFIX:-1}"
@@ -164,6 +171,8 @@ collect_results() {
         --timeout "${REQUEST_TIMEOUT}"
         --max-model-len "${MAX_MODEL_LEN}"
         --request-mode "${REQUEST_MODE}"
+        --logprobs "${LOGPROBS}"
+        --prompt-logprobs "${PROMPT_LOGPROBS}"
     )
     if [[ "${WARM_PREFIX}" == "1" ]]; then
         collect_args+=(--warm-prefix)
@@ -207,6 +216,21 @@ COMPARE_ARGS=(
 )
 if [[ -n "${MAX_MEAN_LOGPROB_DIFF}" ]]; then
     COMPARE_ARGS+=(--max-mean-logprob-diff "${MAX_MEAN_LOGPROB_DIFF}")
+fi
+if [[ -n "${MAX_PROMPT_MEAN_ABS_LOGPROB_DIFF}" ]]; then
+    COMPARE_ARGS+=(--max-prompt-mean-abs-logprob-diff "${MAX_PROMPT_MEAN_ABS_LOGPROB_DIFF}")
+fi
+if [[ -n "${MAX_PROMPT_P95_ABS_LOGPROB_DIFF}" ]]; then
+    COMPARE_ARGS+=(--max-prompt-p95-abs-logprob-diff "${MAX_PROMPT_P95_ABS_LOGPROB_DIFF}")
+fi
+if [[ -n "${MAX_PROMPT_ABS_MEAN_NLL_DELTA}" ]]; then
+    COMPARE_ARGS+=(--max-prompt-abs-mean-nll-delta "${MAX_PROMPT_ABS_MEAN_NLL_DELTA}")
+fi
+if [[ -n "${MIN_FIRST_TOKEN_TOP1_MATCH_RATE}" ]]; then
+    COMPARE_ARGS+=(--min-first-token-top1-match-rate "${MIN_FIRST_TOKEN_TOP1_MATCH_RATE}")
+fi
+if [[ -n "${MIN_FIRST_TOKEN_TOPK_OVERLAP}" ]]; then
+    COMPARE_ARGS+=(--min-first-token-topk-overlap "${MIN_FIRST_TOKEN_TOPK_OVERLAP}")
 fi
 if [[ -n "${MIN_TURBOQUANT_ACCURACY}" ]]; then
     COMPARE_ARGS+=(--min-turboquant-accuracy "${MIN_TURBOQUANT_ACCURACY}")

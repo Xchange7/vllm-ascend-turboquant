@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     collect.add_argument("--label", required=True)
     collect.add_argument("--seed", type=int, default=0)
     collect.add_argument("--logprobs", type=int, default=5)
+    collect.add_argument(
+        "--prompt-logprobs",
+        type=int,
+        default=0,
+        help=("Request per-position prompt logprobs for teacher-forcing tests. Zero disables prompt logprobs."),
+    )
     collect.add_argument("--timeout", type=float, default=600.0)
     collect.add_argument(
         "--request-mode",
@@ -77,6 +83,31 @@ def parse_args() -> argparse.Namespace:
     compare.add_argument("--min-exact-match-rate", type=float, default=0.0)
     compare.add_argument("--min-token-prefix-rate", type=float, default=0.0)
     compare.add_argument("--max-mean-logprob-diff", type=float, default=None)
+    compare.add_argument(
+        "--max-prompt-mean-abs-logprob-diff",
+        type=float,
+        default=None,
+    )
+    compare.add_argument(
+        "--max-prompt-p95-abs-logprob-diff",
+        type=float,
+        default=None,
+    )
+    compare.add_argument(
+        "--max-prompt-abs-mean-nll-delta",
+        type=float,
+        default=None,
+    )
+    compare.add_argument(
+        "--min-first-token-top1-match-rate",
+        type=float,
+        default=None,
+    )
+    compare.add_argument(
+        "--min-first-token-topk-overlap",
+        type=float,
+        default=None,
+    )
     compare.add_argument("--min-turboquant-accuracy", type=float, default=None)
     compare.add_argument("--max-quality-regressions", type=int, default=None)
     return parser.parse_args()
@@ -118,6 +149,9 @@ def load_prompts(path: Path) -> list[dict[str, Any]]:
         evaluation = item.get("evaluation")
         if evaluation is not None and not isinstance(evaluation, dict):
             raise ValueError(f"{path}:{line_number}: evaluation must be an object")
+        score_last_tokens = item.get("score_last_tokens")
+        if score_last_tokens is not None and (not isinstance(score_last_tokens, int) or score_last_tokens <= 0):
+            raise ValueError(f"{path}:{line_number}: score_last_tokens must be positive")
         prompts.append(
             {
                 "id": case_id,
@@ -126,6 +160,7 @@ def load_prompts(path: Path) -> list[dict[str, Any]]:
                 "prompt": prompt * repeat + suffix,
                 "max_tokens": max_tokens,
                 "evaluation": evaluation,
+                "score_last_tokens": score_last_tokens,
             }
         )
         seen_ids.add(case_id)
@@ -315,6 +350,10 @@ def answer_text_report(label: str, cases: list[dict[str, Any]]) -> str:
 
 
 def collect(args: argparse.Namespace) -> int:
+    if args.logprobs < 0:
+        raise ValueError("--logprobs must be non-negative")
+    if args.prompt_logprobs < 0:
+        raise ValueError("--prompt-logprobs must be non-negative")
     cases = []
     failures = 0
     endpoint_path = "chat/completions" if args.request_mode == "chat" else "completions"
@@ -337,7 +376,11 @@ def collect(args: argparse.Namespace) -> int:
             "max_tokens": prompt["max_tokens"],
             "temperature": 0,
             "seed": args.seed,
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
         }
+        if args.prompt_logprobs:
+            payload["prompt_logprobs"] = args.prompt_logprobs
         if args.request_mode == "chat":
             payload.update(
                 {
@@ -349,6 +392,8 @@ def collect(args: argparse.Namespace) -> int:
                         {"role": "user", "content": prompt["prompt"]},
                     ],
                     "chat_template_kwargs": {"enable_thinking": False},
+                    "logprobs": args.logprobs > 0,
+                    "top_logprobs": args.logprobs if args.logprobs else 0,
                 }
             )
         else:
@@ -387,6 +432,7 @@ def collect(args: argparse.Namespace) -> int:
                 "elapsed_seconds": elapsed_seconds,
                 "prompt_tokens": prompt.get("prompt_tokens"),
                 "total_token_budget": prompt.get("total_token_budget"),
+                "score_last_tokens": prompt.get("score_last_tokens"),
             }
         )
         if error is not None:
@@ -443,6 +489,200 @@ def finite_number(value: Any) -> float | None:
     return None
 
 
+def percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError(f"quantile must be in [0, 1], got {quantile}")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def generated_token_trace(choice: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize completion and chat logprobs into one token trace."""
+    logprobs = choice.get("logprobs") or {}
+    completion_tokens = logprobs.get("tokens")
+    if isinstance(completion_tokens, list):
+        token_logprobs = logprobs.get("token_logprobs") or []
+        top_logprobs = logprobs.get("top_logprobs") or []
+        return [
+            {
+                "token": token,
+                "logprob": finite_number(token_logprobs[index] if index < len(token_logprobs) else None),
+                "top_logprobs": (
+                    top_logprobs[index] if index < len(top_logprobs) and isinstance(top_logprobs[index], dict) else {}
+                ),
+            }
+            for index, token in enumerate(completion_tokens)
+        ]
+
+    content = logprobs.get("content")
+    if not isinstance(content, list):
+        return []
+    trace = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        top = {}
+        for candidate in item.get("top_logprobs") or []:
+            if not isinstance(candidate, dict):
+                continue
+            token = candidate.get("token")
+            logprob = finite_number(candidate.get("logprob"))
+            if isinstance(token, str) and logprob is not None:
+                top[token] = logprob
+        trace.append(
+            {
+                "token": item.get("token"),
+                "logprob": finite_number(item.get("logprob")),
+                "top_logprobs": top,
+            }
+        )
+    return trace
+
+
+def first_token_distribution(choice: dict[str, Any]) -> dict[str, float]:
+    trace = generated_token_trace(choice)
+    if not trace:
+        return {}
+    return {
+        str(token): float(logprob)
+        for token, logprob in trace[0]["top_logprobs"].items()
+        if finite_number(logprob) is not None
+    }
+
+
+def prompt_token_trace(case: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract scored target-token logprobs from a vLLM response."""
+    response = case.get("response")
+    choice = first_choice(case)
+    if not isinstance(response, dict) or choice is None:
+        return []
+
+    prompt_token_ids = response.get("prompt_token_ids")
+    prompt_logprobs = response.get("prompt_logprobs")
+    if not isinstance(prompt_token_ids, list):
+        prompt_token_ids = choice.get("prompt_token_ids")
+    if not isinstance(prompt_logprobs, list):
+        prompt_logprobs = choice.get("prompt_logprobs")
+    if not isinstance(prompt_token_ids, list) or not isinstance(prompt_logprobs, list):
+        return []
+    if len(prompt_token_ids) != len(prompt_logprobs):
+        return []
+
+    count = len(prompt_token_ids)
+    score_last_tokens = case.get("score_last_tokens")
+    if not isinstance(score_last_tokens, int):
+        score_last_tokens = max(count - 1, 0)
+    start = max(1, count - score_last_tokens)
+    trace = []
+    for position in range(start, count):
+        target_token_id = prompt_token_ids[position]
+        candidates = prompt_logprobs[position]
+        if not isinstance(target_token_id, int) or not isinstance(candidates, dict):
+            continue
+        target = candidates.get(str(target_token_id), candidates.get(target_token_id))
+        if not isinstance(target, dict):
+            continue
+        logprob = finite_number(target.get("logprob"))
+        if logprob is None:
+            continue
+        top1_token_id = None
+        for candidate_token_id, candidate in candidates.items():
+            if isinstance(candidate, dict) and candidate.get("rank") == 1:
+                try:
+                    top1_token_id = int(candidate_token_id)
+                except (TypeError, ValueError):
+                    top1_token_id = None
+                break
+        trace.append(
+            {
+                "position": position,
+                "target_token_id": target_token_id,
+                "logprob": logprob,
+                "rank": target.get("rank"),
+                "top1_token_id": top1_token_id,
+            }
+        )
+    expected_positions = max(count - start, 0)
+    return trace if len(trace) == expected_positions else []
+
+
+def compare_prompt_traces(
+    native: dict[str, Any],
+    turboquant: dict[str, Any],
+) -> dict[str, Any]:
+    native_trace = prompt_token_trace(native)
+    tq_trace = prompt_token_trace(turboquant)
+    if not native_trace and not tq_trace:
+        return {"available": False}
+    if len(native_trace) != len(tq_trace):
+        return {
+            "available": True,
+            "valid": False,
+            "reason": "different scored prompt lengths",
+            "native_positions": len(native_trace),
+            "turboquant_positions": len(tq_trace),
+        }
+
+    abs_diffs = []
+    native_logprobs = []
+    tq_logprobs = []
+    top1_matches = 0
+    rank_diffs = []
+    for native_item, tq_item in zip(native_trace, tq_trace):
+        if native_item["target_token_id"] != tq_item["target_token_id"]:
+            return {
+                "available": True,
+                "valid": False,
+                "reason": "different prompt token IDs",
+                "position": native_item["position"],
+            }
+        native_lp = native_item["logprob"]
+        tq_lp = tq_item["logprob"]
+        native_logprobs.append(native_lp)
+        tq_logprobs.append(tq_lp)
+        abs_diffs.append(abs(native_lp - tq_lp))
+        top1_matches += (
+            native_item["top1_token_id"] is not None and native_item["top1_token_id"] == tq_item["top1_token_id"]
+        )
+        native_rank = native_item.get("rank")
+        tq_rank = tq_item.get("rank")
+        if isinstance(native_rank, int) and isinstance(tq_rank, int):
+            rank_diffs.append(abs(native_rank - tq_rank))
+
+    if not abs_diffs:
+        return {
+            "available": True,
+            "valid": False,
+            "reason": "no finite target-token logprobs",
+        }
+    native_nll = -statistics.fmean(native_logprobs)
+    tq_nll = -statistics.fmean(tq_logprobs)
+    nll_delta = tq_nll - native_nll
+    return {
+        "available": True,
+        "valid": True,
+        "positions": len(abs_diffs),
+        "native_mean_nll": native_nll,
+        "turboquant_mean_nll": tq_nll,
+        "mean_nll_delta": nll_delta,
+        "perplexity_ratio": math.exp(max(min(nll_delta, 50.0), -50.0)),
+        "mean_abs_logprob_diff": statistics.fmean(abs_diffs),
+        "p95_abs_logprob_diff": percentile(abs_diffs, 0.95),
+        "max_abs_logprob_diff": max(abs_diffs),
+        "top1_match_rate": top1_matches / len(abs_diffs),
+        "mean_target_rank_diff": (statistics.fmean(rank_diffs) if rank_diffs else None),
+        "abs_logprob_diffs": abs_diffs,
+    }
+
+
 def compare_case(native: dict[str, Any], turboquant: dict[str, Any]) -> dict[str, Any]:
     native_choice = first_choice(native)
     tq_choice = first_choice(turboquant)
@@ -461,23 +701,44 @@ def compare_case(native: dict[str, Any], turboquant: dict[str, Any]) -> dict[str
             "turboquant_error": turboquant.get("error"),
         }
 
-    native_logprobs = native_choice.get("logprobs") or {}
-    tq_logprobs = tq_choice.get("logprobs") or {}
-    native_tokens = native_logprobs.get("tokens") or []
-    tq_tokens = tq_logprobs.get("tokens") or []
+    native_trace = generated_token_trace(native_choice)
+    tq_trace = generated_token_trace(tq_choice)
+    native_tokens = [item["token"] for item in native_trace]
+    tq_tokens = [item["token"] for item in tq_trace]
     prefix_tokens = sequence_prefix_length(native_tokens, tq_tokens)
     denominator = max(len(native_tokens), len(tq_tokens), 1)
 
-    native_token_lps = native_logprobs.get("token_logprobs") or []
-    tq_token_lps = tq_logprobs.get("token_logprobs") or []
     logprob_diffs = []
     for index in range(prefix_tokens):
-        if index >= len(native_token_lps) or index >= len(tq_token_lps):
-            break
-        native_lp = finite_number(native_token_lps[index])
-        tq_lp = finite_number(tq_token_lps[index])
+        native_lp = finite_number(native_trace[index]["logprob"])
+        tq_lp = finite_number(tq_trace[index]["logprob"])
         if native_lp is not None and tq_lp is not None:
             logprob_diffs.append(abs(native_lp - tq_lp))
+
+    native_first_token = first_token_distribution(native_choice)
+    tq_first_token = first_token_distribution(tq_choice)
+    first_token_comparison: dict[str, Any] = {"available": False}
+    if native_first_token and tq_first_token:
+        native_top1 = max(native_first_token, key=native_first_token.get)
+        tq_top1 = max(tq_first_token, key=tq_first_token.get)
+        native_tokens_set = set(native_first_token)
+        tq_tokens_set = set(tq_first_token)
+        union = native_tokens_set | tq_tokens_set
+        common = native_tokens_set & tq_tokens_set
+        common_diffs = [abs(native_first_token[token] - tq_first_token[token]) for token in common]
+        first_token_comparison = {
+            "available": True,
+            "native_top1": native_top1,
+            "turboquant_top1": tq_top1,
+            "top1_match": native_top1 == tq_top1,
+            "topk_overlap": len(common) / max(len(union), 1),
+            "common_tokens": len(common),
+            "union_tokens": len(union),
+            "mean_common_abs_logprob_diff": (statistics.fmean(common_diffs) if common_diffs else None),
+            "max_common_abs_logprob_diff": (max(common_diffs) if common_diffs else None),
+        }
+
+    prompt_comparison = compare_prompt_traces(native, turboquant)
 
     return {
         "id": native["id"],
@@ -497,6 +758,8 @@ def compare_case(native: dict[str, Any], turboquant: dict[str, Any]) -> dict[str
         "token_prefix_rate": prefix_tokens / denominator,
         "mean_common_token_logprob_diff": (statistics.fmean(logprob_diffs) if logprob_diffs else None),
         "max_common_token_logprob_diff": max(logprob_diffs) if logprob_diffs else None,
+        "first_token": first_token_comparison,
+        "prompt_logprobs": prompt_comparison,
         "native_elapsed_seconds": native.get("elapsed_seconds"),
         "turboquant_elapsed_seconds": turboquant.get("elapsed_seconds"),
     }
@@ -518,6 +781,26 @@ def markdown_summary(report: dict[str, Any]) -> str:
                 f"- TurboQuant accuracy: {summary['turboquant_accuracy']:.4f}",
                 f"- Quality regressions: {summary['quality_regressions']}",
                 f"- Both wrong: {summary['both_wrong']}",
+            ]
+        )
+    if summary["prompt_logprob_cases"]:
+        lines.extend(
+            [
+                f"- Teacher-forced positions: {summary['prompt_logprob_positions']}",
+                f"- Teacher-forced mean absolute logprob difference: {summary['prompt_mean_abs_logprob_diff']:.6f}",
+                f"- Teacher-forced p95 absolute logprob difference: {summary['prompt_p95_abs_logprob_diff']:.6f}",
+                f"- Native mean NLL: {summary['native_prompt_mean_nll']:.6f}",
+                f"- TurboQuant mean NLL: {summary['turboquant_prompt_mean_nll']:.6f}",
+                f"- Mean NLL delta: {summary['prompt_mean_nll_delta']:+.6f}",
+                f"- Perplexity ratio: {summary['prompt_perplexity_ratio']:.6f}",
+                f"- Teacher-forced top-1 match rate: {summary['prompt_top1_match_rate']:.4f}",
+            ]
+        )
+    if summary["first_token_distribution_cases"]:
+        lines.extend(
+            [
+                f"- First-token top-1 match rate: {summary['first_token_top1_match_rate']:.4f}",
+                f"- Mean first-token top-k overlap: {summary['first_token_topk_overlap']:.4f}",
             ]
         )
     lines.extend(
@@ -562,6 +845,28 @@ def markdown_summary(report: dict[str, Any]) -> str:
                 f"{metrics['turboquant_accuracy']:.4f} | "
                 f"{metrics['quality_regressions']} |"
             )
+    if summary["prompt_logprob_cases"]:
+        lines.extend(
+            [
+                "",
+                "## Teacher-Forcing Drift",
+                "",
+                "| Case | Positions | Mean abs diff | P95 abs diff | NLL delta | PPL ratio | Top-1 match |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for case in report["cases"]:
+            prompt = case.get("prompt_logprobs") or {}
+            if not prompt.get("valid"):
+                continue
+            lines.append(
+                f"| {case['id']} | {prompt['positions']} | "
+                f"{prompt['mean_abs_logprob_diff']:.6f} | "
+                f"{prompt['p95_abs_logprob_diff']:.6f} | "
+                f"{prompt['mean_nll_delta']:+.6f} | "
+                f"{prompt['perplexity_ratio']:.6f} | "
+                f"{prompt['top1_match_rate']:.4f} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -594,6 +899,25 @@ def compare(args: argparse.Namespace) -> int:
         for case in valid_cases
         if case["max_common_token_logprob_diff"] is not None
     ]
+    prompt_cases = [case["prompt_logprobs"] for case in valid_cases if case.get("prompt_logprobs", {}).get("valid")]
+    prompt_failures = sum(
+        case.get("prompt_logprobs", {}).get("available", False)
+        and not case.get("prompt_logprobs", {}).get("valid", False)
+        for case in valid_cases
+    )
+    prompt_abs_diffs = [difference for prompt in prompt_cases for difference in prompt["abs_logprob_diffs"]]
+    prompt_positions = sum(prompt["positions"] for prompt in prompt_cases)
+    native_prompt_nll_sum = sum(prompt["native_mean_nll"] * prompt["positions"] for prompt in prompt_cases)
+    tq_prompt_nll_sum = sum(prompt["turboquant_mean_nll"] * prompt["positions"] for prompt in prompt_cases)
+    native_prompt_mean_nll = native_prompt_nll_sum / prompt_positions if prompt_positions else None
+    tq_prompt_mean_nll = tq_prompt_nll_sum / prompt_positions if prompt_positions else None
+    prompt_mean_nll_delta = (
+        tq_prompt_mean_nll - native_prompt_mean_nll
+        if tq_prompt_mean_nll is not None and native_prompt_mean_nll is not None
+        else None
+    )
+    prompt_top1_matches = sum(prompt["top1_match_rate"] * prompt["positions"] for prompt in prompt_cases)
+    distribution_cases = [case["first_token"] for case in valid_cases if case.get("first_token", {}).get("available")]
     category_accuracy = {}
     for category in sorted({case["category"] for case in graded_cases}):
         category_cases = [case for case in graded_cases if case["category"] == category]
@@ -626,6 +950,30 @@ def compare(args: argparse.Namespace) -> int:
         "token_prefix_rate": total_prefix / max(total_tokens, 1),
         "mean_logprob_diff": statistics.fmean(logprob_diffs) if logprob_diffs else None,
         "max_logprob_diff": max(max_logprob_diffs) if max_logprob_diffs else None,
+        "prompt_logprob_cases": len(prompt_cases),
+        "prompt_logprob_failures": prompt_failures,
+        "prompt_logprob_positions": prompt_positions,
+        "prompt_mean_abs_logprob_diff": (statistics.fmean(prompt_abs_diffs) if prompt_abs_diffs else None),
+        "prompt_p95_abs_logprob_diff": percentile(prompt_abs_diffs, 0.95),
+        "prompt_max_abs_logprob_diff": (max(prompt_abs_diffs) if prompt_abs_diffs else None),
+        "native_prompt_mean_nll": native_prompt_mean_nll,
+        "turboquant_prompt_mean_nll": tq_prompt_mean_nll,
+        "prompt_mean_nll_delta": prompt_mean_nll_delta,
+        "prompt_perplexity_ratio": (
+            math.exp(max(min(prompt_mean_nll_delta, 50.0), -50.0)) if prompt_mean_nll_delta is not None else None
+        ),
+        "prompt_top1_match_rate": (prompt_top1_matches / prompt_positions if prompt_positions else None),
+        "first_token_distribution_cases": len(distribution_cases),
+        "first_token_top1_match_rate": (
+            sum(distribution["top1_match"] for distribution in distribution_cases) / len(distribution_cases)
+            if distribution_cases
+            else None
+        ),
+        "first_token_topk_overlap": (
+            statistics.fmean(distribution["topk_overlap"] for distribution in distribution_cases)
+            if distribution_cases
+            else None
+        ),
     }
     report = {"summary": summary, "cases": cases}
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -636,6 +984,8 @@ def compare(args: argparse.Namespace) -> int:
     failures = []
     if summary["request_failures"]:
         failures.append(f"{summary['request_failures']} request(s) failed")
+    if summary["prompt_logprob_failures"]:
+        failures.append(f"{summary['prompt_logprob_failures']} prompt logprob comparison(s) failed")
     if summary["exact_text_match_rate"] < args.min_exact_match_rate:
         failures.append("exact text match rate is below threshold")
     if summary["token_prefix_rate"] < args.min_token_prefix_rate:
@@ -646,6 +996,49 @@ def compare(args: argparse.Namespace) -> int:
         and summary["mean_logprob_diff"] > args.max_mean_logprob_diff
     ):
         failures.append("mean logprob difference is above threshold")
+    prompt_thresholds = (
+        (
+            "max_prompt_mean_abs_logprob_diff",
+            "prompt_mean_abs_logprob_diff",
+            "teacher-forced mean absolute logprob difference",
+        ),
+        (
+            "max_prompt_p95_abs_logprob_diff",
+            "prompt_p95_abs_logprob_diff",
+            "teacher-forced p95 absolute logprob difference",
+        ),
+    )
+    for argument, metric, description in prompt_thresholds:
+        threshold = getattr(args, argument, None)
+        value = summary[metric]
+        if threshold is not None and value is None:
+            failures.append(f"{description} is unavailable")
+        elif threshold is not None and value > threshold:
+            failures.append(f"{description} is above threshold")
+    max_abs_nll_delta = getattr(args, "max_prompt_abs_mean_nll_delta", None)
+    if max_abs_nll_delta is not None and summary["prompt_mean_nll_delta"] is None:
+        failures.append("teacher-forced mean NLL delta is unavailable")
+    elif max_abs_nll_delta is not None and abs(summary["prompt_mean_nll_delta"]) > max_abs_nll_delta:
+        failures.append("absolute teacher-forced mean NLL delta is above threshold")
+    distribution_thresholds = (
+        (
+            "min_first_token_top1_match_rate",
+            "first_token_top1_match_rate",
+            "first-token top-1 match rate",
+        ),
+        (
+            "min_first_token_topk_overlap",
+            "first_token_topk_overlap",
+            "first-token top-k overlap",
+        ),
+    )
+    for argument, metric, description in distribution_thresholds:
+        threshold = getattr(args, argument, None)
+        value = summary[metric]
+        if threshold is not None and value is None:
+            failures.append(f"{description} is unavailable")
+        elif threshold is not None and value < threshold:
+            failures.append(f"{description} is below threshold")
     if (
         args.min_turboquant_accuracy is not None
         and summary["graded_cases"]

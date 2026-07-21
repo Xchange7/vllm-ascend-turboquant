@@ -263,6 +263,100 @@ def test_accuracy_marks_native_pass_turboquant_fail_as_regression() -> None:
     assert compared["quality_regression"] is True
 
 
+def test_accuracy_normalizes_chat_logprobs() -> None:
+    accuracy = load_script("accuracy_eval.py")
+    choice = {
+        "message": {"content": "A"},
+        "logprobs": {
+            "content": [
+                {
+                    "token": "token_id:10",
+                    "logprob": -0.1,
+                    "top_logprobs": [
+                        {"token": "token_id:10", "logprob": -0.1},
+                        {"token": "token_id:11", "logprob": -2.0},
+                    ],
+                }
+            ]
+        },
+    }
+
+    trace = accuracy.generated_token_trace(choice)
+
+    assert trace[0]["token"] == "token_id:10"
+    assert trace[0]["logprob"] == pytest.approx(-0.1)
+    assert trace[0]["top_logprobs"]["token_id:11"] == pytest.approx(-2.0)
+
+
+def test_accuracy_compares_teacher_forced_prompt_logprobs() -> None:
+    accuracy = load_script("accuracy_eval.py")
+
+    def case(second_logprob: float, third_logprob: float) -> dict:
+        return {
+            "id": "teacher",
+            "category": "long_context",
+            "evaluation_result": None,
+            "score_last_tokens": 2,
+            "response": {
+                "prompt_token_ids": [10, 20, 30],
+                "prompt_logprobs": [
+                    None,
+                    {
+                        "20": {
+                            "logprob": second_logprob,
+                            "rank": 1,
+                        }
+                    },
+                    {
+                        "30": {
+                            "logprob": third_logprob,
+                            "rank": 2,
+                        },
+                        "31": {"logprob": -0.1, "rank": 1},
+                    },
+                ],
+                "choices": [
+                    {
+                        "text": "x",
+                        "logprobs": {
+                            "tokens": ["token_id:40"],
+                            "token_logprobs": [-0.2],
+                            "top_logprobs": [
+                                {
+                                    "token_id:40": -0.2,
+                                    "token_id:41": -1.5,
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            "error": None,
+        }
+
+    compared = accuracy.compare_case(case(-0.2, -1.2), case(-0.3, -0.9))
+    prompt = compared["prompt_logprobs"]
+
+    assert prompt["valid"] is True
+    assert prompt["positions"] == 2
+    assert prompt["mean_abs_logprob_diff"] == pytest.approx(0.2)
+    assert prompt["mean_nll_delta"] == pytest.approx(-0.1)
+    assert prompt["top1_match_rate"] == pytest.approx(1.0)
+    assert compared["first_token"]["top1_match"] is True
+    assert compared["first_token"]["topk_overlap"] == pytest.approx(1.0)
+
+
+def test_teacher_forcing_cases_cover_long_context() -> None:
+    accuracy = load_script("accuracy_eval.py")
+    cases = accuracy.load_prompts(
+        REPO_ROOT / "scripts" / "turboquant_triton" / "correctness" / "teacher_forcing_cases.jsonl"
+    )
+
+    assert len(cases) >= 8
+    assert sum(case["category"] == "long_context" for case in cases) >= 3
+    assert all(case["score_last_tokens"] for case in cases)
+
+
 def test_quality_case_file_has_valid_ground_truth() -> None:
     accuracy = load_script("accuracy_eval.py")
     cases = accuracy.load_prompts(REPO_ROOT / "scripts" / "turboquant_triton" / "correctness" / "quality_cases.jsonl")

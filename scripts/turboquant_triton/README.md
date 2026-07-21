@@ -184,6 +184,34 @@ instruction following, and structured output. Reports are written under
 observed; set `MAX_QUALITY_REGRESSIONS` only after manually reviewing the raw
 native and TurboQuant answers.
 
+For the full non-circular end-to-end correctness comparison, run five real
+servers sequentially. This combines teacher-forced target-token NLL,
+first-token top-k distributions, deterministic generation, and ground-truth
+grading:
+
+```bash
+MODEL=/run/test_llm/Qwen3-0.6B-hf \
+DEVICE_IDS=0 TP_SIZE=1 \
+bash scripts/turboquant_triton/correctness/run_e2e_correctness.sh
+```
+
+The default modes are `native`, `native_repeat`, `tq_reference`, `tq_auto`,
+and `tq_ascend_fused`. The key comparisons are:
+
+- `native -> native_repeat`: runtime and scheduling noise floor.
+- `native -> tq_reference`: TurboQuant cache format and reference Triton path.
+- `tq_reference -> tq_auto`: grouped GQA and activation-dtype rotation.
+- `tq_reference/tq_auto -> tq_ascend_fused`: AscendC fused-path drift.
+
+Prefix caching and ACLGraph are disabled so the first run isolates KV-cache
+quantization. Long teacher-forcing inputs use 512-token chunked prefill so
+later chunks consume previously compressed cache pages. Raw requests,
+responses, answers, server logs, pairwise reports, and one top-level
+`summary.md` are archived under
+`logs/turboquant/e2e_correctness_<timestamp>.tar.gz`. See
+`docs/source/developer_guide/Design_Documents/turboquant_e2e_correctness_zh.md`
+for metric definitions and threshold guidance.
+
 ## 2. Start Qwen3-32B
 
 The default uses tensor parallel size 2 because BF16 Qwen3-32B weights usually
