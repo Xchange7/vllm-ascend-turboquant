@@ -92,6 +92,11 @@ if ! "${PYTHON_BIN}" -m pip --version >/dev/null 2>&1; then
     printf '%s cannot run pip.\n' "${PYTHON_BIN}" >&2
     exit 1
 fi
+if ! TRITON_ASCEND_VERSION="$("${PYTHON_BIN}" -c \
+    'import importlib.metadata; print(importlib.metadata.version("triton-ascend"))')"; then
+    printf '%s cannot find triton-ascend in the active Python environment.\n' "${PYTHON_BIN}" >&2
+    exit 1
+fi
 
 mkdir -p -- "${LOG_DIR}" "$(dirname -- "${BACKUP_DIR}")"
 
@@ -132,11 +137,13 @@ fi
     printf 'VLLM_ASCEND_BUILD_CUSTOM_OPS=%s\n' "${VLLM_ASCEND_BUILD_CUSTOM_OPS}"
     printf 'VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD=%s\n' "${VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD}"
     printf 'python=%s\n' "$("${PYTHON_BIN}" -c 'import sys; print(sys.executable)')"
+    printf 'triton-ascend=%s\n' "${TRITON_ASCEND_VERSION}"
+    printf 'pip_build_isolation=disabled\n'
     printf '\n== Editable TurboQuant developer build ==\n'
 } | tee "${LOG_FILE}"
 
 cd "${REPO_ROOT}"
-"${PYTHON_BIN}" -m pip install -v -e . 2>&1 | tee -a "${LOG_FILE}"
+"${PYTHON_BIN}" -m pip install --no-build-isolation -v -e . 2>&1 | tee -a "${LOG_FILE}"
 
 touch "${MARKER_FILE}"
 trap - ERR

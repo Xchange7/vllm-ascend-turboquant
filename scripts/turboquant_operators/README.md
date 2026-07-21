@@ -41,6 +41,11 @@ bash scripts/turboquant_operators/build_dev.sh
 `logs/turboquant/build_dev_<timestamp>/build.log`。默认保留 `csrc/build` 中的 CMake、protobuf 和
 未变化目标，后续 kernel/tiling 修改使用增量构建。
 
+开发构建使用当前 Python 环境并关闭 pip build isolation。正式依赖已经安装在 NPU 开发镜像中时，
+这样可以避免 pip 在 `/tmp/pip-build-env-*` 中重新下载 `torch-npu`、`triton-ascend` 等大型构建依赖，
+也不会因为内部 PyPI 镜像暂时缺少指定版本而失败。脚本会在构建前打印当前解释器和
+`triton-ascend` 版本；如果当前环境缺少构建依赖，需先在该环境中安装后再运行脚本。
+
 如果 CANN 报告生成文件、旧 tiling data 或 kernel binary 不一致，执行一次单算子 clean build：
 
 ```bash
