@@ -18,11 +18,11 @@ constexpr uint32_t DATA_BLOCK_BYTES = 32;
 constexpr uint32_t HALF_BYTES = 2;
 constexpr float NORM_EPSILON = 1.0e-16F;
 
-__aicore__ inline uint32_t AlignUp(uint32_t value, uint32_t alignment) {
+__aicore__ inline uint32_t AlignBufferBytes(uint32_t value, uint32_t alignment) {
   return (value + alignment - 1U) / alignment * alignment;
 }
 
-__aicore__ inline uint32_t Min(uint32_t lhs, uint32_t rhs) { return lhs < rhs ? lhs : rhs; }
+__aicore__ inline uint32_t MinValue(uint32_t lhs, uint32_t rhs) { return lhs < rhs ? lhs : rhs; }
 }  // namespace
 
 template <typename T>
@@ -56,16 +56,16 @@ class KernelTurboQuantPagedDequant {
     keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(key));
     valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(value));
 
-    pipe_.InitBuffer(slotBuffer_, AlignUp(slotSize_, DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(centroidBuffer_, AlignUp(centroidCount_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(indexBuffer_, AlignUp(headDim_ * sizeof(int32_t), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(keyFloatBuffer_, AlignUp(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(valueFloatBuffer_, AlignUp(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(squaredBuffer_, AlignUp(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(reduceBuffer_, AlignUp(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(slotBuffer_, AlignBufferBytes(slotSize_, DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(centroidBuffer_, AlignBufferBytes(centroidCount_ * sizeof(float), DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(indexBuffer_, AlignBufferBytes(headDim_ * sizeof(int32_t), DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(keyFloatBuffer_, AlignBufferBytes(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(valueFloatBuffer_, AlignBufferBytes(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(squaredBuffer_, AlignBufferBytes(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(reduceBuffer_, AlignBufferBytes(headDim_ * sizeof(float), DATA_BLOCK_BYTES));
     pipe_.InitBuffer(normBuffer_, DATA_BLOCK_BYTES);
-    pipe_.InitBuffer(keyOutputBuffer_, AlignUp(headDim_ * sizeof(T), DATA_BLOCK_BYTES));
-    pipe_.InitBuffer(valueOutputBuffer_, AlignUp(headDim_ * sizeof(T), DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(keyOutputBuffer_, AlignBufferBytes(headDim_ * sizeof(T), DATA_BLOCK_BYTES));
+    pipe_.InitBuffer(valueOutputBuffer_, AlignBufferBytes(headDim_ * sizeof(T), DATA_BLOCK_BYTES));
 
     slotLocal_ = slotBuffer_.Get<uint8_t>();
     centroidLocal_ = centroidBuffer_.Get<float>();
@@ -116,8 +116,8 @@ class KernelTurboQuantPagedDequant {
     if (physicalBlockValue < 0 || static_cast<uint32_t>(physicalBlockValue) >= numBlocks_) {
       return;
     }
-    const uint32_t sequenceLength = Min(static_cast<uint32_t>(sequenceLengthValue), maxSeqLen_);
-    const uint32_t tokenCount = Min(blockSize_, sequenceLength - pageStart);
+    const uint32_t sequenceLength = MinValue(static_cast<uint32_t>(sequenceLengthValue), maxSeqLen_);
+    const uint32_t tokenCount = MinValue(blockSize_, sequenceLength - pageStart);
     for (uint32_t pageOffset = 0; pageOffset < tokenCount; ++pageOffset) {
       const uint64_t slotIndex =
           (static_cast<uint64_t>(physicalBlockValue) * blockSize_ + pageOffset) * numKvHeads_ + headIndex;
