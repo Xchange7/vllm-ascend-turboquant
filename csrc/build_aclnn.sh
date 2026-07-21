@@ -1,11 +1,32 @@
 #!/bin/bash
 
-ROOT_DIR=$1
+set -Eeuo pipefail
+
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <repository-root> <soc-version>" >&2
+    exit 2
+fi
+
+ROOT_DIR=$(cd -- "$1" && pwd)
 SOC_VERSION=$2
+SCRIPT_DIR="${ROOT_DIR}/csrc"
+CURRENT_STAGE="initialization"
 
 log() {
     echo "[build_aclnn] $*"
 }
+
+report_error() {
+    local status=$?
+    local line=$1
+    local command=$2
+    trap - ERR
+    log "ERROR: stage=${CURRENT_STAGE} status=${status} line=${line} command=${command}"
+    log "The protobuf target may have completed successfully; inspect the first error before this marker."
+    exit "${status}"
+}
+
+trap 'report_error "${LINENO}" "${BASH_COMMAND}"' ERR
 
 resolve_op_dir() {
     local op_name=$1
@@ -49,6 +70,9 @@ log_selected_ops() {
 
 log "start: ROOT_DIR=${ROOT_DIR:-<unset>} SOC_VERSION=${SOC_VERSION:-<unset>} cwd=$(pwd)"
 log "env: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-<unset>}"
+log "env: MAX_JOBS=${MAX_JOBS:-<unset>} CPATH=${CPATH:-<unset>}"
+
+CURRENT_STAGE="SoC and operator selection"
 
 if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
     log "matched SOC branch: ascend310"
@@ -79,7 +103,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         cd - || exit 1
     fi
     ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
-    export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH}
+    export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH:-}
     log "catlass include=${ABSOLUTE_CATLASS_PATH}"
 
     CUSTOM_OPS_ARRAY=(
@@ -126,6 +150,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
 elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     log "matched SOC branch: ascend910_93"
     # ASCEND910C (A3) series
+    : "${ASCEND_TOOLKIT_HOME:?ASCEND_TOOLKIT_HOME is required for Ascend 910C builds}"
     # dependency: catlass
     git config --global --add safe.directory "$ROOT_DIR"
     CATLASS_PATH=${ROOT_DIR}/csrc/third_party/catlass/include
@@ -143,13 +168,13 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         cd - || exit 1
     fi
     # dependency: cann-toolkit file moe_distribute_base.h
-    HCCL_STRUCT_FILE_PATH=$(find -L "${ASCEND_TOOLKIT_HOME}" -name "moe_distribute_base.h" 2>/dev/null | head -n1)
+    HCCL_STRUCT_FILE_PATH=$(find -L "${ASCEND_TOOLKIT_HOME}" -name "moe_distribute_base.h" -print -quit 2>/dev/null)
     if [ -z "$HCCL_STRUCT_FILE_PATH" ]; then
         echo "cannot find moe_distribute_base.h file in CANN env"
         exit 1
     fi
     # for dispatch_gmm_combine_decode
-    yes | cp "${HCCL_STRUCT_FILE_PATH}" "${ROOT_DIR}/csrc/utils/inc/kernel"
+    cp -f "${HCCL_STRUCT_FILE_PATH}" "${ROOT_DIR}/csrc/utils/inc/kernel"
 
     # for dispatch_normal and combine_normal
     TARGET_DIR="$SCRIPT_DIR/mc2/moe_dispatch_normal/op_kernel/utils/"
@@ -226,7 +251,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         cd - || exit 1
     fi
     ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
-    export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH}
+    export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH:-}
     log "catlass include=${ABSOLUTE_CATLASS_PATH}"
 
     CUSTOM_OPS_ARRAY=(
@@ -270,12 +295,10 @@ log_selected_ops
 # ./build/cann-ops-transformer*.run --install-path=$ROOT_DIR/vllm_ascend/_cann_ops_custom
 
 
-(
-  set -euo pipefail
-
-  log "subshell cwd before cd=$(pwd)"
-  cd csrc
-  log "subshell cwd after cd=$(pwd)"
+{
+  log "build cwd before cd=$(pwd)"
+  cd "${SCRIPT_DIR}"
+  log "build cwd after cd=$(pwd)"
   log "cleaning csrc build dirs"
   rm -rf -- build output build_out
 
@@ -284,11 +307,13 @@ log_selected_ops
   : "${SOC_VERSION:?SOC_VERSION is not set}"
   : "${SOC_ARG:?SOC_ARG is not set}"
 
+  CURRENT_STAGE="CMake configuration and custom operator package build"
   log "build command: bash build.sh --pkg --ops=\"${CUSTOM_OPS}\" --soc=\"${SOC_ARG}\""
   log "building custom ops ${CUSTOM_OPS} for ${SOC_VERSION}"
   bash build.sh --pkg --ops="${CUSTOM_OPS}" --soc="${SOC_ARG}"
   log "build.sh finished"
 
+  CURRENT_STAGE="custom operator package discovery"
   custom_ops_install_dir="${ROOT_DIR}/vllm_ascend/_cann_ops_custom"
   log "custom_ops_install_dir=${custom_ops_install_dir}"
 
@@ -310,6 +335,7 @@ log_selected_ops
 
   (( ${#installer_candidates[@]} == 1 )) || { echo "ERROR: expected 1 installer, got ${#installer_candidates[@]}" >&2; exit 1; }
 
+  CURRENT_STAGE="custom operator package installation"
   chmod +x -- "${installer_candidates[0]}" || true
   log "running installer: ${installer_candidates[0]}"
   "${installer_candidates[0]}" --install-path="${custom_ops_install_dir}"
@@ -321,4 +347,7 @@ log_selected_ops
   log "installer finished"
   log "installed files under ${custom_ops_install_dir} (maxdepth=4, first 120 entries):"
   { find "${custom_ops_install_dir}" -mindepth 1 -maxdepth 4 -print | sort | head -n 120 | sed 's#^#[build_aclnn] install: #'; } || true
-)
+}
+
+CURRENT_STAGE="complete"
+log "completed successfully for SOC_VERSION=${SOC_VERSION} SOC_ARG=${SOC_ARG}"

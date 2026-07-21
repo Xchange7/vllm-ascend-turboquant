@@ -220,11 +220,20 @@ class build_and_install_aclnn(Command):
 
     def run(self):
         try:
-            print("Running bash build_aclnn.sh ...")
-            subprocess.check_call(["bash", "csrc/build_aclnn.sh", ROOT_DIR, envs.SOC_VERSION])
-            print("build_aclnn.sh executed successfully!")
+            print(
+                f"Running bash build_aclnn.sh for SOC_VERSION={envs.SOC_VERSION} ...",
+                flush=True,
+            )
+            subprocess.check_call(
+                ["bash", "csrc/build_aclnn.sh", ROOT_DIR, envs.SOC_VERSION],
+                cwd=ROOT_DIR,
+            )
+            print("build_aclnn.sh executed successfully!", flush=True)
         except subprocess.CalledProcessError as e:
-            print(f"Error running build_aclnn.sh: {e}")
+            print(
+                f"Error running build_aclnn.sh: SOC_VERSION={envs.SOC_VERSION}, exit_code={e.returncode}",
+                flush=True,
+            )
             raise SystemExit(e.returncode)
 
 
