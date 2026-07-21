@@ -559,8 +559,10 @@ slot size 不变。
 
 ### 12.2 `_turboquant_store_kernel()`
 
-kernel grid 是 `[num_tokens * num_kv_heads]`。每个 program 通过 program id 得到
-`token_index` 和 `head_index`。
+逻辑 grid 是 `[num_tokens * num_kv_heads]`。Ascend runtime 要求单次 Triton launch 的
+`coreDim <= 65535`，因此 Python launcher 会沿 token 边界把逻辑 grid 拆成多个物理 launch。
+每个 program 仍通过本批次内的 program id 得到 `token_index` 和 `head_index`；切片后的
+key/value/slot-mapping 指针保证地址语义与单次 launch 完全相同。
 
 主要代码块如下：
 
@@ -584,7 +586,8 @@ Python launcher 负责 kernel 外的向量运算和参数校验：
 4. 在 store Triton program 内用 FP32 reduction 计算 key norm，并在 centroid search 前归一化；
 5. 为 3-bit 打包选择至少 32 lane 的内部 block，并 mask 无效 lane；
 6. 计算 packed payload byte offset，并检查 FP16 metadata 对齐；
-7. 以每个 token、每个 KV head 一个 program 的 grid 启动 kernel。
+7. 以每个 token、每个 KV head 一个 program 的逻辑 grid 启动 kernel；超过 65535 个
+   program 时按完整 token 分批，避免切开同一个 token 的 KV heads。
 
 rotation 的 FP32 主副本和 activation-dtype 计算副本由所有 attention layer 共享。当前仍使用
 dense Hadamard matrix multiplication，是后续 FWT 优化的主要入口。
@@ -696,11 +699,15 @@ split，通过各 split 的 LSE 重新缩放 partial output，然后合并得到
 
 ### 13.8 `_turboquant_full_dequant_kernel()`
 
-该 kernel 只用于长 continuation fallback。grid 是：
+该 kernel 只用于长 continuation fallback。逻辑 program 数是：
 
 ```text
-(max_seq_len, batch_size * num_kv_heads)
+max_seq_len * batch_size * num_kv_heads
 ```
+
+launcher 把二维坐标展平为 `batch_head * max_seq_len + position`，再拆成每批不超过 65535
+个 program 的一维 launch。kernel 使用 `program_offset` 恢复全局坐标。这既规避 910B4 的
+`coreDim` 上限，也不会改变 block-table 查询和 TND output 地址。
 
 每个 program 解压一个历史 position、一个 KV head：
 
@@ -749,7 +756,9 @@ FP32 output 转换、二次 output copy 或完整 FP16/BF16 历史 K/V tensor。
 ### 13.12 `triton_turboquant_dequant_paged_cache()`
 
 这是完整反量化 kernel 的 Python launcher。它从 output shape 得到 KV head 和 head
-dimension，计算布局参数，并根据最大历史长度启动二维 grid。
+dimension，计算布局参数，并根据最大历史长度得到展平的逻辑 grid。逻辑 program 数超过
+65535 时，launcher 通过 runtime `program_offset` 分批启动；offset 不是 constexpr，因此
+不同批次复用同一个已编译 kernel variant。
 
 `seq_lens` 让不同 request 只处理各自有效历史，`seq_start_locs` 将 ragged request
 写到连续 TND buffer。

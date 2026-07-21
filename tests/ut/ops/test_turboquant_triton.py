@@ -22,6 +22,8 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
 
+import vllm_ascend.ops.triton.turboquant_decode as turboquant_decode_module
+import vllm_ascend.ops.triton.turboquant_store as turboquant_store_module
 from tests.ut.conftest import npu_test
 from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
 from vllm_ascend.attention.turboquant import (
@@ -32,12 +34,18 @@ from vllm_ascend.attention.turboquant import (
 )
 from vllm_ascend.kv_cache.turboquant import get_turboquant_config
 from vllm_ascend.ops.triton.turboquant_decode import (
+    _ASCEND_MAX_TRITON_GRID_SIZE,
+    _dequant_launch_ranges,
     _supports_grouped_gqa,
     select_turboquant_num_kv_splits,
     triton_turboquant_decode_attention,
     triton_turboquant_dequant_paged_cache,
 )
-from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
+from vllm_ascend.ops.triton.turboquant_store import (
+    ASCEND_MAX_TRITON_GRID_SIZE,
+    _store_launch_token_ranges,
+    triton_turboquant_store,
+)
 from vllm_ascend.ops.turboquant import (
     turboquant_paged_dequant,
     turboquant_paged_dequant_out,
@@ -386,6 +394,24 @@ def test_turboquant_split_selection_without_host_sequence_length():
     )
 
 
+def test_turboquant_store_launch_ranges_respect_ascend_grid_limit():
+    ranges = _store_launch_token_ranges(65536, 2)
+
+    assert ranges == [(0, 32767), (32767, 65534), (65534, 65536)]
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == 65536
+    assert all((token_end - token_start) * 2 <= ASCEND_MAX_TRITON_GRID_SIZE for token_start, token_end in ranges)
+
+
+def test_turboquant_dequant_launch_ranges_respect_ascend_grid_limit():
+    ranges = _dequant_launch_ranges(131072)
+
+    assert ranges == [(0, 65535), (65535, 131070), (131070, 131072)]
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == 131072
+    assert all(program_end - program_start <= _ASCEND_MAX_TRITON_GRID_SIZE for program_start, program_end in ranges)
+
+
 @npu_test(num_npus=1, npu_type="a2")
 def test_turboquant_negative_slot_mapping_does_not_write_cache():
     torch.manual_seed(0)
@@ -462,6 +488,136 @@ def test_turboquant_store_writes_valid_slots(cache_dtype, head_dim):
 
     assert torch.count_nonzero(cache[0, 0].cpu()) > 0
     assert torch.count_nonzero(cache[1, 1].cpu()) > 0
+
+
+@npu_test(num_npus=1, npu_type="a2")
+def test_turboquant_chunked_store_matches_single_launch(monkeypatch):
+    torch.manual_seed(2)
+    head_dim = 128
+    num_tokens = 5
+    num_kv_heads = 2
+    config, hadamard, _, midpoints = _constants(
+        "turboquant_4bit_nc",
+        head_dim,
+    )
+    key = torch.randn(
+        num_tokens,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="npu",
+    )
+    value = torch.randn_like(key)
+    reference_cache = torch.zeros(
+        1,
+        128,
+        num_kv_heads,
+        config.slot_size_aligned,
+        dtype=torch.uint8,
+        device="npu",
+    )
+    chunked_cache = torch.zeros_like(reference_cache)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device="npu")
+    store_kwargs = {
+        "key_bits": config.key_quant_bits,
+        "key_packed_size": config.key_packed_size,
+        "value_bits": config.value_quant_bits,
+    }
+
+    triton_turboquant_store(
+        key,
+        value,
+        reference_cache,
+        slot_mapping,
+        hadamard,
+        midpoints,
+        **store_kwargs,
+    )
+    monkeypatch.setattr(
+        turboquant_store_module,
+        "ASCEND_MAX_TRITON_GRID_SIZE",
+        4,
+    )
+    triton_turboquant_store(
+        key,
+        value,
+        chunked_cache,
+        slot_mapping,
+        hadamard,
+        midpoints,
+        **store_kwargs,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(chunked_cache.cpu(), reference_cache.cpu())
+
+
+@npu_test(num_npus=1, npu_type="a2")
+def test_turboquant_chunked_dequant_matches_single_launch(monkeypatch):
+    (
+        config,
+        _,
+        centroids,
+        cache,
+        block_table,
+        seq_lens,
+        seq_lens_list,
+        max_seq_len,
+        query,
+    ) = _build_fused_dequant_inputs("turboquant_4bit_nc", torch.float16)
+    total_tokens = sum(seq_lens_list)
+    seq_start_locs = torch.tensor(
+        [0, seq_lens_list[0], total_tokens],
+        dtype=torch.int32,
+        device="npu",
+    )
+    reference_key = torch.empty(
+        total_tokens,
+        cache.shape[2],
+        query.shape[-1],
+        dtype=query.dtype,
+        device="npu",
+    )
+    reference_value = torch.empty_like(reference_key)
+    chunked_key = torch.empty_like(reference_key)
+    chunked_value = torch.empty_like(reference_value)
+    dequant_kwargs = {
+        "max_seq_len": max_seq_len,
+        "key_bits": config.key_quant_bits,
+        "key_packed_size": config.key_packed_size,
+        "value_bits": config.value_quant_bits,
+        "norm_correction": config.norm_correction,
+    }
+
+    triton_turboquant_dequant_paged_cache(
+        cache,
+        block_table,
+        seq_lens,
+        seq_start_locs,
+        centroids,
+        reference_key,
+        reference_value,
+        **dequant_kwargs,
+    )
+    monkeypatch.setattr(
+        turboquant_decode_module,
+        "_ASCEND_MAX_TRITON_GRID_SIZE",
+        100,
+    )
+    triton_turboquant_dequant_paged_cache(
+        cache,
+        block_table,
+        seq_lens,
+        seq_start_locs,
+        centroids,
+        chunked_key,
+        chunked_value,
+        **dequant_kwargs,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(chunked_key, reference_key, rtol=0, atol=0)
+    torch.testing.assert_close(chunked_value, reference_value, rtol=0, atol=0)
 
 
 @npu_test(num_npus=1, npu_type="a2")

@@ -21,6 +21,29 @@ import torch
 from vllm.triton_utils import tl, triton
 
 ASCEND_UB_ALIGNMENT_BYTES = 32
+ASCEND_MAX_TRITON_GRID_SIZE = 65535
+
+
+def _store_launch_token_ranges(
+    num_tokens: int,
+    num_kv_heads: int,
+) -> list[tuple[int, int]]:
+    """Split store launches without dividing a token's KV heads."""
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}.")
+    if num_kv_heads <= 0:
+        raise ValueError(f"num_kv_heads must be positive, got {num_kv_heads}.")
+    tokens_per_launch = ASCEND_MAX_TRITON_GRID_SIZE // num_kv_heads
+    if tokens_per_launch == 0:
+        raise ValueError(
+            "TurboQuant store cannot launch more KV heads than the Ascend "
+            f"grid limit, got {num_kv_heads} heads and limit "
+            f"{ASCEND_MAX_TRITON_GRID_SIZE}."
+        )
+    return [
+        (token_start, min(token_start + tokens_per_launch, num_tokens))
+        for token_start in range(0, num_tokens, tokens_per_launch)
+    ]
 
 
 @triton.jit
@@ -360,6 +383,11 @@ def triton_turboquant_store(
     num_tokens, num_kv_heads, head_dim = key.shape
     if num_tokens == 0:
         return
+    if slot_mapping.numel() != num_tokens:
+        raise ValueError(
+            "TurboQuant slot mapping must contain one entry per token, got "
+            f"{slot_mapping.numel()} entries for {num_tokens} tokens."
+        )
     if head_dim % ASCEND_UB_ALIGNMENT_BYTES != 0:
         raise ValueError(f"TurboQuant Triton packing requires head_dim % 32 == 0, got {head_dim}.")
 
@@ -402,29 +430,36 @@ def triton_turboquant_store(
     if any(offset % 2 for offset in metadata_offsets):
         raise ValueError(f"TurboQuant FP16 metadata must start at an even byte offset; got offsets {metadata_offsets}.")
 
-    grid = (num_vectors,)
-    _turboquant_store_kernel[grid](
-        rotated_key,
-        key_vectors,
-        value_contiguous,
-        midpoints,
-        kv_cache,
-        kv_cache.view(torch.float16),
-        slot_mapping,
-        stride_cache_block=kv_cache.stride(0),
-        stride_cache_position=kv_cache.stride(1),
-        stride_cache_head=kv_cache.stride(2),
-        D=head_dim,
-        NUM_KV_HEADS=num_kv_heads,
-        CACHE_BLOCK_SIZE=kv_cache.shape[1],
-        BLOCK_D=block_d,
-        MSE_BYTES=mse_bytes,
-        KPS=key_packed_size,
-        KEY_BITS=key_bits,
-        NUM_CENTROIDS=2**key_bits,
-        VALUE_BITS=value_bits,
-        VALUE_DATA_BYTES=value_data_bytes,
-        BLOCK_GROUPS=block_groups,
-        num_warps=4,
-        num_stages=1,
-    )
+    cache_f16 = kv_cache.view(torch.float16)
+    for token_start, token_end in _store_launch_token_ranges(
+        num_tokens,
+        num_kv_heads,
+    ):
+        vector_start = token_start * num_kv_heads
+        vector_end = token_end * num_kv_heads
+        grid = (vector_end - vector_start,)
+        _turboquant_store_kernel[grid](
+            rotated_key[vector_start:vector_end],
+            key_vectors[vector_start:vector_end],
+            value_contiguous[vector_start:vector_end],
+            midpoints,
+            kv_cache,
+            cache_f16,
+            slot_mapping[token_start:token_end],
+            stride_cache_block=kv_cache.stride(0),
+            stride_cache_position=kv_cache.stride(1),
+            stride_cache_head=kv_cache.stride(2),
+            D=head_dim,
+            NUM_KV_HEADS=num_kv_heads,
+            CACHE_BLOCK_SIZE=kv_cache.shape[1],
+            BLOCK_D=block_d,
+            MSE_BYTES=mse_bytes,
+            KPS=key_packed_size,
+            KEY_BITS=key_bits,
+            NUM_CENTROIDS=2**key_bits,
+            VALUE_BITS=value_bits,
+            VALUE_DATA_BYTES=value_data_bytes,
+            BLOCK_GROUPS=block_groups,
+            num_warps=4,
+            num_stages=1,
+        )

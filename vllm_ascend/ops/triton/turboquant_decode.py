@@ -26,6 +26,7 @@ _GROUPED_GQA_MAX_GROUP_SIZE = 32
 _GROUPED_GQA_MAX_HEAD_DIM = 128
 _GROUPED_GQA_BLOCK_KV = 16
 _GROUPED_GQA_BLOCK_KV_OPTIONS = (16, 32)
+_ASCEND_MAX_TRITON_GRID_SIZE = 65535
 
 # Keep enough stage-1 programs to occupy the NPU without multiplying tiny
 # split-KV programs at high concurrency. This mirrors upstream Triton MLA's
@@ -549,6 +550,7 @@ def _turboquant_full_dequant_kernel(
     centroids_ptr,
     key_output_ptr,
     value_output_ptr,
+    program_offset,
     stride_cache_block,
     stride_cache_position,
     stride_cache_head,
@@ -567,9 +569,11 @@ def _turboquant_full_dequant_kernel(
     VALUE_DATA_BYTES: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NORM_CORRECTION: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
 ):
-    position = tl.program_id(0)
-    batch_head = tl.program_id(1)
+    flat_program = tl.program_id(0) + program_offset
+    position = flat_program % MAX_SEQ_LEN
+    batch_head = flat_program // MAX_SEQ_LEN
     batch_index = batch_head // NUM_KV_HEADS
     head_index = batch_head % NUM_KV_HEADS
     seq_len = tl.load(seq_lens_ptr + batch_index)
@@ -674,6 +678,22 @@ def _layout(
         math.ceil(head_dim * value_bits / 8),
         triton.next_power_of_2(head_dim),
     )
+
+
+def _dequant_launch_ranges(total_programs: int) -> list[tuple[int, int]]:
+    if total_programs < 0:
+        raise ValueError(f"total_programs must be non-negative, got {total_programs}.")
+    return [
+        (
+            program_start,
+            min(program_start + _ASCEND_MAX_TRITON_GRID_SIZE, total_programs),
+        )
+        for program_start in range(
+            0,
+            total_programs,
+            _ASCEND_MAX_TRITON_GRID_SIZE,
+        )
+    ]
 
 
 def _supports_grouped_gqa(
@@ -1042,39 +1062,46 @@ def triton_turboquant_dequant_paged_cache(
 ) -> None:
     """Dequantize paged history to compact TND buffers for prefill fallback."""
     _, num_kv_heads, head_dim = key_output.shape
+    if max_seq_len <= 0 or seq_lens.numel() == 0:
+        return
     mse_bytes, value_data_bytes, block_d = _layout(
         head_dim,
         key_bits,
         value_bits,
     )
-    grid = (max_seq_len, seq_lens.shape[0] * num_kv_heads)
-    _turboquant_full_dequant_kernel[grid](
-        kv_cache,
-        kv_cache.view(torch.float16),
-        block_table,
-        seq_lens,
-        seq_start_locs,
-        centroids,
-        key_output,
-        value_output,
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
-        block_table.stride(0),
-        key_output.stride(0),
-        key_output.stride(1),
-        value_output.stride(0),
-        value_output.stride(1),
-        NUM_KV_HEADS=num_kv_heads,
-        HEAD_DIM=head_dim,
-        CACHE_BLOCK_SIZE=kv_cache.shape[1],
-        KEY_BITS=key_bits,
-        MSE_BYTES=mse_bytes,
-        KPS=key_packed_size,
-        VALUE_BITS=value_bits,
-        VALUE_DATA_BYTES=value_data_bytes,
-        BLOCK_D=block_d,
-        NORM_CORRECTION=norm_correction,
-        num_warps=4,
-        num_stages=1,
-    )
+    total_programs = max_seq_len * seq_lens.shape[0] * num_kv_heads
+    cache_f16 = kv_cache.view(torch.float16)
+    for program_start, program_end in _dequant_launch_ranges(total_programs):
+        grid = (program_end - program_start,)
+        _turboquant_full_dequant_kernel[grid](
+            kv_cache,
+            cache_f16,
+            block_table,
+            seq_lens,
+            seq_start_locs,
+            centroids,
+            key_output,
+            value_output,
+            program_start,
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_table.stride(0),
+            key_output.stride(0),
+            key_output.stride(1),
+            value_output.stride(0),
+            value_output.stride(1),
+            NUM_KV_HEADS=num_kv_heads,
+            HEAD_DIM=head_dim,
+            CACHE_BLOCK_SIZE=kv_cache.shape[1],
+            KEY_BITS=key_bits,
+            MSE_BYTES=mse_bytes,
+            KPS=key_packed_size,
+            VALUE_BITS=value_bits,
+            VALUE_DATA_BYTES=value_data_bytes,
+            BLOCK_D=block_d,
+            NORM_CORRECTION=norm_correction,
+            MAX_SEQ_LEN=max_seq_len,
+            num_warps=4,
+            num_stages=1,
+        )

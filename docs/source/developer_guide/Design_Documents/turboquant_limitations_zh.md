@@ -333,8 +333,9 @@ activation-dtype rotation GEMM，不再物化完整的 FP32 normalized key。长
 一个 activation-dtype rotated-key 临时 tensor，需要继续评估其显存和带宽。
 
 可以达到的优化上限是 fused FWT + centroid lookup + bit-pack store。Value 的 min/max、
-scale 和 pack 已在同一 program 完成。长 prefill 后续可使用分块 grid，避免为全部 tokens
-保留 rotated key。
+scale 和 pack 已在同一 program 完成。当前超过 Ascend `coreDim=65535` 上限的 store 逻辑
+grid 已按 token 分批 launch，但 rotation 仍会先生成完整的 rotated-key tensor。后续可把
+rotation 与 store 一起流式分块，降低长 prefill 的峰值临时显存。
 
 ### 8.3 Decode 固定 splits
 

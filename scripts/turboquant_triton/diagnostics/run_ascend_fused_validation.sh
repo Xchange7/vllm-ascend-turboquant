@@ -49,7 +49,8 @@ print("Ascend TurboQuant fused operator is registered (return+out).")
 PY
 
 printf '\n== Fused correctness ==\n'
-pytest -sv tests/ut/ops/test_turboquant_triton.py -k "ascend_fused"
+pytest -sv tests/ut/ops/test_turboquant_triton.py \
+    -k "ascend_fused or chunked_store or chunked_dequant or launch_ranges"
 
 TRACE_ARGS=(--no-trace)
 if [[ "${COLLECT_TRACE}" == "1" ]]; then
