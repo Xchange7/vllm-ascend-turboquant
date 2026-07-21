@@ -19,6 +19,10 @@ constexpr uint32_t FLOAT_BYTES = static_cast<uint32_t>(sizeof(float));
 constexpr uint32_t INT32_BYTES = static_cast<uint32_t>(sizeof(int32_t));
 constexpr uint32_t HALF_BYTES = 2U;
 constexpr float NORM_EPSILON = 1.0e-16F;
+
+__aicore__ constexpr inline uint32_t AlignUbBytes(uint32_t value) {
+  return (value + DATA_BLOCK_BYTES - 1U) & ~(DATA_BLOCK_BYTES - 1U);
+}
 }  // namespace turbo_quant_detail
 
 template <typename T>
@@ -52,17 +56,18 @@ class KernelTurboQuantPagedDequant {
     keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(key));
     valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(value));
 
-    // TPipe::InitBuffer pads byte lengths to a 32-byte data block.
-    pipe_.InitBuffer(slotBuffer_, slotSize_);
-    pipe_.InitBuffer(centroidBuffer_, centroidCount_ * turbo_quant_detail::FLOAT_BYTES);
-    pipe_.InitBuffer(indexBuffer_, headDim_ * turbo_quant_detail::INT32_BYTES);
-    pipe_.InitBuffer(keyFloatBuffer_, headDim_ * turbo_quant_detail::FLOAT_BYTES);
-    pipe_.InitBuffer(valueFloatBuffer_, headDim_ * turbo_quant_detail::FLOAT_BYTES);
-    pipe_.InitBuffer(squaredBuffer_, headDim_ * turbo_quant_detail::FLOAT_BYTES);
-    pipe_.InitBuffer(reduceBuffer_, headDim_ * turbo_quant_detail::FLOAT_BYTES);
+    // DataCopyPad writes complete 32-byte data blocks into local memory.
+    pipe_.InitBuffer(slotBuffer_, turbo_quant_detail::AlignUbBytes(slotSize_));
+    pipe_.InitBuffer(centroidBuffer_,
+                     turbo_quant_detail::AlignUbBytes(centroidCount_ * turbo_quant_detail::FLOAT_BYTES));
+    pipe_.InitBuffer(indexBuffer_, turbo_quant_detail::AlignUbBytes(headDim_ * turbo_quant_detail::INT32_BYTES));
+    pipe_.InitBuffer(keyFloatBuffer_, turbo_quant_detail::AlignUbBytes(headDim_ * turbo_quant_detail::FLOAT_BYTES));
+    pipe_.InitBuffer(valueFloatBuffer_, turbo_quant_detail::AlignUbBytes(headDim_ * turbo_quant_detail::FLOAT_BYTES));
+    pipe_.InitBuffer(squaredBuffer_, turbo_quant_detail::AlignUbBytes(headDim_ * turbo_quant_detail::FLOAT_BYTES));
+    pipe_.InitBuffer(reduceBuffer_, turbo_quant_detail::AlignUbBytes(headDim_ * turbo_quant_detail::FLOAT_BYTES));
     pipe_.InitBuffer(normBuffer_, turbo_quant_detail::DATA_BLOCK_BYTES);
-    pipe_.InitBuffer(keyOutputBuffer_, headDim_ * static_cast<uint32_t>(sizeof(T)));
-    pipe_.InitBuffer(valueOutputBuffer_, headDim_ * static_cast<uint32_t>(sizeof(T)));
+    pipe_.InitBuffer(keyOutputBuffer_, turbo_quant_detail::AlignUbBytes(headDim_ * static_cast<uint32_t>(sizeof(T))));
+    pipe_.InitBuffer(valueOutputBuffer_, turbo_quant_detail::AlignUbBytes(headDim_ * static_cast<uint32_t>(sizeof(T))));
 
     slotLocal_ = slotBuffer_.Get<uint8_t>();
     centroidLocal_ = centroidBuffer_.Get<float>();

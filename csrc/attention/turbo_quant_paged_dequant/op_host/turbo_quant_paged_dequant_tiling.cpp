@@ -94,7 +94,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   OPS_CHECK(*keyPackedSize != keyDataBytes + METADATA_BYTES,
             OPS_LOG_E(nodeName, "packed cache layout does not match TurboQuant attributes"), return ge::GRAPH_FAILED);
   const int64_t minimumSlotSize = keyDataBytes + METADATA_BYTES + valueDataBytes + VALUE_METADATA_BYTES;
-  OPS_CHECK(slotSize < minimumSlotSize, OPS_LOG_E(nodeName, "packed cache slot is smaller than the TurboQuant payload"),
+  const int64_t expectedSlotSize = minimumSlotSize + minimumSlotSize % 2;
+  OPS_CHECK(slotSize != expectedSlotSize,
+            OPS_LOG_E(nodeName, "packed cache slot does not match the aligned TurboQuant payload"),
             return ge::GRAPH_FAILED);
   const int64_t centroidCount = int64_t{1} << *keyBits;
   OPS_CHECK(centroidsShape.GetDim(0) < centroidCount,

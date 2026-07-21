@@ -73,6 +73,25 @@ def test_turboquant_supports_common_dense_head_dimensions(head_dim):
     assert shape[3] > 0
 
 
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
+def test_turboquant_ascend_fused_accepts_supported_head_dim(head_dim):
+    from vllm_ascend.attention.turboquant import (
+        _validate_ascend_fused_head_dim,
+    )
+
+    _validate_ascend_fused_head_dim(head_dim)
+
+
+@pytest.mark.parametrize("head_dim", [16, 48, 512])
+def test_turboquant_ascend_fused_rejects_unsupported_head_dim(head_dim):
+    from vllm_ascend.attention.turboquant import (
+        _validate_ascend_fused_head_dim,
+    )
+
+    with pytest.raises(NotImplementedError, match="multiple of 32 in"):
+        _validate_ascend_fused_head_dim(head_dim)
+
+
 def test_turboquant_dtype_detection_does_not_match_normal_cache():
     assert is_turboquant_kv_cache_dtype("turboquant_4bit_nc")
     assert not is_turboquant_kv_cache_dtype("auto")

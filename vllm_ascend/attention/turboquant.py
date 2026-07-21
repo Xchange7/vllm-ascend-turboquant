@@ -65,6 +65,11 @@ _CONTINUATION_DECODE_THRESHOLD = 128
 # logits soft cap. The K dimension remains full so each tile is exact.
 _FEATURE_PREFILL_QUERY_TILE_SIZE = 32
 
+# Keep this in sync with the AscendC paged-dequant tiling constraints. The
+# Triton path supports a wider set of power-of-two head dimensions.
+_ASCEND_FUSED_MIN_HEAD_DIM = 32
+_ASCEND_FUSED_MAX_HEAD_DIM = 256
+
 # The Lloyd-Max codebook models coordinates produced by a randomized
 # orthogonal transform. Keep the seed stable so cache writes and reads use the
 # same transform across workers and graph captures.
@@ -135,6 +140,19 @@ def _query_lens_from_cumulative(
         query_lens.append(query_len)
         previous_end = request_end
     return query_lens
+
+
+def _validate_ascend_fused_head_dim(head_dim: int) -> None:
+    if (
+        head_dim < _ASCEND_FUSED_MIN_HEAD_DIM
+        or head_dim > _ASCEND_FUSED_MAX_HEAD_DIM
+        or head_dim % _ASCEND_FUSED_MIN_HEAD_DIM != 0
+    ):
+        raise NotImplementedError(
+            "Ascend TurboQuant fused decode requires head_dim to be a "
+            f"multiple of 32 in [32, 256], got {head_dim}. Use the default "
+            "auto decode implementation for other supported head dimensions."
+        )
 
 
 class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
@@ -337,6 +355,8 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             self.alibi_slopes is not None or self.logits_soft_cap is not None
         ):
             raise NotImplementedError("Ascend TurboQuant fused decode does not support ALiBi or logits soft cap.")
+        if self.decode_implementation == "ascend_fused":
+            _validate_ascend_fused_head_dim(head_size)
 
     def _ensure_constants(
         self,
