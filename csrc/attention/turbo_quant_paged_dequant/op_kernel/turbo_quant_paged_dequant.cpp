@@ -262,9 +262,9 @@ class KernelTurboQuantPagedDequant {
   bool normCorrection_ = false;
 };
 
-extern "C" __global__ __aicore__ void turboquant_paged_dequant(GM_ADDR query, GM_ADDR kvCache, GM_ADDR blockTable,
-                                                               GM_ADDR seqLens, GM_ADDR centroids, GM_ADDR key,
-                                                               GM_ADDR value, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void turbo_quant_paged_dequant(GM_ADDR query, GM_ADDR kvCache, GM_ADDR blockTable,
+                                                                GM_ADDR seqLens, GM_ADDR centroids, GM_ADDR key,
+                                                                GM_ADDR value, GM_ADDR workspace, GM_ADDR tiling) {
   (void)query;
   (void)workspace;
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);

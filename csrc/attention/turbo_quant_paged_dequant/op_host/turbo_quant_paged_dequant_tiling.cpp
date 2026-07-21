@@ -15,7 +15,7 @@
 #include "error/ops_error.h"
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "turboquant_paged_dequant_tiling.h"
+#include "turbo_quant_paged_dequant_tiling.h"
 
 namespace {
 constexpr size_t QUERY_INPUT_INDEX = 0;

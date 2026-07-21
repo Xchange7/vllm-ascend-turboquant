@@ -31,8 +31,8 @@ attention。它首先用于验证高并发瓶颈是否来自现有 Triton packed
 
 | 文件 | 职责 |
 | --- | --- |
-| `csrc/attention/turboquant_paged_dequant/op_kernel/turboquant_paged_dequant.cpp` | AIV kernel：paged gather、bit unpack、centroid lookup、norm correction 和 V 反量化 |
-| `csrc/attention/turboquant_paged_dequant/op_host/` | OpDef、shape/dtype inference 和 tiling |
+| `csrc/attention/turbo_quant_paged_dequant/op_kernel/turbo_quant_paged_dequant.cpp` | AIV kernel：paged gather、bit unpack、centroid lookup、norm correction 和 V 反量化 |
+| `csrc/attention/turbo_quant_paged_dequant/op_host/` | OpDef、shape/dtype inference 和 tiling |
 | `csrc/torch_binding.cpp` | 注册 `_C_ascend.npu_turboquant_paged_dequant` 并分配 BNSD 输出 |
 | `csrc/torch_binding_meta.cpp` | PyTorch Meta 实现 |
 | `vllm_ascend/ops/turboquant.py` | Python 可用性检查和稳定调用接口 |
