@@ -8,7 +8,7 @@
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 
-"""Validate the Ascend TurboQuant operator against Triton implementations."""
+"""Validate TurboQuant implementations against an independent CPU reference."""
 
 from __future__ import annotations
 
@@ -22,6 +22,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import torch_npu
+from turboquant_reference import (
+    decode_attention_reference,
+    dequantize_paged_cache_reference,
+)
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
@@ -69,6 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--num-kv-splits", type=int, default=4)
+    parser.add_argument(
+        "--decode-implementation",
+        choices=("auto", "reference", "grouped_gqa"),
+        default="auto",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output", type=Path, required=True)
@@ -203,7 +212,7 @@ def build_inputs(args: argparse.Namespace):
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
-        compute_rotation=compute_rotation,
+        compute_rotation=(None if args.decode_implementation == "reference" else compute_rotation),
     )
     torch.npu.synchronize()
 
@@ -279,7 +288,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         key_bits=config.key_quant_bits,
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
-        compute_rotation=compute_rotation,
+        compute_rotation=(None if args.decode_implementation == "reference" else compute_rotation),
     )
     torch.npu.synchronize()
     negative_slot_mapping_passed = torch.equal(cache, cache_before_invalid_store)
@@ -330,6 +339,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     torch.npu.synchronize()
 
+    key_cpu, value_cpu = dequantize_paged_cache_reference(
+        cache,
+        block_table,
+        args.sequence_lengths,
+        centroids,
+        head_dim=args.head_dim,
+        key_bits=config.key_quant_bits,
+        key_packed_size=config.key_packed_size,
+        value_bits=config.value_quant_bits,
+        norm_correction=config.norm_correction,
+    )
+
     key_ascend_compact = torch.cat(
         [key_ascend[index, :, :length].permute(1, 0, 2) for index, length in enumerate(args.sequence_lengths)]
     )
@@ -349,10 +370,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         atol=dequant_tolerance,
         rtol=dequant_tolerance,
     )
+    key_cpu_reference = close_result(
+        key_triton.cpu(),
+        key_cpu.to(key.dtype),
+        atol=dequant_tolerance,
+        rtol=dequant_tolerance,
+    )
+    value_cpu_reference = close_result(
+        value_triton.cpu(),
+        value_cpu.to(value.dtype),
+        atol=dequant_tolerance,
+        rtol=dequant_tolerance,
+    )
 
-    key_rotated_reference = (key.reshape(-1, args.head_dim) @ compute_rotation).reshape_as(key)
-    key_quantization = error_metrics(key_ascend_compact, key_rotated_reference)
-    value_quantization = error_metrics(value_ascend_compact, value)
+    if args.decode_implementation == "reference":
+        key_rotated_reference = (key.float().reshape(-1, args.head_dim) @ hadamard).reshape_as(key)
+    else:
+        key_rotated_reference = (key.reshape(-1, args.head_dim) @ compute_rotation).reshape_as(key)
+    key_quantization = error_metrics(key_cpu, key_rotated_reference.cpu())
+    value_quantization = error_metrics(value_cpu, value.cpu())
 
     packed_output = triton_turboquant_decode_attention(
         query,
@@ -368,10 +404,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         norm_correction=config.norm_correction,
         max_num_kv_splits=args.num_kv_splits,
         buffer_holder=SimpleNamespace(),
-        compute_rotation=compute_rotation,
-        implementation="auto",
+        compute_rotation=(None if args.decode_implementation == "reference" else compute_rotation),
+        implementation=args.decode_implementation,
     )
-    query_rotated = (query @ compute_rotation).contiguous()
+    if args.decode_implementation == "reference":
+        query_rotated = (query.float() @ hadamard).to(query.dtype).contiguous()
+    else:
+        query_rotated = (query @ compute_rotation).contiguous()
     fused_output, _ = torch_npu.npu_fused_infer_attention_score(
         query=query_rotated.unsqueeze(2),
         key=key_ascend,
@@ -386,6 +425,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         sparse_mode=0,
     )
     torch.npu.synchronize()
+    cpu_attention = decode_attention_reference(
+        query,
+        key_cpu,
+        value_cpu,
+        args.sequence_lengths,
+        hadamard if args.decode_implementation == "reference" else compute_rotation,
+        scale=1 / math.sqrt(args.head_dim),
+    )
+    packed_cpu_reference = close_result(
+        packed_output.cpu(),
+        cpu_attention.to(packed_output.dtype),
+        atol=2.0e-2,
+        rtol=2.0e-2,
+    )
     attention_agreement = close_result(
         fused_output.squeeze(2),
         packed_output,
@@ -402,9 +455,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and key_implementation["passed"]
         and value_implementation["passed"]
         and attention_agreement["passed"]
+        and key_cpu_reference["passed"]
+        and value_cpu_reference["passed"]
+        and packed_cpu_reference["passed"]
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "passed": passed,
         "configuration": {
             **vars(args),
@@ -426,6 +482,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "ascend_key_vs_triton": key_implementation,
             "ascend_value_vs_triton": value_implementation,
             "ascend_fia_vs_packed_decode": attention_agreement,
+            "triton_key_vs_cpu_reference": key_cpu_reference,
+            "triton_value_vs_cpu_reference": value_cpu_reference,
+            "packed_decode_vs_cpu_reference": packed_cpu_reference,
         },
         "quantization_error": {
             "rotated_key": key_quantization,

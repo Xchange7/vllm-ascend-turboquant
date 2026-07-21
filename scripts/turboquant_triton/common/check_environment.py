@@ -90,6 +90,7 @@ def main() -> None:
 
     print(f"vLLM:          {vllm.__version__}")
     print(f"vLLM source:   {vllm.__file__}")
+    print(f"vLLM commit:   {_source_commit(vllm.__file__)}")
     print(f"vLLM Ascend:   {_version('vllm-ascend')}")
     print(f"Ascend source: {vllm_ascend.__file__}")
     print(f"Ascend commit: {_source_commit(vllm_ascend.__file__)}")

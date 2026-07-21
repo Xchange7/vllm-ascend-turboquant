@@ -3,6 +3,7 @@
 本目录只测试 TurboQuant 的底层算子，不负责启动模型服务。测试覆盖：
 
 - Triton 量化写入，包括负 `slot_mapping` 不写 Cache；
+- 独立 CPU/PyTorch reference 对 Cache 字节的解包、反量化和 attention；
 - AscendC paged-dequant 与 Triton dequant 的数值一致性；
 - 紧凑 active-page 调度、四档 head dimension tiling key 和 out-style 输出别名；
 - AscendC dequant + FIA 与直接读取压缩 Cache 的 Triton decode 一致性；
@@ -83,8 +84,22 @@ SOC_VERSION=ascend910b4 DEVICE=0 \
 bash scripts/turboquant_operators/run_smoke.sh
 ```
 
-该入口测试三个 Cache preset 的 FP16 正确性，并运行一个 B=2、S=512 的短性能用例。
+该入口测试三个 Cache preset 的 FP16 正确性、Qwen3-0.6B 对应的
+`Hq=16/Hkv=8/D=128/BF16/splits=1` 路径，并运行一个 B=2、S=512 的短性能用例。
 算子注册检查会同时要求 return-style 和 out-style 两个 schema，因此拉取本次改动后必须重新编译。
+
+## 正确性定向定位
+
+当端到端生成从第二个 token 开始分叉时，先运行不含性能测试的定位矩阵：
+
+```bash
+SOC_VERSION=ascend910b4 DEVICE=0 \
+bash scripts/turboquant_operators/run_correctness_debug.sh
+```
+
+该脚本对比 `Hkv=2/8`、`splits=1/4` 和 `auto/reference` rotation，所有用例都使用 BF16、D=128，并同时输出
+CPU reference、Triton 和 AscendC 三方结果。通常只需回传生成目录中的 `summary.md`；
+若某一行失败，再补充对应的 `accuracy.json`。
 
 ## 完整性能矩阵
 
@@ -139,6 +154,8 @@ bash scripts/turboquant_operators/run_profile.sh
 主要指标含义：
 
 - `K/V impl max` 应处于脚本给定容差内，它验证 AscendC 和 Triton 解码同一份 Cache；
+- `triton_*_vs_cpu_reference` 直接按 CPU 上的 Cache 字节解包，不依赖 Triton 或 AscendC；
+- `packed_decode_vs_cpu_reference` 使用普通 PyTorch FP32 attention 作为独立结果基准；
 - `Attention max` 验证 AscendC + FIA 和 packed Triton decode 的最终输出；
 - `K/V NMSE` 衡量量化算法误差，不要求接近零；
 - `Packed/native > 1` 表示压缩 Cache decode 比原生 paged attention 更快；

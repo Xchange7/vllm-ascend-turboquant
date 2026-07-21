@@ -38,6 +38,21 @@ for cache_dtype in ${CACHE_DTYPES}; do
         | tee "${case_dir}/accuracy.log"
 done
 
+printf '\n== Qwen3-0.6B decode shape correctness ==\n'
+qwen_case_dir="${OUTPUT_DIR}/accuracy_qwen3_0_6b_bfloat16"
+mkdir -p "${qwen_case_dir}"
+"${PYTHON_BIN}" "${SCRIPT_DIR}/operator_accuracy.py" \
+    --cache-dtype turboquant_4bit_nc \
+    --activation-dtype bfloat16 \
+    --sequence-lengths 1 17 129 \
+    --num-query-heads 16 \
+    --num-kv-heads 8 \
+    --head-dim 128 \
+    --num-kv-splits 1 \
+    --device "${DEVICE}" \
+    --output "${qwen_case_dir}/accuracy.json" \
+    | tee "${qwen_case_dir}/accuracy.log"
+
 printf '\n== Short latency benchmark ==\n'
 profile_dir="${OUTPUT_DIR}/profile_b2_s512"
 "${PYTHON_BIN}" "${TQ_PROFILE_SCRIPT}" \

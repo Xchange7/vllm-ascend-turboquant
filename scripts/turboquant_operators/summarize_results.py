@@ -48,6 +48,9 @@ def load_accuracy(root: Path) -> list[dict[str, Any]]:
                 "key_impl_max_abs": checks["ascend_key_vs_triton"]["max_abs"],
                 "value_impl_max_abs": checks["ascend_value_vs_triton"]["max_abs"],
                 "attention_max_abs": checks["ascend_fia_vs_packed_decode"]["max_abs"],
+                "key_cpu_max_abs": checks["triton_key_vs_cpu_reference"]["max_abs"],
+                "value_cpu_max_abs": checks["triton_value_vs_cpu_reference"]["max_abs"],
+                "attention_cpu_max_abs": checks["packed_decode_vs_cpu_reference"]["max_abs"],
                 "key_quant_nmse": quantization["rotated_key"]["nmse"],
                 "value_quant_nmse": quantization["value"]["nmse"],
                 "compression_ratio": report["layout"]["capacity_compression_ratio"],
@@ -109,14 +112,17 @@ def markdown(
             [
                 "## Correctness",
                 "",
-                "| Case | Cache | Dtype | Pass | K impl max | V impl max | "
-                "Attention max | K NMSE | V NMSE | Compression |",
-                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Case | Cache | Dtype | Pass | K CPU max | V CPU max | "
+                "Attention CPU max | K impl max | V impl max | Attention impl max | "
+                "K NMSE | V NMSE | Compression |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for row in accuracy:
             lines.append(
                 "| {case} | {cache_dtype} | {activation_dtype} | {passed} | "
+                "{key_cpu_max_abs:.3e} | {value_cpu_max_abs:.3e} | "
+                "{attention_cpu_max_abs:.3e} | "
                 "{key_impl_max_abs:.3e} | {value_impl_max_abs:.3e} | "
                 "{attention_max_abs:.3e} | {key_quant_nmse:.3e} | "
                 "{value_quant_nmse:.3e} | {compression_ratio:.3f}x |".format(**row)
