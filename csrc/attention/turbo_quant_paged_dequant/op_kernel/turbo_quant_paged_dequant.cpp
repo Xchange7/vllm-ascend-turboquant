@@ -301,31 +301,80 @@ extern "C" __global__ __aicore__ void turbo_quant_paged_dequant(GM_ADDR query, G
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   GET_TILING_DATA(tilingData, tiling);
 
-#define TURBOQUANT_TILING_KEY(KEY_BITS, VALUE_BITS, NORM_CORRECTION, HEAD_DIM) \
-  ((KEY_BITS) * 100000UL + (VALUE_BITS) * 10000UL + (NORM_CORRECTION) * 1000UL + (HEAD_DIM))
-#define RUN_TURBOQUANT_VARIANT(KEY_BITS, VALUE_BITS, NORM_CORRECTION, HEAD_DIM)                    \
-  if (TILING_KEY_IS(TURBOQUANT_TILING_KEY(KEY_BITS, VALUE_BITS, NORM_CORRECTION, HEAD_DIM))) {     \
-    KernelTurboQuantPagedDequant<DTYPE_QUERY, HEAD_DIM, KEY_BITS, VALUE_BITS, NORM_CORRECTION> op; \
-    op.Init(kvCache, blockTable, seqLens, pageTable, centroids, key, value, tilingData);           \
-    op.Process();                                                                                  \
-    return;                                                                                        \
+  // CANN discovers relocatable kernel entries from literal TILING_KEY_IS
+  // invocations before regular C++ macro expansion. Keep these branches
+  // explicit so every host-generated key has a matching binary entry.
+#define RUN_TURBOQUANT_VARIANT(HEAD_DIM, KEY_BITS, VALUE_BITS, NORM_CORRECTION)                  \
+  KernelTurboQuantPagedDequant<DTYPE_QUERY, HEAD_DIM, KEY_BITS, VALUE_BITS, NORM_CORRECTION> op; \
+  op.Init(kvCache, blockTable, seqLens, pageTable, centroids, key, value, tilingData);           \
+  op.Process();                                                                                  \
+  return
+
+  if (TILING_KEY_IS(330032)) {
+    RUN_TURBOQUANT_VARIANT(32, 3, 3, false);
+  } else if (TILING_KEY_IS(330064)) {
+    RUN_TURBOQUANT_VARIANT(64, 3, 3, false);
+  } else if (TILING_KEY_IS(330128)) {
+    RUN_TURBOQUANT_VARIANT(128, 3, 3, false);
+  } else if (TILING_KEY_IS(330256)) {
+    RUN_TURBOQUANT_VARIANT(256, 3, 3, false);
+  } else if (TILING_KEY_IS(331032)) {
+    RUN_TURBOQUANT_VARIANT(32, 3, 3, true);
+  } else if (TILING_KEY_IS(331064)) {
+    RUN_TURBOQUANT_VARIANT(64, 3, 3, true);
+  } else if (TILING_KEY_IS(331128)) {
+    RUN_TURBOQUANT_VARIANT(128, 3, 3, true);
+  } else if (TILING_KEY_IS(331256)) {
+    RUN_TURBOQUANT_VARIANT(256, 3, 3, true);
+  } else if (TILING_KEY_IS(340032)) {
+    RUN_TURBOQUANT_VARIANT(32, 3, 4, false);
+  } else if (TILING_KEY_IS(340064)) {
+    RUN_TURBOQUANT_VARIANT(64, 3, 4, false);
+  } else if (TILING_KEY_IS(340128)) {
+    RUN_TURBOQUANT_VARIANT(128, 3, 4, false);
+  } else if (TILING_KEY_IS(340256)) {
+    RUN_TURBOQUANT_VARIANT(256, 3, 4, false);
+  } else if (TILING_KEY_IS(341032)) {
+    RUN_TURBOQUANT_VARIANT(32, 3, 4, true);
+  } else if (TILING_KEY_IS(341064)) {
+    RUN_TURBOQUANT_VARIANT(64, 3, 4, true);
+  } else if (TILING_KEY_IS(341128)) {
+    RUN_TURBOQUANT_VARIANT(128, 3, 4, true);
+  } else if (TILING_KEY_IS(341256)) {
+    RUN_TURBOQUANT_VARIANT(256, 3, 4, true);
+  } else if (TILING_KEY_IS(430032)) {
+    RUN_TURBOQUANT_VARIANT(32, 4, 3, false);
+  } else if (TILING_KEY_IS(430064)) {
+    RUN_TURBOQUANT_VARIANT(64, 4, 3, false);
+  } else if (TILING_KEY_IS(430128)) {
+    RUN_TURBOQUANT_VARIANT(128, 4, 3, false);
+  } else if (TILING_KEY_IS(430256)) {
+    RUN_TURBOQUANT_VARIANT(256, 4, 3, false);
+  } else if (TILING_KEY_IS(431032)) {
+    RUN_TURBOQUANT_VARIANT(32, 4, 3, true);
+  } else if (TILING_KEY_IS(431064)) {
+    RUN_TURBOQUANT_VARIANT(64, 4, 3, true);
+  } else if (TILING_KEY_IS(431128)) {
+    RUN_TURBOQUANT_VARIANT(128, 4, 3, true);
+  } else if (TILING_KEY_IS(431256)) {
+    RUN_TURBOQUANT_VARIANT(256, 4, 3, true);
+  } else if (TILING_KEY_IS(440032)) {
+    RUN_TURBOQUANT_VARIANT(32, 4, 4, false);
+  } else if (TILING_KEY_IS(440064)) {
+    RUN_TURBOQUANT_VARIANT(64, 4, 4, false);
+  } else if (TILING_KEY_IS(440128)) {
+    RUN_TURBOQUANT_VARIANT(128, 4, 4, false);
+  } else if (TILING_KEY_IS(440256)) {
+    RUN_TURBOQUANT_VARIANT(256, 4, 4, false);
+  } else if (TILING_KEY_IS(441032)) {
+    RUN_TURBOQUANT_VARIANT(32, 4, 4, true);
+  } else if (TILING_KEY_IS(441064)) {
+    RUN_TURBOQUANT_VARIANT(64, 4, 4, true);
+  } else if (TILING_KEY_IS(441128)) {
+    RUN_TURBOQUANT_VARIANT(128, 4, 4, true);
+  } else if (TILING_KEY_IS(441256)) {
+    RUN_TURBOQUANT_VARIANT(256, 4, 4, true);
   }
-#define RUN_TURBOQUANT_HEAD_DIMS(KEY_BITS, VALUE_BITS, NORM_CORRECTION) \
-  RUN_TURBOQUANT_VARIANT(KEY_BITS, VALUE_BITS, NORM_CORRECTION, 32)     \
-  RUN_TURBOQUANT_VARIANT(KEY_BITS, VALUE_BITS, NORM_CORRECTION, 64)     \
-  RUN_TURBOQUANT_VARIANT(KEY_BITS, VALUE_BITS, NORM_CORRECTION, 128)    \
-  RUN_TURBOQUANT_VARIANT(KEY_BITS, VALUE_BITS, NORM_CORRECTION, 256)
 
-  RUN_TURBOQUANT_HEAD_DIMS(3, 3, 0)
-  RUN_TURBOQUANT_HEAD_DIMS(3, 3, 1)
-  RUN_TURBOQUANT_HEAD_DIMS(3, 4, 0)
-  RUN_TURBOQUANT_HEAD_DIMS(3, 4, 1)
-  RUN_TURBOQUANT_HEAD_DIMS(4, 3, 0)
-  RUN_TURBOQUANT_HEAD_DIMS(4, 3, 1)
-  RUN_TURBOQUANT_HEAD_DIMS(4, 4, 0)
-  RUN_TURBOQUANT_HEAD_DIMS(4, 4, 1)
-
-#undef RUN_TURBOQUANT_HEAD_DIMS
 #undef RUN_TURBOQUANT_VARIANT
-#undef TURBOQUANT_TILING_KEY
 }

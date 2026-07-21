@@ -182,7 +182,7 @@ def build_inputs(args: argparse.Namespace):
             dtype=dtype,
             device=device,
         )
-        value = torch.randn_like(key)
+        value = torch.randn(key.shape, dtype=key.dtype, device=key.device)
         positions = torch.arange(sequence_length, dtype=torch.int64, device=device)
         request_blocks = block_table[request_index, positions // args.block_size]
         slots = request_blocks.to(torch.int64) * args.block_size + positions % args.block_size
@@ -267,7 +267,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     triton_turboquant_store(
         invalid_key,
-        torch.randn_like(invalid_key),
+        torch.randn(
+            invalid_key.shape,
+            dtype=invalid_key.dtype,
+            device=invalid_key.device,
+        ),
         cache,
         torch.tensor([-1], dtype=torch.int64, device=key.device),
         hadamard,
