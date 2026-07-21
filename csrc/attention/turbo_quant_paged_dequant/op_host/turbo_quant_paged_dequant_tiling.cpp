@@ -129,7 +129,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   tiling.set_normCorrection(*normCorrection ? 1U : 0U);
   tiling.set_totalTasks(static_cast<uint32_t>(totalTasks));
 
-  const auto* platformInfo = context->GetPlatformInfo();
+  auto* platformInfo = context->GetPlatformInfo();
   OPS_CHECK(platformInfo == nullptr, OPS_LOG_E(nodeName, "platform info is nullptr"), return ge::GRAPH_FAILED);
   auto platform = platform_ascendc::PlatformAscendC(platformInfo);
   const uint32_t aivCoreCount = platform.GetCoreNumAiv();
