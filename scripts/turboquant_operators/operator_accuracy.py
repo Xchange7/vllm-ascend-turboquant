@@ -22,6 +22,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import torch_npu
+from operator_quality_gate import (
+    evaluate_quantization_quality,
+    resolve_thresholds,
+)
 from turboquant_reference import (
     decode_attention_reference,
     dequantize_paged_cache_reference,
@@ -80,6 +84,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--max-key-nmse", type=float)
+    parser.add_argument("--max-value-nmse", type=float)
+    parser.add_argument("--min-key-cosine", type=float)
+    parser.add_argument("--min-value-cosine", type=float)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -389,6 +397,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         key_rotated_reference = (key.reshape(-1, args.head_dim) @ compute_rotation).reshape_as(key)
     key_quantization = error_metrics(key_cpu, key_rotated_reference.cpu())
     value_quantization = error_metrics(value_cpu, value.cpu())
+    quantization_quality = evaluate_quantization_quality(
+        key_quantization,
+        value_quantization,
+        resolve_thresholds(
+            args.cache_dtype,
+            max_key_nmse=args.max_key_nmse,
+            max_value_nmse=args.max_value_nmse,
+            min_key_cosine=args.min_key_cosine,
+            min_value_cosine=args.min_value_cosine,
+        ),
+    )
 
     packed_output = triton_turboquant_decode_attention(
         query,
@@ -458,9 +477,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and key_cpu_reference["passed"]
         and value_cpu_reference["passed"]
         and packed_cpu_reference["passed"]
+        and quantization_quality["passed"]
     )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "passed": passed,
         "configuration": {
             **vars(args),
@@ -485,6 +505,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "triton_key_vs_cpu_reference": key_cpu_reference,
             "triton_value_vs_cpu_reference": value_cpu_reference,
             "packed_decode_vs_cpu_reference": packed_cpu_reference,
+            "quantization_quality": quantization_quality,
         },
         "quantization_error": {
             "rotated_key": key_quantization,

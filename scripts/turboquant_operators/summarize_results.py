@@ -37,6 +37,7 @@ def load_accuracy(root: Path) -> list[dict[str, Any]]:
         config = report["configuration"]
         checks = report["checks"]
         quantization = report["quantization_error"]
+        quality = checks.get("quantization_quality", {})
         rows.append(
             {
                 "case": relative_case(path, root),
@@ -44,6 +45,7 @@ def load_accuracy(root: Path) -> list[dict[str, Any]]:
                 "activation_dtype": config["activation_dtype"],
                 "sequence_lengths": ",".join(map(str, config["sequence_lengths"])),
                 "passed": report["passed"],
+                "quantization_quality_passed": quality.get("passed", True),
                 "negative_slot_mapping": checks["negative_slot_mapping_preserves_cache"],
                 "key_impl_max_abs": checks["ascend_key_vs_triton"]["max_abs"],
                 "value_impl_max_abs": checks["ascend_value_vs_triton"]["max_abs"],
@@ -53,6 +55,8 @@ def load_accuracy(root: Path) -> list[dict[str, Any]]:
                 "attention_cpu_max_abs": checks["packed_decode_vs_cpu_reference"]["max_abs"],
                 "key_quant_nmse": quantization["rotated_key"]["nmse"],
                 "value_quant_nmse": quantization["value"]["nmse"],
+                "key_nmse_limit": quality.get("thresholds", {}).get("max_key_nmse"),
+                "value_nmse_limit": quality.get("thresholds", {}).get("max_value_nmse"),
                 "compression_ratio": report["layout"]["capacity_compression_ratio"],
                 "report": str(path),
             }
@@ -114,8 +118,8 @@ def markdown(
                 "",
                 "| Case | Cache | Dtype | Pass | K CPU max | V CPU max | "
                 "Attention CPU max | K impl max | V impl max | Attention impl max | "
-                "K NMSE | V NMSE | Compression |",
-                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "Quant pass | K NMSE / limit | V NMSE / limit | Compression |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
             ]
         )
         for row in accuracy:
@@ -124,8 +128,13 @@ def markdown(
                 "{key_cpu_max_abs:.3e} | {value_cpu_max_abs:.3e} | "
                 "{attention_cpu_max_abs:.3e} | "
                 "{key_impl_max_abs:.3e} | {value_impl_max_abs:.3e} | "
-                "{attention_max_abs:.3e} | {key_quant_nmse:.3e} | "
-                "{value_quant_nmse:.3e} | {compression_ratio:.3f}x |".format(**row)
+                "{attention_max_abs:.3e} | {quantization_quality_passed} | "
+                "{key_quant_nmse:.3e} / {key_limit} | "
+                "{value_quant_nmse:.3e} / {value_limit} | {compression_ratio:.3f}x |".format(
+                    **row,
+                    key_limit=(f"{row['key_nmse_limit']:.3e}" if row["key_nmse_limit"] is not None else "n/a"),
+                    value_limit=(f"{row['value_nmse_limit']:.3e}" if row["value_nmse_limit"] is not None else "n/a"),
+                )
             )
         lines.append("")
     if benchmarks:

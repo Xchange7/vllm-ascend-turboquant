@@ -127,6 +127,14 @@ def test_execute_requests_reaches_requested_concurrency(capsys) -> None:
     assert "mean TTFT=" in output
 
 
+def test_run_benchmark_rejects_unreached_reported_concurrency() -> None:
+    benchmark = load_script("serving_benchmark.py")
+    args = argparse.Namespace(requests=4, warmup_requests=0, concurrency=8)
+
+    with pytest.raises(ValueError, match=r"--requests \(4\).*--concurrency \(8\)"):
+        benchmark.run_benchmark(args)
+
+
 def test_compare_reports_calculates_effective_compression(tmp_path: Path) -> None:
     benchmark = load_script("serving_benchmark.py")
     native_path = tmp_path / "native.json"
@@ -167,6 +175,40 @@ def test_compare_reports_calculates_effective_compression(tmp_path: Path) -> Non
     tq_path.write_text(json.dumps(mismatched), encoding="utf-8")
     with pytest.raises(ValueError, match="concurrency"):
         benchmark.compare_reports(args)
+
+
+def test_compare_reports_fails_enabled_performance_gate(tmp_path: Path) -> None:
+    benchmark = load_script("serving_benchmark.py")
+    native_path = tmp_path / "native.json"
+    tq_path = tmp_path / "turboquant.json"
+    native_log = tmp_path / "native.log"
+    tq_log = tmp_path / "turboquant.log"
+    output = tmp_path / "comparison.json"
+    summary = tmp_path / "summary.md"
+    native_path.write_text(json.dumps(benchmark_report(0.10, 0.01)), encoding="utf-8")
+    tq_path.write_text(json.dumps(benchmark_report(0.30, 0.10)), encoding="utf-8")
+    native_log.write_text("NPU KV cache size: 10,000 tokens\n", encoding="utf-8")
+    tq_log.write_text("NPU KV cache size: 15,000 tokens\n", encoding="utf-8")
+    args = argparse.Namespace(
+        native=native_path,
+        turboquant=tq_path,
+        native_log=native_log,
+        turboquant_log=tq_log,
+        output=output,
+        summary_markdown=summary,
+        max_ttft_ratio=2.0,
+        max_tpot_ratio=2.0,
+        min_throughput_ratio=0.5,
+        min_kv_capacity_ratio=2.0,
+    )
+
+    assert benchmark.compare_reports(args) == 1
+    gates = json.loads(output.read_text(encoding="utf-8"))["performance_gates"]
+    assert gates["passed"] is False
+    assert gates["checks"]["ttft_ratio"]["passed"] is False
+    assert gates["checks"]["tpot_ratio"]["passed"] is False
+    assert gates["checks"]["kv_capacity_ratio"]["passed"] is False
+    assert "## Performance Gates" in summary.read_text(encoding="utf-8")
 
 
 def test_accuracy_context_budget_rejects_oversized_case() -> None:

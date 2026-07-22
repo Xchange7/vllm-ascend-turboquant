@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     compare.add_argument("--turboquant-log", type=Path, required=True)
     compare.add_argument("--output", type=Path, required=True)
     compare.add_argument("--summary-markdown", type=Path, required=True)
+    compare.add_argument("--max-ttft-ratio", type=float)
+    compare.add_argument("--max-tpot-ratio", type=float)
+    compare.add_argument("--min-throughput-ratio", type=float)
+    compare.add_argument("--min-kv-capacity-ratio", type=float)
     return parser.parse_args()
 
 
@@ -247,6 +251,11 @@ def execute_requests(
 def run_benchmark(args: argparse.Namespace) -> int:
     if args.requests <= 0 or args.warmup_requests < 0 or args.concurrency <= 0:
         raise ValueError("Request and concurrency counts must be positive; warmup count must be non-negative")
+    if args.requests < args.concurrency:
+        raise ValueError(
+            f"--requests ({args.requests}) must be at least --concurrency ({args.concurrency}) "
+            "so the benchmark reaches the reported concurrency"
+        )
     prompt, actual_input_tokens = build_prompt(args.model, args.input_tokens)
     total_budget = actual_input_tokens + args.output_tokens
     if total_budget > args.max_model_len:
@@ -325,6 +334,60 @@ def relative_change(native: float, turboquant: float) -> float:
     return (turboquant / native - 1.0) * 100.0
 
 
+def build_performance_gates(
+    metrics: dict[str, dict[str, float]],
+    compression: dict[str, float] | None,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    gate_specs = {
+        "ttft_ratio": (
+            metrics["ttft_seconds"]["turboquant_mean"] / metrics["ttft_seconds"]["native_mean"],
+            "maximum",
+            getattr(args, "max_ttft_ratio", None),
+        ),
+        "tpot_ratio": (
+            metrics["tpot_seconds"]["turboquant_mean"] / metrics["tpot_seconds"]["native_mean"],
+            "maximum",
+            getattr(args, "max_tpot_ratio", None),
+        ),
+        "aggregate_throughput_ratio": (
+            metrics["aggregate_output_tokens_per_second"]["turboquant_mean"]
+            / metrics["aggregate_output_tokens_per_second"]["native_mean"],
+            "minimum",
+            getattr(args, "min_throughput_ratio", None),
+        ),
+        "kv_capacity_ratio": (
+            compression["capacity_ratio"] if compression is not None else None,
+            "minimum",
+            getattr(args, "min_kv_capacity_ratio", None),
+        ),
+    }
+    checks = {}
+    for name, (actual, direction, limit) in gate_specs.items():
+        enabled = limit is not None
+        if enabled and (not math.isfinite(limit) or limit <= 0):
+            raise ValueError(f"Performance gate for {name} must be finite and positive")
+        if not enabled:
+            passed = True
+        elif actual is None:
+            passed = False
+        elif direction == "maximum":
+            passed = actual <= limit
+        else:
+            passed = actual >= limit
+        checks[name] = {
+            "enabled": enabled,
+            "passed": passed,
+            "actual": actual,
+            "direction": direction,
+            "limit": limit,
+        }
+    return {
+        "passed": all(check["passed"] for check in checks.values()),
+        "checks": checks,
+    }
+
+
 def compare_reports(args: argparse.Namespace) -> int:
     native = json.loads(args.native.read_text(encoding="utf-8"))
     turboquant = json.loads(args.turboquant.read_text(encoding="utf-8"))
@@ -380,6 +443,7 @@ def compare_reports(args: argparse.Namespace) -> int:
         },
         "kv_cache_compression": compression,
         "metrics": metrics,
+        "performance_gates": build_performance_gates(metrics, compression, args),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.summary_markdown.parent.mkdir(parents=True, exist_ok=True)
@@ -429,10 +493,27 @@ def compare_reports(args: argparse.Namespace) -> int:
             ]
         )
     lines.append("")
+    lines.extend(
+        [
+            "## Performance Gates",
+            "",
+            "| Gate | Actual | Requirement | Pass |",
+            "| --- | ---: | ---: | --- |",
+        ]
+    )
+    for name, check in report["performance_gates"]["checks"].items():
+        if not check["enabled"]:
+            continue
+        actual = "unavailable" if check["actual"] is None else f"{check['actual']:.4f}x"
+        operator = "<=" if check["direction"] == "maximum" else ">="
+        lines.append(f"| {name} | {actual} | {operator} {check['limit']:.4f}x | {check['passed']} |")
+    if not any(check["enabled"] for check in report["performance_gates"]["checks"].values()):
+        lines.append("| none | n/a | n/a | True |")
+    lines.append("")
     args.summary_markdown.write_text("\n".join(lines), encoding="utf-8")
     print(json.dumps(report, indent=2))
     print(f"Summary: {args.summary_markdown}")
-    return 0
+    return 0 if report["performance_gates"]["passed"] else 1
 
 
 def main() -> None:

@@ -88,6 +88,50 @@ bash scripts/turboquant_operators/run_smoke.sh
 `Hq=16/Hkv=8/D=128/BF16/splits=1` 路径，并运行一个 B=2、S=512 的短性能用例。
 算子注册检查会同时要求 return-style 和 out-style 两个 schema，因此拉取本次改动后必须重新编译。
 
+`operator_accuracy.py` 的最终 PASS 现在同时要求：实现间结果一致、CPU reference 一致、
+attention 输出一致，以及量化 NMSE/余弦相似度通过分档门禁。这样可以避免 Triton、AscendC 和
+CPU 解包同时正确读取一份错误 Cache 字节时产生假阳性。默认门禁是回归筛查值，可通过
+`--max-key-nmse`、`--max-value-nmse`、`--min-key-cosine` 和
+`--min-value-cosine` 覆盖。
+
+## 910B4 完整验证
+
+完整入口按顺序执行：环境与源码校验、真实 ACLNN 启动探针、三种量化 preset 与 Qwen3 BF16
+算子正确性、kernel/ACLGraph 测试、B16/S16K 算子性能、模型文本与 logprob 精度、质量题、
+spec decode/ACLGraph，以及 TP4 长上下文并发 1/16 的 TTFT、TPOT、吞吐和 KV Cache 容量对比。
+
+```bash
+MODEL=/run/test_llm/Qwen3-32B \
+VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 NETWORK_IFNAME=eth0 \
+SOC_VERSION=ascend910b4 \
+bash scripts/turboquant_operators/run_full_validation.sh
+```
+
+首次验证可先运行快速模式。它保留 ABI、算子正确性、kernel、长上下文算子性能、模型精度和
+eager serving，仅跳过耗时较长的质量、ACLGraph/spec 和 graph serving 阶段：
+
+```bash
+QUICK=1 MODEL=/run/test_llm/Qwen3-32B \
+bash scripts/turboquant_operators/run_full_validation.sh
+```
+
+真实算子探针在独立 Python 进程中使用 `ASCEND_LAUNCH_BLOCKING=1` 执行一次
+`npu_turboquant_paged_dequant_out`。同步只用于错误定位，不会泄漏到后续性能阶段。探针还会
+记录进程实际加载的 `vllm_ascend_C`、`libopapi`/`libcust_opapi` 路径和 SHA256，用于定位
+Python 扩展与 OPP 安装包不匹配造成的段错误。
+
+完整结果位于 `logs/turboquant/full_910b4_<timestamp>/`，重点查看 `summary.txt` 和
+`results.tsv`。即使中间阶段失败，脚本默认继续执行其余阶段并最终返回非零；设置
+`FAIL_FAST=1` 可在首个失败处停止。若只需选择性执行，可使用 `RUN_RUNTIME_PROBE`、
+`RUN_OPERATOR_CORRECTNESS`、`RUN_KERNELS`、`RUN_OPERATOR_PROFILE`、`RUN_ACCURACY`、
+`RUN_QUALITY`、`RUN_GRAPH`、`RUN_SERVING_EAGER` 和 `RUN_SERVING_GRAPH` 开关。
+通过 `PERF_CONCURRENCY_LEVELS="1 4 16"` 可修改 serving 并发矩阵；多个并发会复用同一个
+native 或 TurboQuant 服务进程，避免重复加载模型。
+全量入口默认要求 TTFT/TPOT 不超过 baseline 的 2 倍、聚合输出吞吐不低于 baseline 的 50%，
+且 KV token capacity 至少达到 baseline 的 2 倍。门禁仅用于发现明显回退，可通过
+`PERF_MAX_TTFT_RATIO`、`PERF_MAX_TPOT_RATIO`、`PERF_MIN_THROUGHPUT_RATIO` 和
+`PERF_MIN_KV_CAPACITY_RATIO` 调整。
+
 ## 正确性定向定位
 
 当端到端生成从第二个 token 开始分叉时，先运行不含性能测试的定位矩阵：

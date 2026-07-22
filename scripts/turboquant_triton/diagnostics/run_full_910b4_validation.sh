@@ -36,6 +36,8 @@ else
 fi
 
 RUN_KERNELS="${RUN_KERNELS:-1}"
+RUN_RUNTIME_PROBE="${RUN_RUNTIME_PROBE:-1}"
+RUN_OPERATOR_CORRECTNESS="${RUN_OPERATOR_CORRECTNESS:-1}"
 RUN_OPERATOR_PROFILE="${RUN_OPERATOR_PROFILE:-1}"
 RUN_ACCURACY="${RUN_ACCURACY:-1}"
 RUN_QUALITY="${RUN_QUALITY:-${DEFAULT_RUN_QUALITY}}"
@@ -58,8 +60,13 @@ PERF_MAX_MODEL_LEN="${PERF_MAX_MODEL_LEN:-16384}"
 PERF_INPUT_TOKENS="${PERF_INPUT_TOKENS:-12288}"
 PERF_OUTPUT_TOKENS="${PERF_OUTPUT_TOKENS:-256}"
 PERF_CONCURRENCY="${PERF_CONCURRENCY:-16}"
+PERF_CONCURRENCY_LEVELS="${PERF_CONCURRENCY_LEVELS:-1 ${PERF_CONCURRENCY}}"
 PERF_WARMUP_REQUESTS="${PERF_WARMUP_REQUESTS:-16}"
 PERF_MEASURE_REQUESTS="${PERF_MEASURE_REQUESTS:-${DEFAULT_MEASURE_REQUESTS}}"
+PERF_MAX_TTFT_RATIO="${PERF_MAX_TTFT_RATIO:-2.0}"
+PERF_MAX_TPOT_RATIO="${PERF_MAX_TPOT_RATIO:-2.0}"
+PERF_MIN_THROUGHPUT_RATIO="${PERF_MIN_THROUGHPUT_RATIO:-0.5}"
+PERF_MIN_KV_CAPACITY_RATIO="${PERF_MIN_KV_CAPACITY_RATIO:-2.0}"
 
 RESULTS_FILE="${RUN_ROOT}/results.tsv"
 COMBINED_LOG="${RUN_ROOT}/combined.log"
@@ -86,6 +93,7 @@ export PYTHONUNBUFFERED=1
 write_configuration() {
     {
         printf 'MODEL=%q\n' "${MODEL}"
+        printf 'SOC_VERSION=%q\n' "${SOC_VERSION:-<unset>}"
         printf 'VISIBLE_DEVICES=%q\n' "${VISIBLE_DEVICES}"
         printf 'TP_SIZE=%q\n' "${TP_SIZE}"
         printf 'NETWORK_IFNAME=%q\n' "${NETWORK_IFNAME}"
@@ -95,6 +103,8 @@ write_configuration() {
         printf 'GPU_MEMORY_UTILIZATION=%q\n' "${GPU_MEMORY_UTILIZATION}"
         printf 'QUICK=%q\n' "${QUICK}"
         printf 'RUN_KERNELS=%q\n' "${RUN_KERNELS}"
+        printf 'RUN_RUNTIME_PROBE=%q\n' "${RUN_RUNTIME_PROBE}"
+        printf 'RUN_OPERATOR_CORRECTNESS=%q\n' "${RUN_OPERATOR_CORRECTNESS}"
         printf 'RUN_OPERATOR_PROFILE=%q\n' "${RUN_OPERATOR_PROFILE}"
         printf 'RUN_ACCURACY=%q\n' "${RUN_ACCURACY}"
         printf 'RUN_QUALITY=%q\n' "${RUN_QUALITY}"
@@ -105,8 +115,13 @@ write_configuration() {
         printf 'PERF_INPUT_TOKENS=%q\n' "${PERF_INPUT_TOKENS}"
         printf 'PERF_OUTPUT_TOKENS=%q\n' "${PERF_OUTPUT_TOKENS}"
         printf 'PERF_CONCURRENCY=%q\n' "${PERF_CONCURRENCY}"
+        printf 'PERF_CONCURRENCY_LEVELS=%q\n' "${PERF_CONCURRENCY_LEVELS}"
         printf 'PERF_WARMUP_REQUESTS=%q\n' "${PERF_WARMUP_REQUESTS}"
         printf 'PERF_MEASURE_REQUESTS=%q\n' "${PERF_MEASURE_REQUESTS}"
+        printf 'PERF_MAX_TTFT_RATIO=%q\n' "${PERF_MAX_TTFT_RATIO}"
+        printf 'PERF_MAX_TPOT_RATIO=%q\n' "${PERF_MAX_TPOT_RATIO}"
+        printf 'PERF_MIN_THROUGHPUT_RATIO=%q\n' "${PERF_MIN_THROUGHPUT_RATIO}"
+        printf 'PERF_MIN_KV_CAPACITY_RATIO=%q\n' "${PERF_MIN_KV_CAPACITY_RATIO}"
     } >"${CONFIG_FILE}"
 }
 
@@ -218,6 +233,49 @@ finalize() {
 }
 
 collect_preflight() {
+    local concurrency
+    local numeric_name
+    local numeric_value
+    local concurrency_values=()
+    local seen_concurrencies=" "
+    for numeric_name in \
+        PERF_MAX_MODEL_LEN PERF_INPUT_TOKENS PERF_OUTPUT_TOKENS \
+        PERF_MEASURE_REQUESTS PERF_WARMUP_REQUESTS; do
+        numeric_value="${!numeric_name}"
+        if [[ ! "${numeric_value}" =~ ^[0-9]+$ ]]; then
+            printf '%s must be a non-negative integer; got %s.\n' \
+                "${numeric_name}" "${numeric_value}" >&2
+            return 2
+        fi
+    done
+    if ((
+        PERF_MAX_MODEL_LEN == 0 || PERF_INPUT_TOKENS == 0 ||
+            PERF_OUTPUT_TOKENS == 0 || PERF_MEASURE_REQUESTS == 0
+    )); then
+        printf 'Performance model length, token counts, and measured requests must be positive.\n' >&2
+        return 2
+    fi
+    read -r -a concurrency_values <<<"${PERF_CONCURRENCY_LEVELS}"
+    if ((${#concurrency_values[@]} == 0)); then
+        printf 'PERF_CONCURRENCY_LEVELS must contain at least one positive integer.\n' >&2
+        return 2
+    fi
+    for concurrency in "${concurrency_values[@]}"; do
+        if [[ ! "${concurrency}" =~ ^[1-9][0-9]*$ ]]; then
+            printf 'Invalid performance concurrency: %s\n' "${concurrency}" >&2
+            return 2
+        fi
+        if [[ "${seen_concurrencies}" == *" ${concurrency} "* ]]; then
+            printf 'Duplicate performance concurrency: %s\n' "${concurrency}" >&2
+            return 2
+        fi
+        seen_concurrencies+="${concurrency} "
+        if ((PERF_MEASURE_REQUESTS < concurrency)); then
+            printf 'PERF_MEASURE_REQUESTS=%s is smaller than concurrency %s.\n' \
+                "${PERF_MEASURE_REQUESTS}" "${concurrency}" >&2
+            return 2
+        fi
+    done
     if [[ ! -d "/sys/class/net/${NETWORK_IFNAME}" ]]; then
         printf 'Network interface does not exist: %s\n' "${NETWORK_IFNAME}" >&2
         return 2
@@ -234,8 +292,12 @@ collect_preflight() {
         fi
     done
 
-    python3 - "${REPO_ROOT}" "${MODEL}" "${TP_SIZE}" "${PORT}" <<'PY'
+    python3 - \
+        "${REPO_ROOT}" "${MODEL}" "${TP_SIZE}" "${PORT}" \
+        "${PERF_MAX_TTFT_RATIO}" "${PERF_MAX_TPOT_RATIO}" \
+        "${PERF_MIN_THROUGHPUT_RATIO}" "${PERF_MIN_KV_CAPACITY_RATIO}" <<'PY'
 import importlib.metadata
+import math
 import socket
 import sys
 from pathlib import Path
@@ -251,6 +313,16 @@ repo = Path(sys.argv[1]).resolve()
 model = Path(sys.argv[2]).resolve()
 tp_size = int(sys.argv[3])
 port = int(sys.argv[4])
+gate_names = (
+    "PERF_MAX_TTFT_RATIO",
+    "PERF_MAX_TPOT_RATIO",
+    "PERF_MIN_THROUGHPUT_RATIO",
+    "PERF_MIN_KV_CAPACITY_RATIO",
+)
+for name, raw_value in zip(gate_names, sys.argv[5:], strict=True):
+    value = float(raw_value)
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{name} must be finite and positive; got {raw_value}")
 
 if not (model / "config.json").is_file():
     raise RuntimeError(f"Model config is not readable: {model / 'config.json'}")
@@ -310,17 +382,76 @@ collect_source() {
     printf '\nKey source checksums:\n'
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum \
+            csrc/attention/turbo_quant_paged_dequant/op_kernel/turbo_quant_paged_dequant.cpp \
+            csrc/attention/turbo_quant_paged_dequant/op_host/turbo_quant_paged_dequant_tiling.cpp \
             vllm_ascend/attention/turboquant.py \
+            vllm_ascend/ops/turboquant.py \
             vllm_ascend/ops/triton/turboquant_store.py \
             vllm_ascend/ops/triton/turboquant_decode.py
     else
         shasum -a 256 \
+            csrc/attention/turbo_quant_paged_dequant/op_kernel/turbo_quant_paged_dequant.cpp \
+            csrc/attention/turbo_quant_paged_dequant/op_host/turbo_quant_paged_dequant_tiling.cpp \
             vllm_ascend/attention/turboquant.py \
+            vllm_ascend/ops/turboquant.py \
             vllm_ascend/ops/triton/turboquant_store.py \
             vllm_ascend/ops/triton/turboquant_decode.py
     fi
     printf '\nInstalled packages:\n'
     python3 -m pip show torch torch-npu triton-ascend vllm vllm-ascend || true
+}
+
+run_operator_correctness() {
+    local output_dir="${RUN_ROOT}/operator_correctness"
+    local failures=0
+    mkdir -p "${output_dir}"
+
+    run_operator_case() {
+        local case_name="$1"
+        shift
+        printf '\n--- operator case: %s ---\n' "${case_name}"
+        if ! env ASCEND_LAUNCH_BLOCKING=1 PYTHONFAULTHANDLER=1 \
+            python3 -u "${REPO_ROOT}/scripts/turboquant_operators/operator_accuracy.py" \
+            --device 0 \
+            --output "${output_dir}/${case_name}.json" \
+            "$@"; then
+            printf 'Operator case failed: %s\n' "${case_name}" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    run_operator_case 4bit_fp16 \
+        --cache-dtype turboquant_4bit_nc \
+        --activation-dtype float16 \
+        --sequence-lengths 133 65 \
+        --num-query-heads 16 --num-kv-heads 2 --head-dim 128 --num-kv-splits 4
+    run_operator_case k3v4_fp16 \
+        --cache-dtype turboquant_k3v4_nc \
+        --activation-dtype float16 \
+        --sequence-lengths 133 65 \
+        --num-query-heads 16 --num-kv-heads 2 --head-dim 128 --num-kv-splits 4
+    run_operator_case 3bit_fp16 \
+        --cache-dtype turboquant_3bit_nc \
+        --activation-dtype float16 \
+        --sequence-lengths 133 65 \
+        --num-query-heads 16 --num-kv-heads 2 --head-dim 128 --num-kv-splits 4
+    run_operator_case qwen3_bf16 \
+        --cache-dtype turboquant_4bit_nc \
+        --activation-dtype bfloat16 \
+        --sequence-lengths 1 17 129 \
+        --num-query-heads 16 --num-kv-heads 8 --head-dim 128 --num-kv-splits 1
+
+    if ! python3 "${REPO_ROOT}/scripts/turboquant_operators/summarize_results.py" \
+        --result-root "${output_dir}" \
+        --output-prefix "${output_dir}/summary"; then
+        printf 'Failed to summarize operator correctness reports.\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    if ((failures > 0)); then
+        printf '%s operator correctness case(s) failed.\n' "${failures}" >&2
+        return 1
+    fi
 }
 
 trap finalize EXIT
@@ -342,6 +473,31 @@ run_stage \
     "02_environment" \
     "vLLM 0.20.2 API, packed cache spec, workspace, and NPU checks" \
     python3 "${TQ_COMMON_DIR}/check_environment.py"
+
+if [[ "${RUN_RUNTIME_PROBE}" == "1" ]]; then
+    run_stage \
+        "02a_runtime_probe" \
+        "isolated synchronous ACLNN launch, output aliasing, and loaded-library fingerprints" \
+        env \
+        ASCEND_LAUNCH_BLOCKING=1 \
+        PYTHONFAULTHANDLER=1 \
+        python3 -u "${REPO_ROOT}/scripts/turboquant_operators/operator_runtime_probe.py" \
+        --device 0 \
+        --cache-dtype "${TQ_CACHE_DTYPE}" \
+        --activation-dtype "${ACTIVATION_DTYPE}" \
+        --output "${RUN_ROOT}/operator_runtime_probe.json"
+else
+    skip_stage "02a_runtime_probe" "RUN_RUNTIME_PROBE=0"
+fi
+
+if [[ "${RUN_OPERATOR_CORRECTNESS}" == "1" ]]; then
+    run_stage \
+        "02b_operator_correctness" \
+        "independent CPU, Triton, AscendC, attention, and quantization-quality gates" \
+        run_operator_correctness
+else
+    skip_stage "02b_operator_correctness" "RUN_OPERATOR_CORRECTNESS=0"
+fi
 
 if [[ "${RUN_KERNELS}" == "1" ]]; then
     run_stage \
@@ -488,11 +644,11 @@ SERVING_COMMON=(
     PORT="${PORT}"
     TP_SIZE="${TP_SIZE}"
     MAX_MODEL_LEN="${PERF_MAX_MODEL_LEN}"
-    MAX_NUM_SEQS="${PERF_CONCURRENCY}"
     GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}"
     INPUT_TOKENS="${PERF_INPUT_TOKENS}"
     OUTPUT_TOKENS="${PERF_OUTPUT_TOKENS}"
     CONCURRENCY="${PERF_CONCURRENCY}"
+    CONCURRENCY_LEVELS="${PERF_CONCURRENCY_LEVELS}"
     WARMUP_REQUESTS="${PERF_WARMUP_REQUESTS}"
     MEASURE_REQUESTS="${PERF_MEASURE_REQUESTS}"
     REQUEST_TIMEOUT="${REQUEST_TIMEOUT}"
@@ -500,12 +656,16 @@ SERVING_COMMON=(
     NATIVE_CACHE_DTYPE=auto
     TQ_CACHE_DTYPE="${TQ_CACHE_DTYPE}"
     VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION=auto
+    MAX_TTFT_RATIO="${PERF_MAX_TTFT_RATIO}"
+    MAX_TPOT_RATIO="${PERF_MAX_TPOT_RATIO}"
+    MIN_THROUGHPUT_RATIO="${PERF_MIN_THROUGHPUT_RATIO}"
+    MIN_KV_CAPACITY_RATIO="${PERF_MIN_KV_CAPACITY_RATIO}"
 )
 
 if [[ "${RUN_SERVING_EAGER}" == "1" ]]; then
     run_stage \
         "09_serving_eager" \
-        "native versus TurboQuant eager B16 long-context TTFT, TPOT, throughput, and cache capacity" \
+        "native versus TurboQuant eager B1/B16 long-context TTFT, TPOT, throughput, and cache capacity" \
         env -u ASCEND_LAUNCH_BLOCKING \
         "${SERVING_COMMON[@]}" \
         ENFORCE_EAGER=1 \
@@ -518,7 +678,7 @@ fi
 if [[ "${RUN_SERVING_GRAPH}" == "1" ]]; then
     run_stage \
         "10_serving_aclgraph" \
-        "native versus TurboQuant ACLGraph B16 long-context TTFT, TPOT, throughput, and cache capacity" \
+        "native versus TurboQuant ACLGraph B1/B16 long-context TTFT, TPOT, throughput, and cache capacity" \
         env -u ASCEND_LAUNCH_BLOCKING \
         "${SERVING_COMMON[@]}" \
         ENFORCE_EAGER=0 \

@@ -23,10 +23,19 @@ import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REFERENCE_PATH = REPO_ROOT / "scripts" / "turboquant_operators" / "turboquant_reference.py"
+QUALITY_GATE_PATH = REPO_ROOT / "scripts" / "turboquant_operators" / "operator_quality_gate.py"
 
 
 def load_reference():
     spec = importlib.util.spec_from_file_location("turboquant_operator_reference", REFERENCE_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_quality_gate():
+    spec = importlib.util.spec_from_file_location("turboquant_operator_quality_gate", QUALITY_GATE_PATH)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -139,3 +148,78 @@ def test_cpu_reference_attention_matches_torch_sdpa() -> None:
         token_start = token_end
 
     torch.testing.assert_close(actual, torch.stack(expected), atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "key_nmse", "value_nmse"),
+    [
+        ("turboquant_4bit_nc", 0.01, 0.01),
+        ("turboquant_k3v4_nc", 0.04, 0.01),
+        ("turboquant_3bit_nc", 0.04, 0.05),
+    ],
+)
+def test_quantization_quality_gate_accepts_expected_error(
+    cache_dtype: str,
+    key_nmse: float,
+    value_nmse: float,
+) -> None:
+    quality_gate = load_quality_gate()
+    result = quality_gate.evaluate_quantization_quality(
+        {"nmse": key_nmse, "cosine_similarity": 0.99},
+        {"nmse": value_nmse, "cosine_similarity": 0.99},
+        quality_gate.resolve_thresholds(cache_dtype),
+    )
+
+    assert result["passed"]
+    assert all(result["checks"].values())
+
+
+@pytest.mark.parametrize(
+    ("key_nmse", "key_cosine"),
+    [(0.50, 0.99), (0.01, 0.50), (float("nan"), 0.99)],
+)
+def test_quantization_quality_gate_rejects_corruption(
+    key_nmse: float,
+    key_cosine: float,
+) -> None:
+    quality_gate = load_quality_gate()
+    result = quality_gate.evaluate_quantization_quality(
+        {"nmse": key_nmse, "cosine_similarity": key_cosine},
+        {"nmse": 0.01, "cosine_similarity": 0.99},
+        quality_gate.resolve_thresholds("turboquant_4bit_nc"),
+    )
+
+    assert not result["passed"]
+
+
+def test_quantization_quality_thresholds_can_be_overridden() -> None:
+    quality_gate = load_quality_gate()
+    thresholds = quality_gate.resolve_thresholds(
+        "turboquant_4bit_nc",
+        max_key_nmse=0.5,
+        min_value_cosine=0.5,
+    )
+
+    assert thresholds.max_key_nmse == 0.5
+    assert thresholds.max_value_nmse == 0.03
+    assert thresholds.min_key_cosine == 0.98
+    assert thresholds.min_value_cosine == 0.5
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"max_key_nmse": -0.1}, "NMSE"),
+        ({"max_value_nmse": float("inf")}, "NMSE"),
+        ({"min_key_cosine": 1.1}, "Cosine"),
+        ({"min_value_cosine": float("nan")}, "Cosine"),
+    ],
+)
+def test_quantization_quality_rejects_invalid_thresholds(
+    override: dict[str, float],
+    message: str,
+) -> None:
+    quality_gate = load_quality_gate()
+
+    with pytest.raises(ValueError, match=message):
+        quality_gate.resolve_thresholds("turboquant_4bit_nc", **override)
