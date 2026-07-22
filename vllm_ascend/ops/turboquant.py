@@ -43,24 +43,34 @@ def turboquant_paged_dequant(
     value_bits: int,
     norm_correction: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather and dequantize paged TurboQuant cache into dense BNSD K/V."""
-    if not has_turboquant_paged_dequant():
-        raise RuntimeError(
-            "The Ascend TurboQuant fused operator is not installed. Rebuild "
-            "vllm-ascend with `pip install -e .` after sourcing the CANN environment."
-        )
-    return torch.ops._C_ascend.npu_turboquant_paged_dequant(
+    """Allocate dense BNSD K/V and dispatch through the stable out operator.
+
+    Allocating outputs inside the C++ return-style dispatcher can segfault with
+    torch-npu 2.10. Keep the public return API while sharing the production
+    caller-owned output path.
+    """
+    output_shape = (
+        query.shape[0],
+        kv_cache.shape[2],
+        max_seq_len,
+        query.shape[2],
+    )
+    key_out = torch.empty(output_shape, dtype=query.dtype, device=query.device)
+    value_out = torch.empty_like(key_out)
+    return turboquant_paged_dequant_out(
         query,
         kv_cache,
         block_table,
         seq_lens,
         page_table,
         centroids,
-        max_seq_len,
-        key_bits,
-        key_packed_size,
-        value_bits,
-        norm_correction,
+        key_out,
+        value_out,
+        max_seq_len=max_seq_len,
+        key_bits=key_bits,
+        key_packed_size=key_packed_size,
+        value_bits=value_bits,
+        norm_correction=norm_correction,
     )
 
 

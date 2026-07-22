@@ -285,6 +285,54 @@ def test_turboquant_operator_probe_loads_custom_extension(monkeypatch):
     assert load_attempts == 1
 
 
+def test_turboquant_return_wrapper_dispatches_through_out_operator(monkeypatch):
+    from vllm_ascend.ops import turboquant as turboquant_ops
+
+    captured_outputs = None
+
+    def fake_out_operator(
+        query,
+        _kv_cache,
+        _block_table,
+        _seq_lens,
+        _page_table,
+        _centroids,
+        key_out,
+        value_out,
+        **_kwargs,
+    ):
+        nonlocal captured_outputs
+        captured_outputs = (key_out, value_out)
+        return captured_outputs
+
+    monkeypatch.setattr(
+        turboquant_ops,
+        "turboquant_paged_dequant_out",
+        fake_out_operator,
+    )
+    query = torch.empty(2, 16, 128, dtype=torch.float16)
+    key, value = turboquant_ops.turboquant_paged_dequant(
+        query,
+        torch.empty(4, 128, 2, 134, dtype=torch.uint8),
+        torch.empty(2, 2, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        torch.empty(4, 2, dtype=torch.int32),
+        torch.empty(16, dtype=torch.float32),
+        max_seq_len=129,
+        key_bits=4,
+        key_packed_size=66,
+        value_bits=4,
+        norm_correction=True,
+    )
+
+    assert captured_outputs is not None
+    assert key is captured_outputs[0]
+    assert value is captured_outputs[1]
+    assert key.shape == (2, 2, 129, 128)
+    assert value.shape == key.shape
+    assert key.dtype == query.dtype
+
+
 def test_turboquant_dtype_detection_does_not_match_normal_cache():
     assert is_turboquant_kv_cache_dtype("turboquant_4bit_nc")
     assert not is_turboquant_kv_cache_dtype("auto")
