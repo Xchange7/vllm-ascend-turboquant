@@ -127,6 +127,12 @@ def _build_fused_dequant_inputs(
 
     key = torch.cat(key_parts)
     value = torch.cat(value_parts)
+    rotated_key_workspace = torch.empty(
+        key.shape[0] * num_kv_heads,
+        head_dim,
+        dtype=activation_dtype,
+        device="npu",
+    )
     triton_turboquant_store(
         key,
         value,
@@ -138,6 +144,7 @@ def _build_fused_dequant_inputs(
         key_packed_size=config.key_packed_size,
         value_bits=config.value_quant_bits,
         compute_rotation=hadamard.to(activation_dtype),
+        rotated_key_out=rotated_key_workspace,
     )
     torch.npu.synchronize()
     seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device="npu")
@@ -352,12 +359,17 @@ def test_turboquant_grouped_gqa_dispatch(
     [
         (1, 16384, "auto", 32),
         (2, 16384, "auto", 32),
-        (4, 16384, "auto", 16),
-        (8, 16384, "auto", 8),
-        (16, 16384, "auto", 4),
-        (16, 16384, "reference", 1),
-        (1, 1024, "auto", 2),
-        (1, 128, "auto", 1),
+        (4, 16384, "auto", 32),
+        (8, 16384, "auto", 32),
+        (16, 16384, "auto", 32),
+        (20, 16384, "auto", 32),
+        (16, 16384, "reference", 32),
+        (20, 512, "auto", 4),
+        (20, 4096, "auto", 8),
+        (1, 1024, "auto", 32),
+        (1, 128, "auto", 32),
+        (1, 8, "auto", 8),
+        (1, 1, "auto", 1),
     ],
 )
 def test_turboquant_split_selection_for_qwen3_tp4(
@@ -392,6 +404,48 @@ def test_turboquant_split_selection_without_host_sequence_length():
         )
         == 4
     )
+
+
+def test_turboquant_graph_split_selection_ignores_padded_batch_size():
+    assert (
+        select_turboquant_num_kv_splits(
+            batch_size=20,
+            num_query_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            max_num_kv_splits=32,
+            max_sequence_length=40960,
+            use_static_graph_splits=True,
+        )
+        == 32
+    )
+
+
+def test_turboquant_graph_split_selection_respects_ascend_grid_limit():
+    splits = select_turboquant_num_kv_splits(
+        batch_size=2048,
+        num_query_heads=16,
+        num_kv_heads=2,
+        head_dim=128,
+        max_num_kv_splits=32,
+        max_sequence_length=40960,
+        use_static_graph_splits=True,
+    )
+
+    assert splits == 8
+    assert 2048 * 2 * splits <= 65535
+
+
+def test_turboquant_split_selection_rejects_oversized_base_grid():
+    with pytest.raises(ValueError, match="grid exceeds the Ascend launch limit"):
+        select_turboquant_num_kv_splits(
+            batch_size=32768,
+            num_query_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            max_num_kv_splits=32,
+            max_sequence_length=40960,
+        )
 
 
 def test_turboquant_store_launch_ranges_respect_ascend_grid_limit():
@@ -751,6 +805,11 @@ def test_turboquant_store_and_decode_match_dequantized_reference(
             dtype=torch.float32,
             device="npu",
         ),
+        _tq_ascend_query_rotation_buf=torch.empty_like(
+            query,
+            dtype=torch.float32 if implementation == "reference" else activation_dtype,
+        ),
+        _tq_ascend_query_float_buf=torch.empty_like(query, dtype=torch.float32),
     )
     scale = 1 / math.sqrt(head_dim)
     alibi_slopes = (
@@ -880,6 +939,7 @@ def test_turboquant_zero_keys_and_constant_values_remain_finite(
             dtype=torch.float32,
             device="npu",
         ),
+        _tq_ascend_query_rotation_buf=torch.empty_like(query),
     )
     result = triton_turboquant_decode_attention(
         query,

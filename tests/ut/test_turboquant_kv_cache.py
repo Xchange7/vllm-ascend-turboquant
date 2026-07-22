@@ -92,6 +92,39 @@ def test_turboquant_ascend_fused_rejects_unsupported_head_dim(head_dim):
         _validate_ascend_fused_head_dim(head_dim)
 
 
+@pytest.mark.parametrize(
+    ("implementation", "available", "single_token", "aclgraph", "expected"),
+    [
+        ("auto", True, True, False, True),
+        ("auto", True, True, True, False),
+        ("auto", False, True, False, False),
+        ("auto", True, False, False, False),
+        ("ascend_fused", True, True, False, True),
+        ("grouped_gqa", True, True, False, False),
+    ],
+)
+def test_turboquant_auto_fused_dispatch(
+    implementation,
+    available,
+    single_token,
+    aclgraph,
+    expected,
+):
+    from vllm_ascend.attention.turboquant import (
+        _should_use_ascend_fused_decode,
+    )
+
+    assert (
+        _should_use_ascend_fused_decode(
+            implementation,
+            available,
+            single_token,
+            aclgraph,
+        )
+        is expected
+    )
+
+
 def test_turboquant_compact_page_table_tracks_only_active_pages():
     from vllm_ascend.attention.turboquant import (
         _build_turboquant_page_table_cpu,
@@ -118,6 +151,35 @@ def test_turboquant_compact_page_table_rejects_invalid_input(seq_lens, block_siz
         _build_turboquant_page_table_cpu(seq_lens, block_size)
 
 
+def test_turboquant_page_table_builder_alternates_staging_buffers():
+    from vllm_ascend.attention.turboquant import _TurboQuantPageTableBuilder
+
+    builder = _TurboQuantPageTableBuilder(torch.device("cpu"))
+    first = builder.build([1], 128)
+    second = builder.build([129], 128)
+    repeated = builder.build([129], 128)
+
+    assert first.data_ptr() != second.data_ptr()
+    assert second.data_ptr() == repeated.data_ptr()
+    torch.testing.assert_close(
+        second,
+        torch.tensor([[0, 0], [0, 1]], dtype=torch.int32),
+    )
+
+
+def test_turboquant_page_table_builder_grows_instead_of_waiting():
+    from vllm_ascend.attention.turboquant import _TurboQuantPageTableBuilder
+
+    builder = _TurboQuantPageTableBuilder(torch.device("cpu"))
+    for slot in builder.slots:
+        slot.copy_pending = True
+        slot.copy_event = SimpleNamespace(query=lambda: False)
+
+    builder.build([1], 128)
+
+    assert len(builder.slots) == 3
+
+
 def test_turboquant_fused_workspace_reuses_dense_storage():
     from vllm_ascend.attention.turboquant import _TurboQuantFusedWorkspace
 
@@ -134,6 +196,37 @@ def test_turboquant_fused_workspace_reuses_dense_storage():
     )
     assert reused.key.shape == (1, 2, 64, 32)
     assert reused.value.shape == (1, 2, 64, 32)
+
+
+def test_turboquant_fused_workspace_grows_capacity_geometrically():
+    from vllm_ascend.attention.turboquant import _TurboQuantFusedWorkspace
+
+    workspace = _TurboQuantFusedWorkspace()
+    first = workspace.dense_buffers(
+        torch.empty(1, 4, 32),
+        2,
+        128,
+        128,
+        max_batch_size=8,
+        max_sequence_capacity=1024,
+    )
+    second = workspace.dense_buffers(
+        torch.empty(3, 4, 32),
+        2,
+        257,
+        512,
+        max_batch_size=8,
+        max_sequence_capacity=1024,
+    )
+
+    assert first.sequence_capacity == 128
+    assert second.sequence_capacity == 512
+    assert first.batch_capacity == 1
+    assert second.batch_capacity == 3
+    assert second.query_capacity.shape[0] == 3
+    assert second.key_capacity.shape[:3] == (3, 2, 512)
+    assert workspace.batch_capacity == 3
+    assert workspace.sequence_capacity == 512
 
 
 def test_turboquant_fia_workspace_factory_runs_once_per_shape():

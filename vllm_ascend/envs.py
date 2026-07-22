@@ -125,13 +125,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
-    # Select the TurboQuant packed-decode implementation. Valid values are
+    # Select the TurboQuant decode implementation. Valid values are
     # "auto", "ascend_fused", "grouped_gqa", and "reference". "auto" uses
-    # grouped GQA and activation-dtype rotation when the shape is supported;
-    # "ascend_fused" uses the custom AscendC paged-dequant operator followed by
-    # CANN FIA for eager single-token decode; "reference" uses the
-    # per-query-head kernel and FP32 rotation. This non-sensitive
-    # performance/debug option defaults to "auto" on all Ascend hardware.
+    # AscendC paged dequantization plus CANN FIA for supported single-token
+    # decode and disables graph capture when that fast path is available.
+    # "grouped_gqa" keeps graph-capable packed decode; "ascend_fused" requires
+    # the custom operator; "reference" uses the per-query-head kernel and FP32
+    # rotation. This non-sensitive performance/debug option defaults to "auto"
+    # on all Ascend hardware.
     "VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION": lambda: os.getenv(
         "VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION",
         "auto",

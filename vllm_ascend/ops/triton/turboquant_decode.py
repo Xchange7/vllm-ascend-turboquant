@@ -28,13 +28,11 @@ _GROUPED_GQA_BLOCK_KV = 16
 _GROUPED_GQA_BLOCK_KV_OPTIONS = (16, 32)
 _ASCEND_MAX_TRITON_GRID_SIZE = 65535
 
-# Keep enough stage-1 programs to occupy the NPU without multiplying tiny
-# split-KV programs at high concurrency. This mirrors upstream Triton MLA's
-# sequence-length heuristic, with an additional cap for already-parallel
-# batch/head rows. The constants are intentionally hardware-policy details,
-# not user-facing knobs; profiling should validate them before they change.
-_MIN_KV_TOKENS_PER_SPLIT = 512
+# Keep enough stage-1 programs to occupy the NPU. Grouped GQA launches one
+# program per KV head rather than per query head, so short-context and
+# low-concurrency decode need additional KV splits to expose enough work.
 _TARGET_DECODE_PROGRAMS = 128
+_TARGET_KV_TOKENS_PER_SPLIT = 512
 
 
 @triton.jit
@@ -717,13 +715,15 @@ def select_turboquant_num_kv_splits(
     max_num_kv_splits: int,
     max_sequence_length: int | None,
     implementation: str = "auto",
+    use_static_graph_splits: bool = False,
 ) -> int:
-    """Select split-KV parallelism without oversubscribing high batches.
+    """Select split-KV parallelism for eager or static-graph decode.
 
     The grouped kernel launches one stage-1 program per KV head and split;
-    the reference kernel launches one per query head and split. Once the
-    batch/head rows already expose enough parallel work, more splits only add
-    program scheduling, partial-buffer traffic, and stage-2 reduction work.
+    the reference kernel launches one per query head and split. Eager decode
+    selects enough splits to approach the target number of useful programs.
+    ACLGraph capture uses the configured maximum because the active request
+    count can be smaller than the padded graph bucket during replay.
     """
     if batch_size <= 0:
         raise ValueError(f"TurboQuant batch_size must be positive, got {batch_size}.")
@@ -747,18 +747,36 @@ def select_turboquant_num_kv_splits(
     )
     program_heads = num_kv_heads if grouped else num_query_heads
     parallel_rows = batch_size * program_heads
-    parallel_limit = max(1, _TARGET_DECODE_PROGRAMS // parallel_rows)
+    if parallel_rows > _ASCEND_MAX_TRITON_GRID_SIZE:
+        raise ValueError(
+            "TurboQuant decode batch/head grid exceeds the Ascend launch "
+            f"limit: {batch_size} * {program_heads} = {parallel_rows} > "
+            f"{_ASCEND_MAX_TRITON_GRID_SIZE}."
+        )
+    max_grid_splits = max(1, _ASCEND_MAX_TRITON_GRID_SIZE // parallel_rows)
+    max_grid_splits = 1 << (max_grid_splits.bit_length() - 1)
+    if use_static_graph_splits:
+        return min(max_num_kv_splits, max_grid_splits)
 
-    # Powers of two limit Triton specializations and produce balanced split
-    # ranges. Round the concurrency limit down so the target is never exceeded.
-    parallel_limit = 1 << (parallel_limit.bit_length() - 1)
-    split_limit = min(max_num_kv_splits, parallel_limit)
-    if max_sequence_length is None:
-        return max(1, split_limit)
-
-    ideal_splits = max(1, max_sequence_length // _MIN_KV_TOKENS_PER_SPLIT)
-    ideal_splits = triton.next_power_of_2(ideal_splits)
-    return max(1, min(split_limit, ideal_splits))
+    required_splits = max(
+        1,
+        (_TARGET_DECODE_PROGRAMS + parallel_rows - 1) // parallel_rows,
+    )
+    required_splits = triton.next_power_of_2(required_splits)
+    if max_sequence_length is not None:
+        work_splits = (max_sequence_length + _TARGET_KV_TOKENS_PER_SPLIT - 1) // _TARGET_KV_TOKENS_PER_SPLIT
+        required_splits = max(
+            required_splits,
+            triton.next_power_of_2(work_splits),
+        )
+    split_limit = min(max_num_kv_splits, max_grid_splits)
+    if max_sequence_length is not None:
+        # Do not launch empty power-of-two splits for very short sequences.
+        split_limit = min(
+            split_limit,
+            1 << (max_sequence_length.bit_length() - 1),
+        )
+    return max(1, min(required_splits, split_limit))
 
 
 def _get_compute_rotation(
@@ -782,18 +800,19 @@ def _get_workspace(
     name: str,
     shape: tuple[int, ...],
     device: torch.device,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Reuse graph-safe layer storage or allocate an eager-only fallback."""
     buffer = getattr(holder, name, None)
     if (
         buffer is not None
-        and buffer.dtype == torch.float32
+        and buffer.dtype == dtype
         and buffer.device == device
         and buffer.ndim == len(shape)
         and all(actual >= required for actual, required in zip(buffer.shape, shape))
     ):
         return buffer[tuple(slice(0, size) for size in shape)]
-    return torch.empty(shape, dtype=torch.float32, device=device)
+    return torch.empty(shape, dtype=dtype, device=device)
 
 
 def triton_turboquant_decode_attention(
@@ -895,9 +914,29 @@ def triton_turboquant_decode_attention(
                 "TurboQuant compute rotation must be square with the attention "
                 f"head dimension, got {compute_rotation.shape} for {head_dim}."
             )
-        query_rotated = (query @ compute_rotation).contiguous()
+        query_rotated = _get_workspace(
+            buffer_holder,
+            "_tq_ascend_query_rotation_buf",
+            tuple(query.shape),
+            query.device,
+            query.dtype,
+        )
+        torch.matmul(query, compute_rotation, out=query_rotated)
     else:
-        query_rotated = (query.float() @ hadamard_transpose).contiguous()
+        query_float = _get_workspace(
+            buffer_holder,
+            "_tq_ascend_query_float_buf",
+            tuple(query.shape),
+            query.device,
+        )
+        query_float.copy_(query)
+        query_rotated = _get_workspace(
+            buffer_holder,
+            "_tq_ascend_query_rotation_buf",
+            tuple(query.shape),
+            query.device,
+        )
+        torch.matmul(query_float, hadamard_transpose, out=query_rotated)
     num_splits = max_num_kv_splits
 
     # Layer buffers are sized for max_num_seqs and are stable during graph

@@ -371,6 +371,7 @@ def triton_turboquant_store(
     key_packed_size: int,
     value_bits: int,
     compute_rotation: torch.Tensor | None = None,
+    rotated_key_out: torch.Tensor | None = None,
 ) -> None:
     """Quantize post-RoPE K/V and scatter packed bytes into paged cache."""
     if key_bits not in (3, 4) or value_bits not in (3, 4):
@@ -395,8 +396,30 @@ def triton_turboquant_store(
     key_vectors = key.reshape(num_vectors, head_dim).contiguous()
     # Rotation is linear, so normalization can happen in the scatter kernel.
     # The production path keeps this GEMM in the activation dtype for Cube.
+    rotation_dtype = torch.float32 if compute_rotation is None else key.dtype
+    if rotated_key_out is not None:
+        if (
+            rotated_key_out.device != key.device
+            or rotated_key_out.dtype != rotation_dtype
+            or rotated_key_out.ndim != 2
+            or rotated_key_out.shape[0] < num_vectors
+            or rotated_key_out.shape[1] < head_dim
+        ):
+            raise ValueError(
+                "TurboQuant rotated-key workspace does not cover the requested "
+                f"shape/dtype/device: {rotated_key_out.shape}, "
+                f"{rotated_key_out.dtype}, {rotated_key_out.device}."
+            )
+        rotated_key = rotated_key_out[:num_vectors, :head_dim]
+    else:
+        rotated_key = torch.empty(
+            (num_vectors, head_dim),
+            dtype=rotation_dtype,
+            device=key.device,
+        )
+
     if compute_rotation is None:
-        rotated_key = (key_vectors.float() @ hadamard_transpose).contiguous()
+        torch.matmul(key_vectors.float(), hadamard_transpose, out=rotated_key)
     else:
         if compute_rotation.dtype != key.dtype:
             raise TypeError(
@@ -413,7 +436,7 @@ def triton_turboquant_store(
                 "TurboQuant compute rotation must be on the K/V device, got "
                 f"{compute_rotation.device} and {key.device}."
             )
-        rotated_key = (key_vectors @ compute_rotation).contiguous()
+        torch.matmul(key_vectors, compute_rotation, out=rotated_key)
     value_contiguous = value.reshape(num_vectors, head_dim).contiguous()
 
     block_d = triton.next_power_of_2(head_dim)

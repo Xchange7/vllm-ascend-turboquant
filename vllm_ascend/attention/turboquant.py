@@ -23,8 +23,9 @@ from typing import ClassVar, NamedTuple
 import torch
 import torch.nn.functional as F
 import torch_npu
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -152,12 +153,42 @@ def _query_lens_from_cumulative(
 
 
 def _validate_ascend_fused_head_dim(head_dim: int) -> None:
-    if head_dim < _ASCEND_FUSED_MIN_HEAD_DIM or head_dim > _ASCEND_FUSED_MAX_HEAD_DIM or head_dim & (head_dim - 1):
+    if not _supports_ascend_fused_head_dim(head_dim):
         raise NotImplementedError(
             "Ascend TurboQuant fused decode requires head_dim to be a "
             f"power of two in [32, 256], got {head_dim}. Use the default "
             "auto decode implementation for other supported head dimensions."
         )
+
+
+def _supports_ascend_fused_head_dim(head_dim: int) -> bool:
+    return _ASCEND_FUSED_MIN_HEAD_DIM <= head_dim <= _ASCEND_FUSED_MAX_HEAD_DIM and head_dim & (head_dim - 1) == 0
+
+
+def _is_aclgraph_forward() -> bool:
+    try:
+        forward_context = get_forward_context()
+    except (AssertionError, LookupError, RuntimeError):
+        return False
+    runtime_mode = getattr(
+        forward_context,
+        "cudagraph_runtime_mode",
+        CUDAGraphMode.NONE,
+    )
+    return runtime_mode is not None and runtime_mode != CUDAGraphMode.NONE
+
+
+def _should_use_ascend_fused_decode(
+    implementation: str,
+    fused_available: bool,
+    single_token_decode: bool,
+    aclgraph_forward: bool,
+) -> bool:
+    if not single_token_decode:
+        return False
+    if implementation == "ascend_fused":
+        return True
+    return implementation == "auto" and fused_available and not aclgraph_forward
 
 
 def _build_turboquant_page_table_cpu(seq_lens: list[int], block_size: int) -> torch.Tensor:
@@ -176,8 +207,8 @@ def _build_turboquant_page_table_cpu(seq_lens: list[int], block_size: int) -> to
     return torch.tensor(rows, dtype=torch.int32).reshape(-1, 2)
 
 
-class _TurboQuantPageTableBuilder:
-    """Reuse pinned host and NPU storage for compact active-page metadata."""
+class _TurboQuantPageTableSlot:
+    """One asynchronous host/device staging pair."""
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
@@ -185,36 +216,65 @@ class _TurboQuantPageTableBuilder:
         self.host_buffer: torch.Tensor | None = None
         self.page_indices: torch.Tensor | None = None
         self.device_buffer: torch.Tensor | None = None
-        self.last_page_counts: tuple[int, ...] | None = None
         self.copy_event: torch.npu.Event | None = None
         self.copy_pending = False
 
-    def _wait_for_staging_copy(self) -> None:
-        if self.copy_pending:
-            assert self.copy_event is not None
-            self.copy_event.synchronize()
+    def ready_for_host_write(self) -> bool:
+        if not self.copy_pending:
+            return True
+        assert self.copy_event is not None
+        if self.copy_event.query():
             self.copy_pending = False
+            return True
+        return False
 
-    def _reserve(self, required_pages: int) -> None:
-        if required_pages <= self.capacity:
+
+class _TurboQuantPageTableBuilder:
+    """Build active-page metadata without synchronizing the model thread."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.slots = [
+            _TurboQuantPageTableSlot(device),
+            _TurboQuantPageTableSlot(device),
+        ]
+        self.active_slot = -1
+        self.last_page_counts: tuple[int, ...] | None = None
+
+    @staticmethod
+    def _reserve(slot: _TurboQuantPageTableSlot, required_pages: int) -> None:
+        if required_pages <= slot.capacity:
             return
-        self.capacity = max(required_pages, max(16, self.capacity * 2))
-        self.host_buffer = torch.empty(
-            (self.capacity, 2),
+        slot.capacity = max(required_pages, max(16, slot.capacity * 2))
+        slot.host_buffer = torch.empty(
+            (slot.capacity, 2),
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=slot.device.type == "npu",
         )
-        self.page_indices = torch.empty(
-            self.capacity,
+        slot.page_indices = torch.empty(
+            slot.capacity,
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=slot.device.type == "npu",
         )
-        torch.arange(self.capacity, dtype=torch.int32, out=self.page_indices)
-        self.device_buffer = torch.empty(
-            (self.capacity, 2),
+        torch.arange(slot.capacity, dtype=torch.int32, out=slot.page_indices)
+        slot.device_buffer = torch.empty(
+            (slot.capacity, 2),
             dtype=torch.int32,
-            device=self.device,
+            device=slot.device,
         )
+
+    def _next_writable_slot(self) -> tuple[int, _TurboQuantPageTableSlot]:
+        for offset in range(1, len(self.slots) + 1):
+            slot_index = (self.active_slot + offset) % len(self.slots)
+            slot = self.slots[slot_index]
+            if slot.ready_for_host_write():
+                return slot_index, slot
+
+        # The CPU can occasionally enqueue more than two model steps before
+        # either staging copy completes. Add a slot instead of blocking it.
+        slot = _TurboQuantPageTableSlot(self.device)
+        self.slots.append(slot)
+        return len(self.slots) - 1, slot
 
     def build(self, seq_lens: list[int], block_size: int) -> torch.Tensor:
         if block_size <= 0:
@@ -225,32 +285,34 @@ class _TurboQuantPageTableBuilder:
         if any(seq_len <= 0 for seq_len in seq_lens):
             raise ValueError(f"TurboQuant sequence lengths must be positive, got {seq_lens}.")
         active_pages = sum(page_counts)
-        if page_counts != self.last_page_counts:
-            # A pinned source must not be rewritten while its non-blocking H2D
-            # is in flight. This normally completes long before a page change.
-            self._wait_for_staging_copy()
-        self._reserve(active_pages)
-        assert self.host_buffer is not None
-        assert self.page_indices is not None
-        assert self.device_buffer is not None
         if page_counts == self.last_page_counts:
-            return self.device_buffer[:active_pages]
+            active = self.slots[self.active_slot]
+            assert active.device_buffer is not None
+            return active.device_buffer[:active_pages]
+
+        slot_index, slot = self._next_writable_slot()
+        self._reserve(slot, active_pages)
+        assert slot.host_buffer is not None
+        assert slot.page_indices is not None
+        assert slot.device_buffer is not None
         offset = 0
         for request_index, page_count in enumerate(page_counts):
             next_offset = offset + page_count
-            self.host_buffer[offset:next_offset, 0].fill_(request_index)
-            self.host_buffer[offset:next_offset, 1].copy_(self.page_indices[:page_count])
+            slot.host_buffer[offset:next_offset, 0].fill_(request_index)
+            slot.host_buffer[offset:next_offset, 1].copy_(slot.page_indices[:page_count])
             offset = next_offset
-        self.device_buffer[:active_pages].copy_(
-            self.host_buffer[:active_pages],
+        slot.device_buffer[:active_pages].copy_(
+            slot.host_buffer[:active_pages],
             non_blocking=True,
         )
-        if self.copy_event is None:
-            self.copy_event = torch.npu.Event()
-        self.copy_event.record()
-        self.copy_pending = True
+        if self.device.type == "npu":
+            if slot.copy_event is None:
+                slot.copy_event = torch.npu.Event()
+            slot.copy_event.record()
+            slot.copy_pending = True
+        self.active_slot = slot_index
         self.last_page_counts = page_counts
-        return self.device_buffer[:active_pages]
+        return slot.device_buffer[:active_pages]
 
 
 class _TurboQuantDenseBuffers(NamedTuple):
@@ -260,6 +322,9 @@ class _TurboQuantDenseBuffers(NamedTuple):
     softmax_lse: torch.Tensor
     key_capacity: torch.Tensor
     value_capacity: torch.Tensor
+    query_capacity: torch.Tensor
+    batch_capacity: int
+    sequence_capacity: int
 
 
 class _TurboQuantFusedWorkspace:
@@ -272,6 +337,17 @@ class _TurboQuantFusedWorkspace:
         self.softmax_lse: torch.Tensor | None = None
         self.fia_workspace: torch.Tensor | None = None
         self.fia_workspace_shapes: set[tuple[object, ...]] = set()
+        self.batch_capacity = 0
+        self.sequence_capacity = 0
+        self.layout: tuple[object, ...] | None = None
+
+    @staticmethod
+    def _grow_capacity(current: int, required: int, maximum: int) -> int:
+        if current >= required:
+            return current
+        if current == 0:
+            return required
+        return min(maximum, max(required, current * 2))
 
     @staticmethod
     def _flat_buffer(
@@ -298,19 +374,61 @@ class _TurboQuantFusedWorkspace:
         num_kv_heads: int,
         max_seq_len: int,
         reserve_seq_len: int | None = None,
+        max_batch_size: int | None = None,
+        max_sequence_capacity: int | None = None,
     ) -> _TurboQuantDenseBuffers:
         batch_size, num_query_heads, head_dim = query.shape
         if reserve_seq_len is None:
             reserve_seq_len = max_seq_len
         if reserve_seq_len < max_seq_len:
             raise ValueError(f"TurboQuant reserve_seq_len {reserve_seq_len} is smaller than max_seq_len {max_seq_len}.")
+        if max_batch_size is None:
+            max_batch_size = batch_size
+        if max_sequence_capacity is None:
+            max_sequence_capacity = reserve_seq_len
+        if max_batch_size < batch_size or max_sequence_capacity < reserve_seq_len:
+            raise ValueError("TurboQuant fused workspace capacity does not cover the requested shape.")
+
+        layout = (
+            query.device,
+            query.dtype,
+            num_query_heads,
+            num_kv_heads,
+            head_dim,
+        )
+        if layout != self.layout:
+            self.key = None
+            self.value = None
+            self.query = None
+            self.softmax_lse = None
+            self.fia_workspace = None
+            self.fia_workspace_shapes.clear()
+            self.batch_capacity = 0
+            self.sequence_capacity = 0
+            self.layout = layout
+        self.batch_capacity = self._grow_capacity(
+            self.batch_capacity,
+            batch_size,
+            max_batch_size,
+        )
+        self.sequence_capacity = self._grow_capacity(
+            self.sequence_capacity,
+            reserve_seq_len,
+            max_sequence_capacity,
+        )
         dense_shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
-        reserve_shape = (batch_size, num_kv_heads, reserve_seq_len, head_dim)
+        reserve_shape = (
+            self.batch_capacity,
+            num_kv_heads,
+            self.sequence_capacity,
+            head_dim,
+        )
         dense_elements = math.prod(dense_shape)
         reserve_elements = math.prod(reserve_shape)
         self.key = self._flat_buffer(self.key, reserve_elements, query)
         self.value = self._flat_buffer(self.value, reserve_elements, query)
-        self.query = self._flat_buffer(self.query, query.numel(), query)
+        query_capacity_elements = self.batch_capacity * num_query_heads * head_dim
+        self.query = self._flat_buffer(self.query, query_capacity_elements, query)
         self.softmax_lse = self._flat_buffer(self.softmax_lse, 1, query)
         return _TurboQuantDenseBuffers(
             key=self.key[:dense_elements].view(dense_shape),
@@ -319,6 +437,13 @@ class _TurboQuantFusedWorkspace:
             softmax_lse=self.softmax_lse[:1],
             key_capacity=self.key[:reserve_elements].view(reserve_shape),
             value_capacity=self.value[:reserve_elements].view(reserve_shape),
+            query_capacity=self.query[:query_capacity_elements].view(
+                self.batch_capacity,
+                num_query_heads,
+                head_dim,
+            ),
+            batch_capacity=self.batch_capacity,
+            sequence_capacity=self.sequence_capacity,
         )
 
     def get_fia_workspace(
@@ -364,7 +489,19 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         vllm_config,
         kv_cache_spec,
     ) -> AttentionCGSupport:
-        if envs.VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION == "ascend_fused":
+        implementation = envs.VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION
+        if implementation == "ascend_fused":
+            return AttentionCGSupport.NEVER
+        head_size = getattr(kv_cache_spec, "head_size", None)
+        if (
+            implementation == "auto"
+            and isinstance(head_size, int)
+            and _supports_ascend_fused_head_dim(head_size)
+            and has_turboquant_paged_dequant()
+        ):
+            # ACLGraph would force auto onto the much slower packed path.
+            # Prefer eager AscendC+CANN when that implementation is available;
+            # grouped_gqa remains the explicit graph-capable selection.
             return AttentionCGSupport.NEVER
         return cls._cudagraph_support
 
@@ -381,11 +518,11 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         )
         metadata.seq_lens = common_attn_metadata.seq_lens[: common_attn_metadata.num_reqs]
         metadata.max_seq_len = common_attn_metadata.max_seq_len
-        if envs.VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION == "ascend_fused" and metadata.num_decodes:
-            metadata.turboquant_page_table = self._turboquant_page_table_builder.build(
-                metadata.seq_lens_list[: metadata.num_decodes],
-                self.kv_cache_spec.block_size,
-            )
+        if envs.VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION in ("auto", "ascend_fused") and metadata.num_decodes:
+            # Defer page-table construction until the implementation selects
+            # eager fused decode. ACLGraph auto mode therefore does no unused
+            # host work and captures only the packed Triton path.
+            metadata.turboquant_page_table_builder = self._turboquant_page_table_builder
             metadata.turboquant_workspace = self._turboquant_workspace
         if (
             metadata.attn_state != AscendAttentionState.PrefillNoCache
@@ -541,8 +678,10 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             kv_cache_dtype,
             head_size,
         )
-        attention_config = get_current_vllm_config().attention_config
+        vllm_config = get_current_vllm_config()
+        attention_config = vllm_config.attention_config
         self.max_num_kv_splits = attention_config.tq_max_kv_splits_for_cuda_graph
+        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.decode_implementation = envs.VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION
         if self.decode_implementation not in (
             "auto",
@@ -555,13 +694,19 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
                 "ascend_fused, grouped_gqa, or reference; got "
                 f"{self.decode_implementation}."
             )
-        if self.decode_implementation == "ascend_fused" and (
-            self.alibi_slopes is not None or self.logits_soft_cap is not None
-        ):
+        fused_features_supported = self.alibi_slopes is None and self.logits_soft_cap is None
+        fused_shape_supported = _supports_ascend_fused_head_dim(head_size)
+        self.ascend_fused_available = (
+            self.decode_implementation in ("auto", "ascend_fused")
+            and fused_features_supported
+            and fused_shape_supported
+            and has_turboquant_paged_dequant()
+        )
+        if self.decode_implementation == "ascend_fused" and not fused_features_supported:
             raise NotImplementedError("Ascend TurboQuant fused decode does not support ALiBi or logits soft cap.")
         if self.decode_implementation == "ascend_fused":
             _validate_ascend_fused_head_dim(head_size)
-            if not has_turboquant_paged_dequant():
+            if not self.ascend_fused_available:
                 raise RuntimeError(
                     "Ascend TurboQuant fused decode requires the paged-dequant "
                     "out operator. Rebuild vllm-ascend after sourcing CANN."
@@ -573,34 +718,88 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         device: torch.device,
         activation_dtype: torch.dtype,
     ) -> None:
+        workspace_signature = (
+            device,
+            activation_dtype,
+            self.decode_implementation,
+            self.max_num_seqs,
+        )
         if hasattr(layer, "_tq_ascend_constants_ready"):
             compute_rotation = getattr(layer, "_tq_ascend_compute_rotation", None)
-            if (
-                compute_rotation is None
-                or compute_rotation.dtype != activation_dtype
-                or compute_rotation.device != device
-            ):
+            compute_rotation_ready = (
+                compute_rotation is not None
+                and compute_rotation.dtype == activation_dtype
+                and compute_rotation.device == device
+            )
+            if compute_rotation_ready and getattr(layer, "_tq_ascend_workspace_signature", None) == workspace_signature:
+                return
+            if not compute_rotation_ready:
                 layer._tq_ascend_compute_rotation = _build_compute_rotation(
                     self.head_size,
                     str(device),
                     activation_dtype,
                 )
-            return
-        rotation = _build_hadamard(self.head_size, str(device))
-        layer._tq_ascend_hadamard = rotation
-        layer._tq_ascend_compute_rotation = _build_compute_rotation(
-            self.head_size,
-            str(device),
-            activation_dtype,
+        else:
+            rotation = _build_hadamard(self.head_size, str(device))
+            layer._tq_ascend_hadamard = rotation
+            layer._tq_ascend_compute_rotation = _build_compute_rotation(
+                self.head_size,
+                str(device),
+                activation_dtype,
+            )
+            centroids = layer._tq_centroids.to(  # type: ignore[attr-defined]
+                device=device,
+                dtype=torch.float32,
+            )
+            centroids, _ = centroids.sort()
+            layer._tq_ascend_centroids = centroids
+            layer._tq_ascend_midpoints = (centroids[:-1] + centroids[1:]) / 2
+            layer._tq_ascend_constants_ready = True
+
+        rotation_dtype = torch.float32 if self.decode_implementation == "reference" else activation_dtype
+        self._ensure_layer_workspace(
+            layer,
+            "_tq_ascend_query_rotation_buf",
+            (self.max_num_seqs, self.num_heads, self.head_size),
+            rotation_dtype,
+            device,
         )
-        centroids = layer._tq_centroids.to(  # type: ignore[attr-defined]
-            device=device,
-            dtype=torch.float32,
+        self._ensure_layer_workspace(
+            layer,
+            "_tq_ascend_key_rotation_buf",
+            (self.max_num_seqs * self.num_kv_heads, self.head_size),
+            rotation_dtype,
+            device,
         )
-        centroids, _ = centroids.sort()
-        layer._tq_ascend_centroids = centroids
-        layer._tq_ascend_midpoints = (centroids[:-1] + centroids[1:]) / 2
-        layer._tq_ascend_constants_ready = True
+        if self.decode_implementation == "reference":
+            self._ensure_layer_workspace(
+                layer,
+                "_tq_ascend_query_float_buf",
+                (self.max_num_seqs, self.num_heads, self.head_size),
+                torch.float32,
+                device,
+            )
+        layer._tq_ascend_workspace_signature = workspace_signature
+
+    @staticmethod
+    def _ensure_layer_workspace(
+        layer: AttentionLayer,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        buffer = getattr(layer, name, None)
+        if (
+            buffer is None
+            or buffer.device != device
+            or buffer.dtype != dtype
+            or buffer.ndim != len(shape)
+            or any(actual < required for actual, required in zip(buffer.shape, shape))
+        ):
+            buffer = torch.empty(shape, dtype=dtype, device=device)
+            setattr(layer, name, buffer)
+        return buffer
 
     def do_kv_cache_update(
         self,
@@ -624,6 +823,10 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             self.num_kv_heads,
             self.head_size,
         )
+        key_rotation_workspace = layer._tq_ascend_key_rotation_buf
+        num_key_vectors = num_tokens * self.num_kv_heads
+        if key_rotation_workspace.shape[0] < num_key_vectors:
+            key_rotation_workspace = None
         triton_turboquant_store(
             key,
             value,
@@ -635,6 +838,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             key_packed_size=self.tq_config.key_packed_size,
             value_bits=self.tq_config.value_quant_bits,
             compute_rotation=(None if self.decode_implementation == "reference" else layer._tq_ascend_compute_rotation),
+            rotated_key_out=key_rotation_workspace,
         )
 
     def _prefill_attention(
@@ -748,6 +952,8 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             self.num_kv_heads,
             max_seq_len,
             reserve_seq_len,
+            max_batch_size=self.max_num_seqs,
+            max_sequence_capacity=cache_sequence_capacity,
         )
         query_bnsd = buffers.query.unsqueeze(2)
         output_bnsd = output.unsqueeze(2)
@@ -766,12 +972,21 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         )
         fia_workspace_kwargs = {
             **fia_kwargs,
+            "query": buffers.query_capacity.unsqueeze(2),
             "key": buffers.key_capacity,
             "value": buffers.value_capacity,
-            "actual_seq_lengths_kv": [reserve_seq_len] * query.shape[0],
+            "actual_seq_lengths_kv": [buffers.sequence_capacity] * buffers.batch_capacity,
         }
         fia_workspace = workspace.get_fia_workspace(
-            (query.device.type, query.device.index, query.dtype, *query.shape, reserve_seq_len),
+            (
+                query.device.type,
+                query.device.index,
+                query.dtype,
+                buffers.batch_capacity,
+                self.num_heads,
+                self.head_size,
+                buffers.sequence_capacity,
+            ),
             lambda: torch_npu._npu_fused_infer_attention_score_get_max_workspace(**fia_workspace_kwargs),
         )
         turboquant_paged_dequant_out(
@@ -920,12 +1135,24 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         if not query_lens:
             return output
 
-        if self.decode_implementation == "ascend_fused" and all(query_len == 1 for query_len in query_lens):
-            if metadata.turboquant_page_table is None or not isinstance(
-                metadata.turboquant_workspace,
-                _TurboQuantFusedWorkspace,
+        single_token_decode = all(query_len == 1 for query_len in query_lens)
+        use_ascend_fused = _should_use_ascend_fused_decode(
+            self.decode_implementation,
+            self.ascend_fused_available,
+            single_token_decode,
+            _is_aclgraph_forward(),
+        )
+        if use_ascend_fused:
+            if not isinstance(metadata.turboquant_workspace, _TurboQuantFusedWorkspace) or not isinstance(
+                metadata.turboquant_page_table_builder,
+                _TurboQuantPageTableBuilder,
             ):
-                raise RuntimeError("Ascend TurboQuant fused metadata is missing its page table or workspace.")
+                raise RuntimeError("Ascend TurboQuant fused metadata is missing its page-table builder or workspace.")
+            if metadata.turboquant_page_table is None:
+                metadata.turboquant_page_table = metadata.turboquant_page_table_builder.build(
+                    metadata.seq_lens_list[:num_reqs],
+                    kv_cache.shape[1],
+                )
             max_seq_len = metadata.max_seq_len
             if max_seq_len is None:
                 max_seq_len = max(metadata.seq_lens_list[:num_reqs])
@@ -1028,6 +1255,7 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             max_num_kv_splits=self.max_num_kv_splits,
             max_sequence_length=max_sequence_length,
             implementation=triton_implementation,
+            use_static_graph_splits=_is_aclgraph_forward(),
         )
         return triton_turboquant_decode_attention(
             query,

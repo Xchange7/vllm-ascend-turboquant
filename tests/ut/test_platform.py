@@ -747,7 +747,47 @@ class TestNPUPlatform(TestBase):
         "os.environ",
         {"VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION": "auto"},
     )
-    def test_turboquant_supports_uniform_batch_graph_capture(self):
+    @patch("vllm_ascend.attention.turboquant.has_turboquant_paged_dequant", return_value=True)
+    def test_turboquant_auto_fused_disables_graph_capture(self, _mock_has_fused_op):
+        from vllm_ascend.attention.turboquant import (
+            AscendTurboQuantMetadataBuilder,
+        )
+
+        kv_cache_spec = MagicMock()
+        kv_cache_spec.head_size = 128
+        self.assertEqual(
+            AscendTurboQuantMetadataBuilder.get_cudagraph_support(
+                MagicMock(),
+                kv_cache_spec,
+            ),
+            AttentionCGSupport.NEVER,
+        )
+
+    @patch.dict(
+        "os.environ",
+        {"VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION": "auto"},
+    )
+    @patch("vllm_ascend.attention.turboquant.has_turboquant_paged_dequant", return_value=False)
+    def test_turboquant_auto_without_fused_op_supports_graph_capture(self, _mock_has_fused_op):
+        from vllm_ascend.attention.turboquant import (
+            AscendTurboQuantMetadataBuilder,
+        )
+
+        kv_cache_spec = MagicMock()
+        kv_cache_spec.head_size = 128
+        self.assertEqual(
+            AscendTurboQuantMetadataBuilder.get_cudagraph_support(
+                MagicMock(),
+                kv_cache_spec,
+            ),
+            AttentionCGSupport.UNIFORM_BATCH,
+        )
+
+    @patch.dict(
+        "os.environ",
+        {"VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION": "grouped_gqa"},
+    )
+    def test_turboquant_grouped_gqa_supports_uniform_batch_graph_capture(self):
         from vllm_ascend.attention.turboquant import (
             AscendTurboQuantMetadataBuilder,
         )

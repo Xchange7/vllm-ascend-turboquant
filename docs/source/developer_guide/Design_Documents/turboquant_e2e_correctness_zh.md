@@ -26,15 +26,15 @@ bit packing、Lloyd-Max 分桶和元数据布局仍需独立 PyTorch/CPU oracle 
 | `native` | 原生 BF16/FP16 | CANN 原生 attention | 行为基线 |
 | `native_repeat` | 原生 BF16/FP16 | 与 `native` 相同 | 测量运行时和调度噪声底线 |
 | `tq_reference` | TurboQuant | FP32 旋转和 reference Triton | 隔离基础 TurboQuant/Triton 算法 |
-| `tq_auto` | TurboQuant | 低精度旋转和 grouped-GQA Triton | 验证生产 Triton 优化 |
-| `tq_ascend_fused` | TurboQuant | AscendC 反量化和 CANN FIA | 验证融合路径 |
+| `tq_auto` | TurboQuant | 算子可用时关闭图捕获，单 token 优先 AscendC+CANN FIA；不支持的 shape 回退 grouped-GQA | 验证生产自动分发 |
+| `tq_ascend_fused` | TurboQuant | 强制 AscendC 反量化和 CANN FIA | 验证融合路径和算子注册 |
 
 重点看三类比较：
 
 - `native -> native_repeat`：没有量化时的正常运行波动；
 - `native -> tq_reference`：基础 TurboQuant/Triton 相对原生模型的漂移；
-- `tq_reference -> tq_auto`：grouped GQA 和低精度旋转带来的额外漂移；
-- `tq_reference/tq_auto -> tq_ascend_fused`：AscendC 融合实现带来的额外漂移。
+- `tq_reference -> tq_auto`：生产自动路径相对 reference 的整体漂移；
+- `tq_auto -> tq_ascend_fused`：eager 单 token 下自动分发与显式融合路径是否一致。
 
 如果 `native -> tq_reference` 已经严重失败，应该先检查 Triton 量化和 decode，不应继续归因于融合算子。
 

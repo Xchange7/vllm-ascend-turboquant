@@ -200,8 +200,13 @@ and `tq_ascend_fused`. The key comparisons are:
 
 - `native -> native_repeat`: runtime and scheduling noise floor.
 - `native -> tq_reference`: TurboQuant cache format and reference Triton path.
-- `tq_reference -> tq_auto`: grouped GQA and activation-dtype rotation.
-- `tq_reference/tq_auto -> tq_ascend_fused`: AscendC fused-path drift.
+- `tq_reference -> tq_auto`: drift from the production automatic path. With
+  the custom operator installed, auto disables graph capture so single-token
+  decode selects AscendC paged dequantization plus CANN FIA. Unsupported shapes
+  use grouped GQA with activation-dtype rotation; select `grouped_gqa` explicitly
+  when validating ACLGraph.
+- `tq_auto -> tq_ascend_fused`: verifies that explicit fused mode matches the
+  automatic eager dispatch and fails fast when the operator is unavailable.
 
 Prefix caching and ACLGraph are disabled so the first run isolates KV-cache
 quantization. Long teacher-forcing inputs use 512-token chunked prefill so

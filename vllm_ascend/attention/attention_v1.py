@@ -187,6 +187,7 @@ class AscendMetadata:
     # TurboQuant fused decode state is owned by its metadata builder and
     # shared by every attention layer in a model step.
     turboquant_page_table: torch.Tensor | None = None
+    turboquant_page_table_builder: object | None = None
     turboquant_workspace: object | None = None
     actual_seq_lengths_q: list[int] = None  # type: ignore
 

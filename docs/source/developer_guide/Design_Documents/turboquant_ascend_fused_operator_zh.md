@@ -513,6 +513,20 @@ Attention 初始化时会校验：
 - head dimension 满足 AscendC 契约；
 - 扩展同时包含返回式和 out-style paged-dequant schema，否则在模型初始化阶段直接失败。
 
+默认的 `auto` 在算子已注册且 head dimension 受支持时会向 vLLM 声明不捕获 ACLGraph，避免图模式把
+单 token decode 固定到明显更慢的 packed kernel；没有 ALiBi/logits soft cap 时会自动进入
+`_run_ascend_fused_decode()`。算子缺失、不受支持的 shape 和 multi-token decode 保持 packed
+Triton 回退。需要 ACLGraph 时可显式设置 `grouped_gqa`；显式 `ascend_fused` 用于强制校验算子并在
+缺失时尽早失败。
+
+packed Triton decode 在 eager 下根据实际 batch、KV head 数和最大上下文选择 split-KV 并行度，目标是
+避免低并发时每个 program 串行扫描完整上下文。ACLGraph capture 无法根据 replay 时的实际 batch
+重新选择 specialization，因此固定使用配置允许的最大 2 的幂 split，同时保证第一维 grid 不超过
+Ascend 的 65535 上限。Q/K 旋转缓冲区挂在 attention layer 上重复使用；AscendC+CANN FIA 路径的
+page table staging 和 dense K/V/query workspace 则由 metadata builder 跨 layer、跨 step 共享。
+page table 使用非阻塞 event query 和多 staging slot，dense/FIA workspace 按 batch 和 sequence
+capacity 几何增长，decode 热路径不执行 host synchronize。
+
 `ascend_fused` 只在所有请求都是单 token decode 时进入
 `_run_ascend_fused_decode()`。multi-token decode、continuation prefill 等其他场景会把实现名转换为
 `auto`，回退到 packed Triton decode。
