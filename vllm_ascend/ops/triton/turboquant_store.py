@@ -507,8 +507,12 @@ def triton_turboquant_store(
             cache_f16,
             slot_mapping[token_start:token_end],
             stride_cache_block=kv_cache.stride(0),
-            stride_cache_position=kv_cache.stride(1),
-            stride_cache_head=kv_cache.stride(2),
+            # Cache layout V2 keeps all tokens of one KV head contiguous:
+            # [block, kv_head, token, packed_slot].  The public tensor shape
+            # remains [block, token, kv_head, packed_slot], so pass the
+            # physical V2 strides explicitly instead of the tensor strides.
+            stride_cache_position=kv_cache.stride(2),
+            stride_cache_head=kv_cache.shape[1] * kv_cache.stride(2),
             D=head_dim,
             NUM_KV_HEADS=num_kv_heads,
             CACHE_BLOCK_SIZE=kv_cache.shape[1],

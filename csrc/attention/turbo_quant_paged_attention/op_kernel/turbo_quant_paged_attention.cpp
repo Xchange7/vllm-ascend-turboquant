@@ -31,6 +31,7 @@ constexpr uint32_t STATE_STRIDE =
 constexpr uint32_t DEQUANT_METADATA_PLANES = 3U;
 constexpr uint32_t SOFTMAX_TMP_BYTES = 32U * 1024U;
 constexpr uint32_t PIPELINE_BUFFER_COUNT = 1U;
+constexpr uint32_t SLOT_LOAD_BATCH = 64U;
 constexpr float NORM_EPSILON = 1.0e-16F;
 constexpr float NEGATIVE_INFINITY = -3.402823466e38F;
 
@@ -164,7 +165,8 @@ class KernelTurboQuantPagedAttentionVector {
 
     pipe_->InitBuffer(
         slotBuffer_,
-        turbo_quant_attention_detail::AlignUbBytes(slotSize_));
+        turbo_quant_attention_detail::SLOT_LOAD_BATCH *
+            turbo_quant_attention_detail::AlignUbBytes(slotSize_));
     pipe_->InitBuffer(
         centroidBuffer_,
         turbo_quant_attention_detail::AlignUbBytes(
@@ -476,7 +478,8 @@ class KernelTurboQuantPagedAttentionVector {
     uint32_t pageOffset = tokenIndex % blockSize_;
     int32_t physicalBlock = blockTableGm_.GetValue(
         static_cast<uint64_t>(batchIndex) * maxPages_ + pageIndex);
-    for (uint32_t tileRow = localTokenStart; tileRow < end; ++tileRow) {
+    uint32_t tileRow = localTokenStart;
+    while (tileRow < end) {
       const uint32_t localRow = tileRow - localTokenStart;
       const uint32_t localOutputOffset =
           localRow * turbo_quant_attention_detail::HEAD_DIM;
@@ -492,22 +495,51 @@ class KernelTurboQuantPagedAttentionVector {
         currentValueScale_ = 0.0F;
         currentValueMinimum_ = 0.0F;
         PipeBarrier<PIPE_V>();
+        keyScaleStagingLocal_.SetValue(
+            localRow, currentKeyScale_);
+        valueScaleStagingLocal_.SetValue(
+            localRow, currentValueScale_);
+        valueMinimumStagingLocal_.SetValue(
+            localRow, currentValueMinimum_);
+        ++tileRow;
+        ++pageOffset;
       } else {
+        uint32_t loadCount = end - tileRow;
+        const uint32_t pageRemaining = blockSize_ - pageOffset;
+        if (loadCount > pageRemaining) {
+          loadCount = pageRemaining;
+        }
+        if (loadCount >
+            turbo_quant_attention_detail::SLOT_LOAD_BATCH) {
+          loadCount =
+              turbo_quant_attention_detail::SLOT_LOAD_BATCH;
+        }
         const uint64_t slotIndex =
-            (static_cast<uint64_t>(physicalBlock) * blockSize_ +
-             pageOffset) *
-                numKvHeads_ +
-            kvHeadIndex;
-        DequantizeSlot(slotIndex * slotSize_, localOutputOffset);
+            (static_cast<uint64_t>(physicalBlock) * numKvHeads_ +
+             kvHeadIndex) *
+                blockSize_ +
+            pageOffset;
+        LoadSlotBatch(slotIndex * slotSize_, loadCount);
+        const uint32_t slotUbStride =
+            turbo_quant_attention_detail::AlignUbBytes(slotSize_);
+        for (uint32_t loadIndex = 0U; loadIndex < loadCount;
+             ++loadIndex) {
+          const uint32_t batchLocalRow = localRow + loadIndex;
+          DequantizeStagedSlot(
+              loadIndex * slotUbStride,
+              batchLocalRow *
+                  turbo_quant_attention_detail::HEAD_DIM);
+          keyScaleStagingLocal_.SetValue(
+              batchLocalRow, currentKeyScale_);
+          valueScaleStagingLocal_.SetValue(
+              batchLocalRow, currentValueScale_);
+          valueMinimumStagingLocal_.SetValue(
+              batchLocalRow, currentValueMinimum_);
+        }
+        tileRow += loadCount;
+        pageOffset += loadCount;
       }
-      keyScaleStagingLocal_.SetValue(
-          localRow, currentKeyScale_);
-      valueScaleStagingLocal_.SetValue(
-          localRow, currentValueScale_);
-      valueMinimumStagingLocal_.SetValue(
-          localRow, currentValueMinimum_);
-      ++pageOffset;
-      if (pageOffset == blockSize_ && tileRow + 1U < end) {
+      if (pageOffset == blockSize_ && tileRow < end) {
         ++pageIndex;
         pageOffset = 0U;
         physicalBlock = blockTableGm_.GetValue(
@@ -610,16 +642,21 @@ class KernelTurboQuantPagedAttentionVector {
     PipeBarrier<PIPE_V>();
   }
 
-  __aicore__ inline void DequantizeSlot(
-      uint64_t cacheOffset, uint32_t localOutputOffset) {
-    DataCopyExtParams cacheCopyParams{1, slotSize_, 0, 0, 0};
+  __aicore__ inline void LoadSlotBatch(
+      uint64_t cacheOffset, uint32_t slotCount) {
+    DataCopyExtParams cacheCopyParams{
+        static_cast<uint16_t>(slotCount), slotSize_, 0, 0, 0};
     DataCopyPadExtParams<uint8_t> cachePadParams{false, 0, 0, 0};
     DataCopyPad(slotLocal_, kvCacheGm_[cacheOffset], cacheCopyParams,
                 cachePadParams);
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+  }
 
-    LocalTensor<half> slotHalf = slotLocal_.ReinterpretCast<half>();
+  __aicore__ inline void DequantizeStagedSlot(
+      uint32_t slotByteBase, uint32_t localOutputOffset) {
+    LocalTensor<half> slotHalf =
+        slotLocal_[slotByteBase].ReinterpretCast<half>();
     const float cachedKeyScale = static_cast<float>(
         slotHalf.GetValue(
             turbo_quant_attention_detail::KEY_DATA_BYTES / 2U));
@@ -636,7 +673,7 @@ class KernelTurboQuantPagedAttentionVector {
 
     SetFlag<HardEvent::S_V>(EVENT_ID0);
     WaitFlag<HardEvent::S_V>(EVENT_ID0);
-    DequantizeKeyCodes(0U);
+    DequantizeKeyCodes(slotByteBase);
     // The value unpack reuses the packed-nibble UB buffers. A PIPE_V barrier
     // orders vector instructions but does not make those buffers safe for
     // scalar-controlled reuse; retire the key decode before starting V.
@@ -644,7 +681,7 @@ class KernelTurboQuantPagedAttentionVector {
     WaitFlag<HardEvent::V_S>(EVENT_ID0);
     currentKeyScale_ = cachedKeyScale * scale_;
 
-    DequantizeValueCodes(valueBase);
+    DequantizeValueCodes(slotByteBase + valueBase);
 
     if constexpr (IsSameType<T, bfloat16_t>::value) {
       Cast(keyOutputLocal_[localOutputOffset], keyFloatLocal_,

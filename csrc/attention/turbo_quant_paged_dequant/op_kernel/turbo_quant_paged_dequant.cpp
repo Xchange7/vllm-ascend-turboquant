@@ -143,7 +143,7 @@ class KernelTurboQuantPagedDequant {
     const uint32_t tokenCount = blockSize_ < remainingTokens ? blockSize_ : remainingTokens;
     for (uint32_t pageOffset = 0; pageOffset < tokenCount; ++pageOffset) {
       const uint64_t slotIndex =
-          (static_cast<uint64_t>(physicalBlockValue) * blockSize_ + pageOffset) * numKvHeads_ + headIndex;
+          (static_cast<uint64_t>(physicalBlockValue) * numKvHeads_ + headIndex) * blockSize_ + pageOffset;
       const uint64_t outputIndex =
           ((static_cast<uint64_t>(batchIndex) * numKvHeads_ + headIndex) * maxSeqLen_ + pageStart + pageOffset) *
           HEAD_DIM;

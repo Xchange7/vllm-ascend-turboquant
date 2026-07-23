@@ -570,8 +570,10 @@ def test_turboquant_store_writes_valid_slots(cache_dtype, head_dim):
     )
     torch.npu.synchronize()
 
-    assert torch.count_nonzero(cache[0, 0].cpu()) > 0
-    assert torch.count_nonzero(cache[1, 1].cpu()) > 0
+    flat_cache = cache.view(-1, config.slot_size_aligned)
+    # Layout V2 is physically [block, kv_head, token, packed_slot].
+    assert torch.count_nonzero(flat_cache[[0, 128]].cpu()) > 0
+    assert torch.count_nonzero(flat_cache[[257, 385]].cpu()) > 0
 
 
 @npu_test(num_npus=1, npu_type="a2")

@@ -71,6 +71,9 @@ def gather_paged_slots(
         )
 
     block_size = cache.shape[1]
+    num_kv_heads = cache.shape[2]
+    flat_cache = cache.view(-1, cache.shape[-1])
+    head_indices = torch.arange(num_kv_heads, dtype=torch.int64)
     requests = []
     for request_index, seq_len in enumerate(seq_lens):
         if seq_len <= 0:
@@ -85,7 +88,14 @@ def gather_paged_slots(
         physical_blocks = block_table[request_index, logical_blocks].long()
         if torch.any(physical_blocks < 0) or torch.any(physical_blocks >= cache.shape[0]):
             raise ValueError(f"Request {request_index} contains an invalid physical block.")
-        requests.append(cache[physical_blocks, positions % block_size])
+        # Cache layout V2 is physically [block, kv_head, token, slot] while
+        # preserving the public [block, token, kv_head, slot] tensor shape.
+        slot_indices = (
+            (physical_blocks[:, None] * num_kv_heads + head_indices[None, :])
+            * block_size
+            + (positions % block_size)[:, None]
+        )
+        requests.append(flat_cache[slot_indices])
     return torch.cat(requests, dim=0)
 
 
