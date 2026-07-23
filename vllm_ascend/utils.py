@@ -503,7 +503,14 @@ def vllm_version_is(target_vllm_version: str):
 
         vllm_version = vllm.__version__
     try:
-        return Version(vllm_version) == Version(target_vllm_version)
+        installed_version = Version(vllm_version)
+        target_version = Version(target_vllm_version)
+        # Local version labels describe how an otherwise identical vLLM build
+        # was packaged (for example, the ``0.20.2+empty`` wheel used by the
+        # Ascend source-build workflow).  They must not select a different
+        # compatibility branch.  Keep pre/dev/post releases significant by
+        # comparing the public versions rather than only ``base_version``.
+        return installed_version.public == target_version.public
     except InvalidVersion:
         raise ValueError(
             f"Invalid vllm version {vllm_version} found. A dev version of vllm "

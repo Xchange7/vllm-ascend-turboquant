@@ -37,6 +37,7 @@ from vllm_ascend.ops.triton.turboquant_decode import (
     _ASCEND_MAX_TRITON_GRID_SIZE,
     _dequant_launch_ranges,
     _supports_grouped_gqa,
+    select_turboquant_grouped_block_kv,
     select_turboquant_num_kv_splits,
     triton_turboquant_decode_attention,
     triton_turboquant_dequant_paged_cache,
@@ -294,6 +295,8 @@ def test_turboquant_ascend_fused_decode_matches_packed_decode():
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_kv_heads = cache.shape[2]
     impl.num_heads = query.shape[1]
+    impl.head_size = query.shape[-1]
+    impl.max_num_seqs = len(seq_lens_list)
     impl.scale = 1 / math.sqrt(query.shape[-1])
     impl.tq_config = config
     page_table = _build_turboquant_page_table_cpu(seq_lens_list, cache.shape[1]).to(query.device)
@@ -403,6 +406,33 @@ def test_turboquant_split_selection_without_host_sequence_length():
             max_sequence_length=None,
         )
         == 4
+    )
+
+
+@pytest.mark.parametrize(
+    ("sequence_length", "num_kv_splits", "expected"),
+    [
+        (None, 32, 16),
+        (512, 32, 16),
+        (992, 32, 16),
+        (993, 32, 32),
+        (1023, 32, 32),
+        (1024, 32, 32),
+        (16384, 32, 32),
+        (512, 4, 32),
+    ],
+)
+def test_turboquant_grouped_block_kv_selection(
+    sequence_length,
+    num_kv_splits,
+    expected,
+):
+    assert (
+        select_turboquant_grouped_block_kv(
+            sequence_length,
+            num_kv_splits,
+        )
+        == expected
     )
 
 
@@ -1109,6 +1139,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
     )
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_heads = num_query_heads
+    impl.num_kv_heads = num_kv_heads
     impl.head_size = head_dim
     impl.scale = 1 / math.sqrt(head_dim)
     impl.alibi_slopes = None
@@ -1116,6 +1147,7 @@ def test_turboquant_store_and_decode_aclgraph_replay_matches_eager():
     impl.tq_config = config
     impl.max_num_kv_splits = num_splits
     impl.decode_implementation = "auto"
+    impl.ascend_fused_available = False
     output = torch.empty_like(query)
 
     # Warm up compilation before entering the graph capture scope.

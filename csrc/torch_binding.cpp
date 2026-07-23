@@ -912,6 +912,109 @@ std::tuple<at::Tensor, at::Tensor> npu_turboquant_paged_dequant(
                                             key, value);
 }
 
+at::Tensor npu_turboquant_paged_attention_out(
+    const at::Tensor& query,
+    const at::Tensor& kvCache,
+    const at::Tensor& blockTable,
+    const at::Tensor& seqLens,
+    const at::Tensor& centroids,
+    double scale,
+    int64_t maxSeqLen,
+    int64_t keyBits,
+    int64_t keyPackedSize,
+    int64_t valueBits,
+    bool normCorrection,
+    int64_t maxNumSplits,
+    at::Tensor& output) {
+    TORCH_CHECK(query.dim() == 3,
+                "TurboQuant attention query must have shape [B, Nq, D].");
+    TORCH_CHECK(kvCache.dim() == 4,
+                "TurboQuant KV cache must have shape [blocks, block_size, Nkv, slot_size].");
+    TORCH_CHECK(blockTable.dim() == 2,
+                "TurboQuant block table must be two-dimensional.");
+    TORCH_CHECK(seqLens.dim() == 1,
+                "TurboQuant sequence lengths must be one-dimensional.");
+    TORCH_CHECK(centroids.dim() == 1,
+                "TurboQuant centroids must be one-dimensional.");
+    TORCH_CHECK(query.scalar_type() == at::kHalf ||
+                    query.scalar_type() == at::kBFloat16,
+                "TurboQuant attention query must use FP16 or BF16.");
+    TORCH_CHECK(kvCache.scalar_type() == at::kByte,
+                "TurboQuant KV cache must use uint8.");
+    TORCH_CHECK(blockTable.scalar_type() == at::kInt &&
+                    seqLens.scalar_type() == at::kInt,
+                "TurboQuant block table and sequence lengths must use int32.");
+    TORCH_CHECK(centroids.scalar_type() == at::kFloat,
+                "TurboQuant centroids must use float32.");
+    TORCH_CHECK(query.size(0) == blockTable.size(0) &&
+                    query.size(0) == seqLens.size(0),
+                "TurboQuant attention batch dimensions must match.");
+    TORCH_CHECK(query.size(2) == 128,
+                "TurboQuant pipelined attention currently supports head dimension 128.");
+    TORCH_CHECK(query.size(1) % kvCache.size(2) == 0 &&
+                    query.size(1) / kvCache.size(2) == 8,
+                "TurboQuant pipelined attention currently supports GQA group size 8.");
+    TORCH_CHECK(keyBits == 4 && valueBits == 4 && normCorrection,
+                "TurboQuant pipelined attention currently supports K4V4 with norm correction.");
+    TORCH_CHECK(scale > 0.0 && std::isfinite(scale),
+                "TurboQuant attention scale must be finite and positive.");
+    TORCH_CHECK(maxSeqLen > 0 &&
+                    maxSeqLen <= blockTable.size(1) * kvCache.size(1),
+                "TurboQuant maxSeqLen must fit in the block table.");
+    TORCH_CHECK(maxNumSplits > 0,
+                "TurboQuant maxNumSplits must be positive.");
+    const int64_t expectedKeyPackedSize = query.size(2) / 2 + 2;
+    const int64_t expectedSlotSize =
+        expectedKeyPackedSize + query.size(2) / 2 + 4;
+    TORCH_CHECK(keyPackedSize == expectedKeyPackedSize &&
+                    kvCache.size(3) == expectedSlotSize,
+                "TurboQuant packed cache layout is incompatible with K4V4 D=128.");
+    TORCH_CHECK(centroids.size(0) >= 16,
+                "TurboQuant centroid table must contain at least 16 entries.");
+    const auto queryDevice = query.device();
+    TORCH_CHECK(kvCache.device() == queryDevice &&
+                    blockTable.device() == queryDevice &&
+                    seqLens.device() == queryDevice &&
+                    centroids.device() == queryDevice,
+                "TurboQuant attention inputs must be on the same device.");
+    TORCH_CHECK(query.is_contiguous() && kvCache.is_contiguous() &&
+                    blockTable.is_contiguous() && seqLens.is_contiguous() &&
+                    centroids.is_contiguous(),
+                "TurboQuant attention inputs must be contiguous.");
+    TORCH_CHECK(output.sizes() == query.sizes(),
+                "TurboQuant attention output must match the query shape.");
+    TORCH_CHECK(output.scalar_type() == query.scalar_type() &&
+                    output.device() == queryDevice && output.is_contiguous(),
+                "TurboQuant attention output must match the query dtype/device "
+                "and be contiguous.");
+
+    EXEC_NPU_CMD(aclnnTurboQuantPagedAttention, query, kvCache, blockTable,
+                 seqLens, centroids, scale, maxSeqLen, keyBits,
+                 keyPackedSize, valueBits, normCorrection, maxNumSplits,
+                 output);
+    return output;
+}
+
+at::Tensor npu_turboquant_paged_attention(
+    const at::Tensor& query,
+    const at::Tensor& kvCache,
+    const at::Tensor& blockTable,
+    const at::Tensor& seqLens,
+    const at::Tensor& centroids,
+    double scale,
+    int64_t maxSeqLen,
+    int64_t keyBits,
+    int64_t keyPackedSize,
+    int64_t valueBits,
+    bool normCorrection,
+    int64_t maxNumSplits) {
+    at::Tensor output = at::empty_like(query);
+    return npu_turboquant_paged_attention_out(
+        query, kvCache, blockTable, seqLens, centroids, scale, maxSeqLen,
+        keyBits, keyPackedSize, valueBits, normCorrection, maxNumSplits,
+        output);
+}
+
 at::Tensor npu_sign_bits_pack(const at::Tensor& input,
                                    const int64_t size) {
     int64_t ySize = (input.size(0) + 7) / 8;
@@ -2667,6 +2770,21 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_turboquant_paged_dequant_out", torch::kPrivateUse1,
              &vllm_ascend::npu_turboquant_paged_dequant_out);
+    ops.def(
+        "npu_turboquant_paged_attention(Tensor query, Tensor kv_cache, Tensor block_table, "
+        "Tensor seq_lens, Tensor centroids, float scale, int max_seq_len, int key_bits, "
+        "int key_packed_size, int value_bits, bool norm_correction, int max_num_splits) -> Tensor"
+    );
+    ops.impl("npu_turboquant_paged_attention", torch::kPrivateUse1,
+             &vllm_ascend::npu_turboquant_paged_attention);
+    ops.def(
+        "npu_turboquant_paged_attention_out(Tensor query, Tensor kv_cache, Tensor block_table, "
+        "Tensor seq_lens, Tensor centroids, float scale, int max_seq_len, int key_bits, "
+        "int key_packed_size, int value_bits, bool norm_correction, int max_num_splits, "
+        "Tensor(a!) output) -> Tensor(a!)"
+    );
+    ops.impl("npu_turboquant_paged_attention_out", torch::kPrivateUse1,
+             &vllm_ascend::npu_turboquant_paged_attention_out);
 
     ops.def("npu_sign_bits_pack(Tensor input, int size) -> Tensor");
     ops.impl("npu_sign_bits_pack", torch::kPrivateUse1, &vllm_ascend::npu_sign_bits_pack);

@@ -34,7 +34,10 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
 
-from vllm_ascend.attention.turboquant import _build_hadamard
+from vllm_ascend.attention.turboquant import (
+    _build_hadamard,
+    _build_pipelined_compute_rotation,
+)
 from vllm_ascend.kv_cache.turboquant import get_turboquant_config
 from vllm_ascend.ops.triton.turboquant_decode import (
     triton_turboquant_decode_attention,
@@ -42,7 +45,9 @@ from vllm_ascend.ops.triton.turboquant_decode import (
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
 from vllm_ascend.ops.turboquant import (
+    has_turboquant_paged_attention,
     has_turboquant_paged_dequant,
+    turboquant_paged_attention_out,
     turboquant_paged_dequant,
 )
 
@@ -77,6 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--num-kv-splits", type=int, default=4)
+    parser.add_argument(
+        "--grouped-block-kv",
+        choices=(8, 16, 32),
+        type=int,
+        default=16,
+    )
     parser.add_argument(
         "--decode-implementation",
         choices=("auto", "reference", "grouped_gqa"),
@@ -253,7 +264,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not has_turboquant_paged_dequant():
         raise RuntimeError(
             "TurboQuant paged-dequant return/out schemas are unavailable; "
-            "clean and rebuild vLLM Ascend with SOC_VERSION=ascend910b4."
+            "clean and rebuild vLLM Ascend with SOC_VERSION matching the physical NPU."
         )
 
     torch.npu.set_device(args.device)
@@ -425,6 +436,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         buffer_holder=SimpleNamespace(),
         compute_rotation=(None if args.decode_implementation == "reference" else compute_rotation),
         implementation=args.decode_implementation,
+        grouped_block_kv=args.grouped_block_kv,
     )
     if args.decode_implementation == "reference":
         query_rotated = (query.float() @ hadamard).to(query.dtype).contiguous()
@@ -464,6 +476,54 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         atol=2.0e-2,
         rtol=2.0e-2,
     )
+    pipelined_attention: dict[str, Any] = {
+        "passed": True,
+        "skipped": True,
+        "reason": (
+            "requires the pipelined operator, D=128, GQA group=8, "
+            "and K4V4 norm-corrected cache"
+        ),
+    }
+    if (
+        has_turboquant_paged_attention()
+        and args.head_dim == 128
+        and args.num_query_heads == args.num_kv_heads * 8
+        and config.key_quant_bits == 4
+        and config.value_quant_bits == 4
+        and config.norm_correction
+    ):
+        pipelined_output = torch.empty_like(query)
+        pipelined_query = (
+            query
+            @ _build_pipelined_compute_rotation(
+                args.head_dim,
+                str(query.device),
+                query.dtype,
+            )
+        ).contiguous()
+        turboquant_paged_attention_out(
+            pipelined_query,
+            cache,
+            block_table,
+            seq_lens,
+            centroids,
+            pipelined_output,
+            scale=1 / math.sqrt(args.head_dim),
+            max_seq_len=max_seq_len,
+            key_bits=config.key_quant_bits,
+            key_packed_size=config.key_packed_size,
+            value_bits=config.value_quant_bits,
+            norm_correction=config.norm_correction,
+            max_num_splits=args.num_kv_splits,
+        )
+        torch.npu.synchronize()
+        pipelined_attention = close_result(
+            pipelined_output,
+            packed_output,
+            atol=2.0e-2,
+            rtol=2.0e-2,
+        )
+        pipelined_attention["skipped"] = False
 
     native_capacity_bytes = (
         cache.shape[0] * args.block_size * args.num_kv_heads * 2 * args.head_dim * key.element_size()
@@ -474,6 +534,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and key_implementation["passed"]
         and value_implementation["passed"]
         and attention_agreement["passed"]
+        and pipelined_attention["passed"]
         and key_cpu_reference["passed"]
         and value_cpu_reference["passed"]
         and packed_cpu_reference["passed"]
@@ -502,6 +563,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "ascend_key_vs_triton": key_implementation,
             "ascend_value_vs_triton": value_implementation,
             "ascend_fia_vs_packed_decode": attention_agreement,
+            "ascend_pipeline_vs_packed_decode": pipelined_attention,
             "triton_key_vs_cpu_reference": key_cpu_reference,
             "triton_value_vs_cpu_reference": value_cpu_reference,
             "packed_decode_vs_cpu_reference": packed_cpu_reference,

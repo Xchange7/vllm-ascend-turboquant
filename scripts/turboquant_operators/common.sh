@@ -15,19 +15,26 @@ TQ_PROFILE_SCRIPT="${TQ_SCRIPT_ROOT}/performance/profile_kernels.py"
 TQ_ENVIRONMENT_SCRIPT="${TQ_SCRIPT_ROOT}/common/check_environment.py"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DEVICE="${DEVICE:-0}"
-SOC_VERSION="${SOC_VERSION:-ascend910b4}"
+source "${OPERATOR_SCRIPT_DIR}/soc_utils.sh"
+DETECTED_SOC_VERSION=""
+if [[ -z "${SOC_VERSION:-}" ]]; then
+    SOC_VERSION="$(detect_turboquant_soc_version "${PYTHON_BIN}")"
+    DETECTED_SOC_VERSION="${SOC_VERSION}"
+else
+    SOC_VERSION="$(resolve_turboquant_soc_version "${SOC_VERSION}" "${PYTHON_BIN}")"
+fi
 
 export SOC_VERSION
 
 readonly OPERATOR_SCRIPT_DIR REPO_ROOT TQ_SCRIPT_ROOT TQ_PROFILE_SCRIPT
 readonly TQ_ENVIRONMENT_SCRIPT PYTHON_BIN DEVICE
 
-check_910b4_target() {
+check_supported_target() {
     case "${SOC_VERSION}" in
-        ascend910b4|ascend910b4-1)
+        ascend910b4|ascend910b4-1|ascend910_93*)
             ;;
         *)
-            printf 'WARNING: SOC_VERSION=%s; this suite defaults to Ascend 910B4.\n' "${SOC_VERSION}"
+            printf 'WARNING: SOC_VERSION=%s is not a validated TurboQuant A2/A3 target.\n' "${SOC_VERSION}"
             ;;
     esac
 }
@@ -47,18 +54,24 @@ collect_environment() {
         printf 'ASCEND_TOOLKIT_HOME=%s\n' "${ASCEND_TOOLKIT_HOME:-<unset>}"
     } > "${output_dir}/environment.txt"
 
-    check_910b4_target | tee -a "${output_dir}/environment.txt"
-    "${PYTHON_BIN}" "${TQ_ENVIRONMENT_SCRIPT}" | tee -a "${output_dir}/environment.txt"
+    check_supported_target | tee -a "${output_dir}/environment.txt"
+    validate_turboquant_soc_matches_device "${SOC_VERSION}" "${PYTHON_BIN}" "${DETECTED_SOC_VERSION}" \
+        | tee -a "${output_dir}/environment.txt" || return
+    "${PYTHON_BIN}" "${TQ_ENVIRONMENT_SCRIPT}" | tee -a "${output_dir}/environment.txt" || return
     "${PYTHON_BIN}" - <<'PY' | tee -a "${output_dir}/environment.txt"
 from vllm_ascend.ops.turboquant import has_turboquant_paged_dequant
 
 if not has_turboquant_paged_dequant():
     raise RuntimeError(
         "TurboQuant paged-dequant return/out schemas are not registered. Set "
-        "SOC_VERSION=ascend910b4, clean build/csrc/build, and reinstall."
+        "SOC_VERSION for the physical A2/A3 device, clean csrc/build, and reinstall."
     )
 print("npu_turboquant_paged_dequant=registered (return+out)")
 PY
+    local schema_status=${PIPESTATUS[0]}
+    if ((schema_status != 0)); then
+        return "${schema_status}"
+    fi
 
     if command -v npu-smi >/dev/null 2>&1; then
         npu-smi info > "${output_dir}/npu_smi_before.txt" 2>&1 || true

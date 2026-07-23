@@ -25,7 +25,7 @@ _GROUPED_GQA_MIN_GROUP_SIZE = 4
 _GROUPED_GQA_MAX_GROUP_SIZE = 32
 _GROUPED_GQA_MAX_HEAD_DIM = 128
 _GROUPED_GQA_BLOCK_KV = 16
-_GROUPED_GQA_BLOCK_KV_OPTIONS = (16, 32)
+_GROUPED_GQA_BLOCK_KV_OPTIONS = (8, 16, 32)
 _ASCEND_MAX_TRITON_GRID_SIZE = 65535
 
 # Keep enough stage-1 programs to occupy the NPU. Grouped GQA launches one
@@ -154,7 +154,12 @@ def _turboquant_decode_stage1(
             other=0.0,
         ).to(tl.float32)
 
-        if NORM_CORRECTION:
+        key_scale = tl.load(
+            cache_f16_ptr + (slot_bases + MSE_BYTES) // 2,
+            mask=position_mask,
+            other=0.0,
+        ).to(tl.float32)
+        if not NORM_CORRECTION:
             centroid_norm_sq = tl.sum(
                 tl.where(
                     d_mask[None, :],
@@ -163,7 +168,7 @@ def _turboquant_decode_stage1(
                 ),
                 axis=1,
             )
-            centroid_values *= (1.0 / tl.sqrt(centroid_norm_sq + 1e-16))[:, None]
+            key_scale *= tl.sqrt(centroid_norm_sq + 1e-16)
 
         key_dot = tl.sum(
             tl.where(
@@ -173,12 +178,7 @@ def _turboquant_decode_stage1(
             ),
             axis=1,
         )
-        key_norm = tl.load(
-            cache_f16_ptr + (slot_bases + MSE_BYTES) // 2,
-            mask=position_mask,
-            other=0.0,
-        ).to(tl.float32)
-        scores = key_norm * key_dot * ATTENTION_SCALE
+        scores = key_scale * key_dot * ATTENTION_SCALE
         if LOGITS_SOFT_CAP > 0:
             scores = LOGITS_SOFT_CAP * _tanh(scores / LOGITS_SOFT_CAP)
         if HAS_ALIBI:
@@ -317,14 +317,11 @@ def _turboquant_grouped_gqa_stage1(
         other=0.0,
     )
 
-    key_bit_offsets = dimension_offsets * KEY_BITS
-    key_byte_indices = key_bit_offsets // 8
-    key_bit_shifts = key_bit_offsets % 8
-    key_mask = (1 << KEY_BITS) - 1
-    if VALUE_BITS == 3:
-        value_bit_offsets = dimension_offsets * 3
-        value_byte_indices = value_bit_offsets // 8
-        value_bit_shifts = value_bit_offsets % 8
+    packed_dimension_offsets = tl.arange(0, BLOCK_D // 2)
+    packed_dimension_mask = packed_dimension_offsets < tl.cdiv(HEAD_DIM, 2)
+    packed_group_offsets = tl.arange(0, BLOCK_D // 8)
+    packed_group_mask = packed_group_offsets < tl.cdiv(HEAD_DIM, 8)
+    packed_lane_shifts = tl.arange(0, 8) * 3
 
     running_max = tl.zeros([BLOCK_Q], dtype=tl.float32) - float("inf")
     running_sum = tl.zeros([BLOCK_Q], dtype=tl.float32)
@@ -350,24 +347,59 @@ def _turboquant_grouped_gqa_stage1(
             + tl.cast(kv_head, tl.int64) * stride_cache_head
         )
 
-        key_addresses = slot_bases[:, None] + key_byte_indices[None, :]
-        key_byte_0 = tl.load(
-            cache_u8_ptr + key_addresses,
-            mask=position_mask[:, None] & dimension_mask[None, :],
-            other=0,
-        ).to(tl.int32)
-        key_byte_1 = tl.load(
-            cache_u8_ptr + key_addresses + 1,
-            mask=position_mask[:, None] & dimension_mask[None, :],
-            other=0,
-        ).to(tl.int32)
-        key_indices = ((key_byte_0 | (key_byte_1 << 8)) >> key_bit_shifts[None, :]) & key_mask
+        if KEY_BITS == 3:
+            # Eight 3-bit values occupy exactly three bytes. Load each source
+            # byte once, then expand the packed words in UB.
+            key_addresses = (
+                slot_bases[:, None] + packed_group_offsets[None, :] * 3
+            )
+            key_byte_0 = tl.load(
+                cache_u8_ptr + key_addresses,
+                mask=position_mask[:, None] & packed_group_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            key_byte_1 = tl.load(
+                cache_u8_ptr + key_addresses + 1,
+                mask=position_mask[:, None] & packed_group_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            key_byte_2 = tl.load(
+                cache_u8_ptr + key_addresses + 2,
+                mask=position_mask[:, None] & packed_group_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            key_words = key_byte_0 | (key_byte_1 << 8) | (key_byte_2 << 16)
+            key_indices = tl.reshape(
+                (
+                    key_words[:, :, None]
+                    >> packed_lane_shifts[None, None, :]
+                )
+                & 0x7,
+                (BLOCK_KV, BLOCK_D),
+            )
+        else:
+            # Load each packed byte exactly once. The generic per-dimension
+            # formulation addresses every 4-bit byte twice and is especially
+            # costly for the scattered paged-cache access on Ascend.
+            key_packed = tl.load(
+                cache_u8_ptr
+                + slot_bases[:, None]
+                + packed_dimension_offsets[None, :],
+                mask=position_mask[:, None] & packed_dimension_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            key_indices = tl.interleave(key_packed & 0xF, key_packed >> 4)
         centroid_values = tl.load(
             centroids_ptr + key_indices,
             mask=position_mask[:, None] & dimension_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        if NORM_CORRECTION:
+        key_scale = tl.load(
+            cache_f16_ptr + (slot_bases + MSE_BYTES) // 2,
+            mask=position_mask,
+            other=0.0,
+        ).to(tl.float32)
+        if not NORM_CORRECTION:
             centroid_norm_sq = tl.sum(
                 tl.where(
                     dimension_mask[None, :],
@@ -376,18 +408,13 @@ def _turboquant_grouped_gqa_stage1(
                 ),
                 axis=1,
             )
-            centroid_values *= (1.0 / tl.sqrt(centroid_norm_sq + 1e-16))[:, None]
+            key_scale *= tl.sqrt(centroid_norm_sq + 1e-16)
 
         key_dot = tl.dot(
             query_rotated,
             tl.trans(centroid_values.to(query_rotated_ptr.dtype.element_ty)),
         )
-        key_norm = tl.load(
-            cache_f16_ptr + (slot_bases + MSE_BYTES) // 2,
-            mask=position_mask,
-            other=0.0,
-        ).to(tl.float32)
-        scores = key_dot * key_norm[None, :] * ATTENTION_SCALE
+        scores = key_dot * key_scale[None, :] * ATTENTION_SCALE
         if LOGITS_SOFT_CAP > 0:
             scores = LOGITS_SOFT_CAP * _tanh(scores / LOGITS_SOFT_CAP)
         if HAS_ALIBI:
@@ -416,27 +443,44 @@ def _turboquant_grouped_gqa_stage1(
 
         value_bases = slot_bases + KPS
         if VALUE_BITS == 3:
-            value_addresses = value_bases[:, None] + value_byte_indices[None, :]
+            value_addresses = (
+                value_bases[:, None] + packed_group_offsets[None, :] * 3
+            )
             value_byte_0 = tl.load(
                 cache_u8_ptr + value_addresses,
-                mask=position_mask[:, None] & dimension_mask[None, :],
+                mask=position_mask[:, None] & packed_group_mask[None, :],
                 other=0,
             ).to(tl.int32)
             value_byte_1 = tl.load(
                 cache_u8_ptr + value_addresses + 1,
-                mask=position_mask[:, None] & dimension_mask[None, :],
+                mask=position_mask[:, None] & packed_group_mask[None, :],
                 other=0,
             ).to(tl.int32)
-            value_indices = ((value_byte_0 | (value_byte_1 << 8)) >> value_bit_shifts[None, :]) & 0x7
+            value_byte_2 = tl.load(
+                cache_u8_ptr + value_addresses + 2,
+                mask=position_mask[:, None] & packed_group_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            value_words = (
+                value_byte_0 | (value_byte_1 << 8) | (value_byte_2 << 16)
+            )
+            value_indices = tl.reshape(
+                (
+                    value_words[:, :, None]
+                    >> packed_lane_shifts[None, None, :]
+                )
+                & 0x7,
+                (BLOCK_KV, BLOCK_D),
+            )
         else:
-            value_byte_indices_4 = dimension_offsets // 2
-            value_bit_shifts_4 = (dimension_offsets % 2) * 4
-            value_byte = tl.load(
-                cache_u8_ptr + value_bases[:, None] + value_byte_indices_4[None, :],
-                mask=position_mask[:, None] & dimension_mask[None, :],
+            value_packed = tl.load(
+                cache_u8_ptr
+                + value_bases[:, None]
+                + packed_dimension_offsets[None, :],
+                mask=position_mask[:, None] & packed_dimension_mask[None, :],
                 other=0,
             ).to(tl.int32)
-            value_indices = (value_byte >> value_bit_shifts_4[None, :]) & 0xF
+            value_indices = tl.interleave(value_packed & 0xF, value_packed >> 4)
 
         value_metadata_base = value_bases + VALUE_DATA_BYTES
         value_scale = tl.load(
@@ -449,11 +493,15 @@ def _turboquant_grouped_gqa_stage1(
             mask=position_mask,
             other=0.0,
         ).to(tl.float32)
-        values = value_indices.to(tl.float32) * value_scale[:, None] + value_minimum[:, None]
+        scaled_probabilities = probabilities * value_scale[None, :]
         weighted_values = tl.dot(
-            probabilities.to(query_rotated_ptr.dtype.element_ty),
-            values.to(query_rotated_ptr.dtype.element_ty),
+            scaled_probabilities.to(query_rotated_ptr.dtype.element_ty),
+            value_indices.to(query_rotated_ptr.dtype.element_ty),
         )
+        weighted_values += tl.sum(
+            probabilities * value_minimum[None, :],
+            axis=1,
+        )[:, None]
 
         accumulator = accumulator * previous_scale[:, None] + weighted_values
         running_sum = running_sum * previous_scale + tl.sum(probabilities, axis=1)
@@ -611,14 +659,16 @@ def _turboquant_full_dequant_kernel(
         mask=d_mask,
         other=0.0,
     ).to(tl.float32)
-    if NORM_CORRECTION:
+    key_scale = tl.load(
+        cache_f16_ptr + (slot_base + MSE_BYTES) // 2,
+    ).to(tl.float32)
+    if not NORM_CORRECTION:
         key_norm_sq = tl.sum(
             tl.where(d_mask, key_values * key_values, 0.0),
             axis=0,
         )
-        key_values *= 1.0 / tl.sqrt(key_norm_sq + 1e-16)
-    original_norm = tl.load(cache_f16_ptr + (slot_base + MSE_BYTES) // 2).to(tl.float32)
-    key_values *= original_norm
+        key_scale *= tl.sqrt(key_norm_sq + 1e-16)
+    key_values *= key_scale
 
     value_base = slot_base + KPS
     if VALUE_BITS == 3:
@@ -777,6 +827,29 @@ def select_turboquant_num_kv_splits(
             1 << (max_sequence_length.bit_length() - 1),
         )
     return max(1, min(required_splits, split_limit))
+
+
+def select_turboquant_grouped_block_kv(
+    max_sequence_length: int | None,
+    num_kv_splits: int,
+) -> int:
+    """Select the grouped kernel tile from its per-split token count."""
+    if num_kv_splits <= 0:
+        raise ValueError(
+            "TurboQuant num_kv_splits must be positive, got "
+            f"{num_kv_splits}."
+        )
+    if max_sequence_length is None:
+        return _GROUPED_GQA_BLOCK_KV
+    if max_sequence_length <= 0:
+        raise ValueError(
+            "TurboQuant max_sequence_length must be positive when provided, "
+            f"got {max_sequence_length}."
+        )
+    tokens_per_split = (
+        max_sequence_length + num_kv_splits - 1
+    ) // num_kv_splits
+    return 32 if tokens_per_split >= 32 else 16
 
 
 def _get_compute_rotation(
@@ -1027,7 +1100,7 @@ def triton_turboquant_decode_attention(
             VALUE_BITS=value_bits,
             VALUE_DATA_BYTES=value_data_bytes,
             ATTENTION_SCALE=scale,
-            BLOCK_Q=max(16, triton.next_power_of_2(group_size)),
+            BLOCK_Q=max(8, triton.next_power_of_2(group_size)),
             BLOCK_D=block_d,
             BLOCK_KV=grouped_block_kv,
             NORM_CORRECTION=norm_correction,

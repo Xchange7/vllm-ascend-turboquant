@@ -187,7 +187,8 @@ class KernelTurboQuantPagedDequant {
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
 
     LocalTensor<half> slotHalf = slotLocal_.ReinterpretCast<half>();
-    const float originalNorm = static_cast<float>(slotHalf.GetValue(KEY_DATA_BYTES / turbo_quant_detail::HALF_BYTES));
+    const float cachedKeyScale =
+        static_cast<float>(slotHalf.GetValue(KEY_DATA_BYTES / turbo_quant_detail::HALF_BYTES));
     const uint32_t valueBase = KEY_PACKED_SIZE;
     const uint32_t valueMetadataBase = valueBase + VALUE_DATA_BYTES;
     const float valueScale = static_cast<float>(slotHalf.GetValue(valueMetadataBase / turbo_quant_detail::HALF_BYTES));
@@ -200,8 +201,8 @@ class KernelTurboQuantPagedDequant {
     Gather(keyFloatLocal_, centroidLocal_, indexLocal_.ReinterpretCast<uint32_t>(), static_cast<uint32_t>(0), HEAD_DIM);
     PipeBarrier<PIPE_V>();
 
-    float keyScale = originalNorm;
-    if constexpr (NORM_CORRECTION) {
+    float keyScale = cachedKeyScale;
+    if constexpr (!NORM_CORRECTION) {
       Mul(squaredLocal_, keyFloatLocal_, keyFloatLocal_, HEAD_DIM);
       PipeBarrier<PIPE_V>();
       ReduceSum(normLocal_, squaredLocal_, reduceLocal_, HEAD_DIM);
@@ -211,7 +212,7 @@ class KernelTurboQuantPagedDequant {
       Sqrt(normLocal_, normLocal_, 1);
       SetFlag<HardEvent::V_S>(EVENT_ID0);
       WaitFlag<HardEvent::V_S>(EVENT_ID0);
-      keyScale /= normLocal_.GetValue(0);
+      keyScale *= normLocal_.GetValue(0);
     } else {
       SetFlag<HardEvent::V_S>(EVENT_ID0);
       WaitFlag<HardEvent::V_S>(EVENT_ID0);

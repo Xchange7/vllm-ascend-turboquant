@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
 
@@ -109,11 +110,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     value_out = torch.full_like(key_out, float("nan"))
 
     libraries_before_launch = loaded_turboquant_libraries()
-    print(
-        json.dumps({"loaded_libraries_before_launch": libraries_before_launch}, indent=2),
-        flush=True,
-    )
-    print("Launching npu_turboquant_paged_dequant_out...", flush=True)
+    if not args.quiet:
+        print(
+            json.dumps({"loaded_libraries_before_launch": libraries_before_launch}, indent=2),
+            flush=True,
+        )
+        print("Launching npu_turboquant_paged_dequant_out...", flush=True)
     returned_key, returned_value = turboquant_paged_dequant_out(
         query,
         cache,
@@ -170,8 +172,15 @@ def main() -> None:
     report = run(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps(report, indent=2), flush=True)
-    print(f"Report: {args.output}", flush=True)
+    if args.quiet:
+        print(
+            "TurboQuant runtime preflight passed: "
+            f"device={report['device']} head_dim={report['configuration']['head_dim']}",
+            flush=True,
+        )
+    else:
+        print(json.dumps(report, indent=2), flush=True)
+        print(f"Report: {args.output}", flush=True)
 
 
 if __name__ == "__main__":

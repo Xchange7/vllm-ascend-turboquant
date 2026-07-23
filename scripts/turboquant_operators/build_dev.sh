@@ -5,7 +5,9 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-SOC_VERSION="${SOC_VERSION:-ascend910b4}"
+source "${SCRIPT_DIR}/soc_utils.sh"
+SOC_VERSION="${SOC_VERSION:-}"
+DETECTED_SOC_VERSION=""
 MAX_JOBS="${MAX_JOBS:-8}"
 INSTALL_DIR="${REPO_ROOT}/vllm_ascend/_cann_ops_custom"
 BACKUP_DIR="${TURBOQUANT_DEV_BACKUP_DIR:-${REPO_ROOT}/.cache/turboquant_build_dev/full_cann_ops_custom}"
@@ -20,9 +22,9 @@ usage() {
     cat <<'EOF'
 Usage: bash scripts/turboquant_operators/build_dev.sh [--clean|--restore-full]
 
-Build mode compiles and installs only turbo_quant_paged_dequant plus the
-vllm-ascend PyTorch extension. The existing full custom-op package is backed
-up before the first developer build.
+Build mode compiles and installs the TurboQuant dequant and attention ops plus the
+vllm-ascend PyTorch extension for the selected A2/A3 SoC. The existing full
+custom-op package is backed up before the first developer build.
 
 Options:
   --clean         Discard csrc/build and perform a clean one-op build.
@@ -72,14 +74,22 @@ if [[ "${MODE}" == "restore" ]]; then
     exit
 fi
 
+if [[ -z "${SOC_VERSION}" ]]; then
+    SOC_VERSION="$(detect_turboquant_soc_version "${PYTHON_BIN}")"
+    DETECTED_SOC_VERSION="${SOC_VERSION}"
+else
+    SOC_VERSION="$(resolve_turboquant_soc_version "${SOC_VERSION}" "${PYTHON_BIN}")"
+fi
+
 case "${SOC_VERSION}" in
-    ascend910b4|ascend910b4-1)
+    ascend910b4|ascend910b4-1|ascend910_93*)
         ;;
     *)
-        printf 'SOC_VERSION must target Ascend 910B4, got %s\n' "${SOC_VERSION}" >&2
+        printf 'SOC_VERSION must target Ascend 910B4 or 910_93, got %s\n' "${SOC_VERSION}" >&2
         exit 2
         ;;
 esac
+validate_turboquant_soc_matches_device "${SOC_VERSION}" "${PYTHON_BIN}" "${DETECTED_SOC_VERSION}"
 if [[ ! "${MAX_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
     printf 'MAX_JOBS must be a positive integer, got %s\n' "${MAX_JOBS}" >&2
     exit 2
@@ -122,7 +132,7 @@ trap restore_after_failure ERR
 
 export MAX_JOBS
 export SOC_VERSION
-export VLLM_ASCEND_BUILD_CUSTOM_OPS="turbo_quant_paged_dequant"
+export VLLM_ASCEND_BUILD_CUSTOM_OPS="turbo_quant_paged_dequant;turbo_quant_paged_attention"
 if ((CLEAN_BUILD == 0)); then
     export VLLM_ASCEND_ACLNN_INCREMENTAL_BUILD=1
 else
@@ -143,7 +153,7 @@ fi
 } | tee "${LOG_FILE}"
 
 cd "${REPO_ROOT}"
-"${PYTHON_BIN}" -m pip install --no-build-isolation -v -e . 2>&1 | tee -a "${LOG_FILE}"
+"${PYTHON_BIN}" -m pip install --no-deps --no-build-isolation -v -e . 2>&1 | tee -a "${LOG_FILE}"
 
 touch "${MARKER_FILE}"
 trap - ERR

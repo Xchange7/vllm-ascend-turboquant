@@ -114,16 +114,17 @@ def dequantize_paged_cache_reference(
         raise ValueError(f"TurboQuant slot has {slots.shape[-1]} bytes, but {expected_slot_size} are required.")
     if key_packed_size != key_data_bytes + 2:
         raise ValueError(
-            "TurboQuant reference expects an MSE key payload followed by an FP16 norm, "
+            "TurboQuant reference expects an MSE key payload followed by an FP16 norm-correction scale, "
             f"got key_packed_size={key_packed_size} and key_data_bytes={key_data_bytes}."
         )
 
     key_indices = _unpack_indices(slots[..., :key_data_bytes], key_bits, head_dim)
     key = centroids[key_indices.long()]
-    if norm_correction:
-        key = key / key.square().sum(dim=-1, keepdim=True).clamp_min(1.0e-16).sqrt()
-    key_norm = _decode_fp16(slots[..., key_data_bytes:key_packed_size])
-    key = key * key_norm.unsqueeze(-1)
+    key_scale = _decode_fp16(slots[..., key_data_bytes:key_packed_size])
+    if not norm_correction:
+        decoded_norm = key.square().sum(dim=-1).clamp_min(1.0e-16).sqrt()
+        key_scale = key_scale * decoded_norm
+    key = key * key_scale.unsqueeze(-1)
 
     value_start = key_packed_size
     value_end = value_start + value_data_bytes

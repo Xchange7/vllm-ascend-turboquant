@@ -79,15 +79,25 @@ def test_cpu_reference_dequantizes_permuted_pages(key_bits: int, value_bits: int
         key_norm = 1.5 + position
         value_scale = 0.25 + position * 0.125
         value_minimum = -1.0 + position * 0.5
+        decoded_key = centroids[key_indices]
+        decoded_norm = torch.linalg.vector_norm(decoded_key).item()
+        cached_key_scale = (
+            torch.tensor(
+                key_norm / decoded_norm,
+                dtype=torch.float16,
+            )
+            .float()
+            .item()
+        )
         slot = (
             pack_indices(key_indices, key_bits)
-            + fp16_bytes(key_norm)
+            + fp16_bytes(cached_key_scale)
             + pack_indices(value_indices, value_bits)
             + fp16_bytes(value_scale)
             + fp16_bytes(value_minimum)
         )
         cache[1, position, 0] = torch.tensor(slot, dtype=torch.uint8)
-        expected_keys.append(centroids[key_indices] * key_norm)
+        expected_keys.append(decoded_key * cached_key_scale * decoded_norm)
         expected_values.append(torch.tensor(value_indices).float() * value_scale + value_minimum)
 
     key, value = reference.dequantize_paged_cache_reference(

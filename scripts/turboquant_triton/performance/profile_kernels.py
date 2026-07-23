@@ -36,15 +36,22 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
 
-from vllm_ascend.attention.turboquant import _build_hadamard
+from vllm_ascend.attention.turboquant import (
+    _build_hadamard,
+    _build_pipelined_compute_rotation,
+)
 from vllm_ascend.kv_cache.turboquant import get_turboquant_config
 from vllm_ascend.ops.triton.turboquant_decode import (
+    select_turboquant_grouped_block_kv,
     select_turboquant_num_kv_splits,
     triton_turboquant_decode_attention,
     triton_turboquant_dequant_paged_cache,
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
-from vllm_ascend.ops.turboquant import turboquant_paged_dequant_out
+from vllm_ascend.ops.turboquant import (
+    turboquant_paged_attention_out,
+    turboquant_paged_dequant_out,
+)
 
 
 @dataclass
@@ -94,6 +101,9 @@ def parse_args() -> argparse.Namespace:
             "dequant",
             "fused_dequant",
             "fused_decode",
+            "pipelined_attention",
+            "pipelined_decode",
+            "pipelined_decode_step",
             "native_decode",
         ),
         default="all",
@@ -142,9 +152,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--grouped-block-kv",
-        choices=(16, 32),
+        choices=(8, 16, 32),
         type=int,
         default=16,
+    )
+    parser.add_argument(
+        "--adaptive-block-kv",
+        action="store_true",
+        help="Select grouped BLOCK_KV using the production per-split policy.",
     )
     parser.add_argument(
         "--activation-dtype",
@@ -715,6 +730,125 @@ def build_ascend_fused_case(
     )
 
 
+def build_ascend_pipelined_case(
+    args: argparse.Namespace,
+    constants,
+    paged_cache,
+    *,
+    include_query_rotation: bool = True,
+    include_store: bool = False,
+) -> BenchmarkCase:
+    config, hadamard, centroids, midpoints, compute_rotation = constants
+    if (
+        args.head_dim != 128
+        or args.num_query_heads != args.num_kv_heads * 8
+        or config.key_quant_bits != 4
+        or config.value_quant_bits != 4
+        or not config.norm_correction
+    ):
+        raise ValueError(
+            "AscendC pipelined decode requires D=128, GQA group=8, "
+            "and turboquant_4bit_nc."
+        )
+    cache, block_table, seq_lens, _, _ = paged_cache
+    device = torch.device(f"npu:{args.device}")
+    query = torch.randn(
+        args.batch_size,
+        args.num_query_heads,
+        args.head_dim,
+        dtype=activation_dtype(args),
+        device=device,
+    )
+    query_rotated = torch.empty_like(query)
+    output = torch.empty_like(query)
+    pipelined_compute_rotation = _build_pipelined_compute_rotation(
+        args.head_dim,
+        str(device),
+        activation_dtype(args),
+    )
+    if not include_query_rotation:
+        torch.matmul(query, pipelined_compute_rotation, out=query_rotated)
+        torch.npu.synchronize()
+    current_key = None
+    current_value = None
+    current_slots = None
+    if include_store:
+        current_key = torch.randn(
+            args.batch_size,
+            args.num_kv_heads,
+            args.head_dim,
+            dtype=activation_dtype(args),
+            device=device,
+        )
+        current_value = torch.randn_like(current_key)
+        current_slots = paged_cache[3].view(
+            args.batch_size,
+            args.sequence_length,
+        )[:, -1].contiguous()
+
+    def run() -> torch.Tensor:
+        if include_store:
+            assert current_key is not None
+            assert current_value is not None
+            assert current_slots is not None
+            triton_turboquant_store(
+                current_key,
+                current_value,
+                cache,
+                current_slots,
+                hadamard,
+                midpoints,
+                key_bits=config.key_quant_bits,
+                key_packed_size=config.key_packed_size,
+                value_bits=config.value_quant_bits,
+                compute_rotation=compute_rotation,
+            )
+        if include_query_rotation:
+            torch.matmul(query, pipelined_compute_rotation, out=query_rotated)
+        return turboquant_paged_attention_out(
+            query_rotated,
+            cache,
+            block_table,
+            seq_lens,
+            centroids,
+            output,
+            scale=1 / math.sqrt(args.head_dim),
+            max_seq_len=args.sequence_length,
+            key_bits=config.key_quant_bits,
+            key_packed_size=config.key_packed_size,
+            value_bits=config.value_quant_bits,
+            norm_correction=config.norm_correction,
+            max_num_splits=args.num_kv_splits,
+        )
+
+    return BenchmarkCase(
+        name=(
+            "pipelined_decode_step"
+            if include_store
+            else (
+                "pipelined_decode"
+                if include_query_rotation
+                else "pipelined_attention"
+            )
+        ),
+        run=run,
+        work_per_iteration=args.batch_size,
+        throughput_name="generated_tokens_per_second",
+        tensors=(
+            query,
+            pipelined_compute_rotation,
+            query_rotated,
+            cache,
+            block_table,
+            seq_lens,
+            output,
+            current_key,
+            current_value,
+            current_slots,
+        ),
+    )
+
+
 def benchmark(case: BenchmarkCase, args: argparse.Namespace) -> BenchmarkResult:
     for _ in range(args.warmup):
         case.run()
@@ -820,6 +954,15 @@ def main() -> None:
             f"Adaptive split selection: max={configured_max_splits}, selected={args.num_kv_splits}",
             flush=True,
         )
+    if args.adaptive_block_kv:
+        args.grouped_block_kv = select_turboquant_grouped_block_kv(
+            args.sequence_length,
+            args.num_kv_splits,
+        )
+        print(
+            f"Adaptive grouped BLOCK_KV selection: selected={args.grouped_block_kv}",
+            flush=True,
+        )
     if not torch.npu.is_available():
         raise RuntimeError("torch-npu cannot see an Ascend NPU.")
 
@@ -842,6 +985,9 @@ def main() -> None:
         "dequant",
         "fused_dequant",
         "fused_decode",
+        "pipelined_attention",
+        "pipelined_decode",
+        "pipelined_decode_step",
     ):
         paged_cache = build_paged_cache(args, constants)
         if args.operation in ("all", "decode"):
@@ -873,6 +1019,25 @@ def main() -> None:
                     constants,
                     paged_cache,
                     include_attention=True,
+                )
+            )
+        if args.operation in (
+            "pipelined_attention",
+            "pipelined_decode",
+            "pipelined_decode_step",
+        ) or (
+            args.operation == "all"
+            and args.head_dim == 128
+            and args.num_query_heads == args.num_kv_heads * 8
+            and args.cache_dtype == "turboquant_4bit_nc"
+        ):
+            cases.append(
+                build_ascend_pipelined_case(
+                    args,
+                    constants,
+                    paged_cache,
+                    include_query_rotation=args.operation != "pipelined_attention",
+                    include_store=args.operation == "pipelined_decode_step",
                 )
             )
     if args.operation == "native_decode" or (args.native_baseline and args.operation in ("all", "decode")):

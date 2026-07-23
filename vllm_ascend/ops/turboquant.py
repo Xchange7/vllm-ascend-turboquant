@@ -29,6 +29,97 @@ def has_turboquant_paged_dequant() -> bool:
     )
 
 
+def has_turboquant_paged_attention() -> bool:
+    """Return whether the installed extension contains the pipelined kernel."""
+    from vllm_ascend.utils import enable_custom_op
+
+    return (
+        enable_custom_op()
+        and hasattr(torch.ops._C_ascend, "npu_turboquant_paged_attention")
+        and hasattr(torch.ops._C_ascend, "npu_turboquant_paged_attention_out")
+    )
+
+
+def turboquant_paged_attention(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    centroids: torch.Tensor,
+    *,
+    scale: float,
+    max_seq_len: int,
+    key_bits: int,
+    key_packed_size: int,
+    value_bits: int,
+    norm_correction: bool,
+    max_num_splits: int = 32,
+) -> torch.Tensor:
+    """Run the AscendC packed-cache decode attention pipeline.
+
+    The initial optimized specialization covers D=128, GQA group=8, and
+    K4V4 cache entries with key norm correction.
+    """
+    if not has_turboquant_paged_attention():
+        raise RuntimeError(
+            "The Ascend TurboQuant pipelined attention operator is not "
+            "installed. Rebuild the TurboQuant developer custom-op package."
+        )
+    return torch.ops._C_ascend.npu_turboquant_paged_attention(
+        query,
+        kv_cache,
+        block_table,
+        seq_lens,
+        centroids,
+        scale,
+        max_seq_len,
+        key_bits,
+        key_packed_size,
+        value_bits,
+        norm_correction,
+        max_num_splits,
+    )
+
+
+def turboquant_paged_attention_out(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    centroids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    scale: float,
+    max_seq_len: int,
+    key_bits: int,
+    key_packed_size: int,
+    value_bits: int,
+    norm_correction: bool,
+    max_num_splits: int = 32,
+) -> torch.Tensor:
+    """Run pipelined packed-cache attention into caller-owned storage."""
+    if not has_turboquant_paged_attention():
+        raise RuntimeError(
+            "The Ascend TurboQuant pipelined attention out operator is not "
+            "installed. Rebuild vllm-ascend and the TurboQuant custom op."
+        )
+    return torch.ops._C_ascend.npu_turboquant_paged_attention_out(
+        query,
+        kv_cache,
+        block_table,
+        seq_lens,
+        centroids,
+        scale,
+        max_seq_len,
+        key_bits,
+        key_packed_size,
+        value_bits,
+        norm_correction,
+        max_num_splits,
+        output,
+    )
+
+
 def turboquant_paged_dequant(
     query: torch.Tensor,
     kv_cache: torch.Tensor,

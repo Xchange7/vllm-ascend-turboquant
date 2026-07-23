@@ -37,6 +37,20 @@ SOC_VERSION=ascend910b4 MAX_JOBS=8 \
 bash scripts/turboquant_operators/build_dev.sh
 ```
 
+同一入口支持 910B4/A2 和 910_93/A3。未设置 `SOC_VERSION` 时，脚本通过
+`torch.npu.get_device_name(0)` 自动选择；也可以在目标机器上显式设置：
+
+```bash
+# 910B4 / A2
+SOC_VERSION=ascend910b4 bash scripts/turboquant_operators/build_dev.sh
+
+# Ascend910_9382 / A3
+SOC_VERSION=ascend910_9382 bash scripts/turboquant_operators/build_dev.sh
+```
+
+显式目标与物理卡的 A2/A3 family 不一致时脚本会直接失败。不要把一台机器生成的
+`vllm_ascend/_cann_ops_custom` 目录复制到另一代 SoC；应在目标机器上重新构建。
+
 该入口仍会重编译 `vllm_ascend_C`，因此新增或修改 PyTorch schema 能够生效，但 ACLNN 部分只构建
 `turbo_quant_paged_dequant`，不会等待其余 35 个自定义算子。构建日志保存在
 `logs/turboquant/build_dev_<timestamp>/build.log`。默认保留 `csrc/build` 中的 CMake、protobuf 和
@@ -88,6 +102,63 @@ bash scripts/turboquant_operators/run_smoke.sh
 `Hq=16/Hkv=8/D=128/BF16/splits=1` 路径，并运行一个 B=2、S=512 的短性能用例。
 算子注册检查会同时要求 return-style 和 out-style 两个 schema，因此拉取本次改动后必须重新编译。
 
+如果只想调试 Qwen3-0.6B/TP2 的每卡算子形状，A2/A3 都可使用同一个短入口：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 DEVICE=0 \
+bash scripts/turboquant_operators/run_debug_validation.sh
+```
+
+它只运行真实 ACLNN 启动、短正确性、B1/S512 异步微基准和定向单测，不启动模型服务或高并发测试。
+默认每卡使用 `Hq=8/Hkv=4/D=128`；设置 `RUN_TRACE=1` 会额外为每个算子采集一次 NPU trace。
+构建 A3 自定义算子时使用 `SOC_VERSION=ascend910_9382`（CANN 内部映射到 `ascend910_93`）；
+构建 910B4/A2 时使用 `SOC_VERSION=ascend910b4`。未显式设置时脚本自动识别，两个 kernel 包不能复用。
+
+定位 Qwen3-32B 的低并发长上下文 decode 时，可直接运行 B1/S16K 的每 rank 形状对照：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 DEVICE=0 TP_SIZE=2 \
+bash scripts/turboquant_operators/run_qwen32_decode_debug.sh
+```
+
+`TP_SIZE=2` 使用 `Hq=32/Hkv=4`，`TP_SIZE=4` 使用 `Hq=16/Hkv=2`。脚本同时测 packed、
+AscendC+FIA 和 native FIA，并使用生产默认上限 `NUM_KV_SPLITS=32`；默认只做一次 trace，
+不启动 32B 模型服务。
+
+启动 Qwen3-32B TurboQuant 服务时还要加载 NNAL/ATB 环境。公共启动脚本对 TurboQuant 默认强制
+`ascend_fused`；如果当前 SoC 的 paged-dequant 算子不可用，会在启动阶段直接报错，而不是静默
+回退到长上下文下极慢的 packed 路径：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+MODEL=/run/test_llm/Qwen3-32B TP_SIZE=4 ENFORCE_EAGER=1 \
+VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION=ascend_fused \
+bash scripts/turboquant_triton/common/serve_qwen3_32b.sh
+```
+
+启动日志必须出现 `eager_single_token=ascend_fused`。如果出现
+`eager_single_token=packed_triton`，该次吞吐结果不能作为 TurboQuant 性能结果。
+启动脚本还会在加载 32B 权重前，用可见设备 0 实际执行一次 paged-dequant；这会在十几秒内
+发现 A2/A3 kernel 包混用，而不必等模型加载完。仅在专门定位 preflight 本身时可设置
+`TURBOQUANT_RUNTIME_PREFLIGHT=0` 跳过。
+
+在 910B4 上只复现低并发 decode、避免完整实验矩阵时，可运行：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+MODEL=/run/test_llm/Qwen3-32B \
+VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 NETWORK_IFNAME=eth0 \
+OUTPUT_TOKENS=32 WARMUP_REQUESTS=1 MEASURE_REQUESTS=2 \
+bash scripts/turboquant_operators/run_qwen32_serving_debug.sh
+```
+
+该入口固定并发 1，依次启动 native 和 TurboQuant eager 服务，并报告 TTFT、TPOT、输出吞吐和
+KV capacity；TurboQuant 阶段固定使用 `ascend_fused`。
+
 `operator_accuracy.py` 的最终 PASS 现在同时要求：实现间结果一致、CPU reference 一致、
 attention 输出一致，以及量化 NMSE/余弦相似度通过分档门禁。这样可以避免 Triton、AscendC 和
 CPU 解包同时正确读取一份错误 Cache 字节时产生假阳性。默认门禁是回归筛查值，可通过
@@ -127,6 +198,8 @@ Python 扩展与 OPP 安装包不匹配造成的段错误。
 `RUN_QUALITY`、`RUN_GRAPH`、`RUN_SERVING_EAGER` 和 `RUN_SERVING_GRAPH` 开关。
 通过 `PERF_CONCURRENCY_LEVELS="1 4 16"` 可修改 serving 并发矩阵；多个并发会复用同一个
 native 或 TurboQuant 服务进程，避免重复加载模型。
+serving 性能阶段默认设置 `PERF_DECODE_IMPLEMENTATION=ascend_fused`，以便算子缺失或 SoC
+不匹配时直接失败；只有专门测 packed/ACLGraph 时才应显式覆盖为 `grouped_gqa`。
 全量入口默认要求 TTFT/TPOT 不超过 baseline 的 2 倍、聚合输出吞吐不低于 baseline 的 50%，
 且 KV token capacity 至少达到 baseline 的 2 倍。门禁仅用于发现明显回退，可通过
 `PERF_MAX_TTFT_RATIO`、`PERF_MAX_TPOT_RATIO`、`PERF_MIN_THROUGHPUT_RATIO` 和

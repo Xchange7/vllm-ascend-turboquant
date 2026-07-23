@@ -15,13 +15,30 @@
 
 """Triton-Ascend kernels for writing the packed TurboQuant KV cache."""
 
+import functools
 import math
 
 import torch
+from vllm.model_executor.layers.quantization.turboquant.centroids import (
+    get_centroids,
+)
 from vllm.triton_utils import tl, triton
 
 ASCEND_UB_ALIGNMENT_BYTES = 32
 ASCEND_MAX_TRITON_GRID_SIZE = 65535
+
+
+@functools.cache
+def _store_centroids(
+    head_dim: int,
+    key_bits: int,
+    device_string: str,
+) -> torch.Tensor:
+    centroids = get_centroids(head_dim, key_bits).to(
+        device=torch.device(device_string),
+        dtype=torch.float32,
+    )
+    return centroids.sort().values
 
 
 def _store_launch_token_ranges(
@@ -214,6 +231,7 @@ def _turboquant_store_kernel(
     key_ptr,
     value_ptr,
     midpoint_ptr,
+    centroid_ptr,
     cache_u8_ptr,
     cache_f16_ptr,
     slot_mapping_ptr,
@@ -303,10 +321,18 @@ def _turboquant_store_kernel(
             packed,
             mask=byte_offsets < MSE_BYTES,
         )
+        even_centroids = tl.load(centroid_ptr + even).to(tl.float32)
+        odd_centroids = tl.load(centroid_ptr + odd).to(tl.float32)
+        decoded_norm_sq = tl.sum(
+            even_centroids * even_centroids
+            + odd_centroids * odd_centroids,
+            axis=0,
+        )
     else:
         group_offsets = tl.arange(0, BLOCK_GROUPS)
         group_mask = group_offsets < (D // 8)
         packed_24 = tl.zeros([BLOCK_GROUPS], dtype=tl.int32)
+        decoded_norm_sq = 0.0
         for coordinate in range(8):
             coordinate_offsets = group_offsets * 8 + coordinate
             centroid_index = _quantize_key_coordinates(
@@ -321,6 +347,15 @@ def _turboquant_store_kernel(
                 PACK_SIZE=BLOCK_GROUPS,
             )
             packed_24 = packed_24 | ((centroid_index & 0x7) << (coordinate * 3))
+            centroid_value = tl.load(
+                centroid_ptr + centroid_index,
+                mask=group_mask,
+                other=0.0,
+            ).to(tl.float32)
+            decoded_norm_sq += tl.sum(
+                centroid_value * centroid_value,
+                axis=0,
+            )
         tl.store(
             cache_u8_ptr + slot_base + group_offsets * 3,
             (packed_24 & 0xFF).to(tl.uint8),
@@ -339,7 +374,7 @@ def _turboquant_store_kernel(
 
     tl.store(
         cache_f16_ptr + (slot_base + MSE_BYTES) // 2,
-        key_norm.to(tl.float16),
+        (key_norm / tl.sqrt(decoded_norm_sq + 1e-16)).to(tl.float16),
     )
 
     _store_quantized_value(
@@ -454,6 +489,7 @@ def triton_turboquant_store(
         raise ValueError(f"TurboQuant FP16 metadata must start at an even byte offset; got offsets {metadata_offsets}.")
 
     cache_f16 = kv_cache.view(torch.float16)
+    centroids = _store_centroids(head_dim, key_bits, str(key.device))
     for token_start, token_end in _store_launch_token_ranges(
         num_tokens,
         num_kv_heads,
@@ -466,6 +502,7 @@ def triton_turboquant_store(
             key_vectors[vector_start:vector_end],
             value_contiguous[vector_start:vector_end],
             midpoints,
+            centroids,
             kv_cache,
             cache_f16,
             slot_mapping[token_start:token_end],

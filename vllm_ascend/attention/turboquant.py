@@ -26,6 +26,7 @@ import torch_npu
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -47,13 +48,16 @@ from vllm_ascend.kv_cache.turboquant import (
     validate_turboquant_layout,
 )
 from vllm_ascend.ops.triton.turboquant_decode import (
+    select_turboquant_grouped_block_kv,
     select_turboquant_num_kv_splits,
     triton_turboquant_decode_attention,
     triton_turboquant_dequant_paged_cache,
 )
 from vllm_ascend.ops.triton.turboquant_store import triton_turboquant_store
 from vllm_ascend.ops.turboquant import (
+    has_turboquant_paged_attention,
     has_turboquant_paged_dequant,
+    turboquant_paged_attention_out,
     turboquant_paged_dequant_out,
 )
 
@@ -127,6 +131,23 @@ def _build_compute_rotation(
 ) -> torch.Tensor:
     """Share the low-precision Cube operand across attention layers."""
     return _build_hadamard(head_dim, device_string).to(dtype=dtype)
+
+
+@functools.cache
+def _build_pipelined_compute_rotation(
+    head_dim: int,
+    device_string: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Emit rotated Q in the packed cache's low/high-nibble order.
+
+    A 4-bit cache byte stores an even coordinate in its low nibble and the
+    following odd coordinate in its high nibble. Producing Q as all even
+    coordinates followed by all odd coordinates lets the AscendC pipeline
+    skip two 128-element deinterleaves for every cached KV token.
+    """
+    rotation = _build_compute_rotation(head_dim, device_string, dtype)
+    return torch.cat((rotation[:, 0::2], rotation[:, 1::2]), dim=1).contiguous()
 
 
 def _query_lens_from_cumulative(
@@ -497,7 +518,10 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             implementation == "auto"
             and isinstance(head_size, int)
             and _supports_ascend_fused_head_dim(head_size)
-            and has_turboquant_paged_dequant()
+            and (
+                has_turboquant_paged_attention()
+                or has_turboquant_paged_dequant()
+            )
         ):
             # ACLGraph would force auto onto the much slower packed path.
             # Prefer eager AscendC+CANN when that implementation is available;
@@ -696,20 +720,64 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             )
         fused_features_supported = self.alibi_slopes is None and self.logits_soft_cap is None
         fused_shape_supported = _supports_ascend_fused_head_dim(head_size)
+        pipelined_shape_supported = (
+            head_size == 128
+            and num_heads == num_kv_heads * 8
+            and self.tq_config.key_quant_bits == 4
+            and self.tq_config.value_quant_bits == 4
+            and self.tq_config.norm_correction
+        )
+        paged_attention_available = (
+            pipelined_shape_supported
+            and has_turboquant_paged_attention()
+        )
+        paged_dequant_available = has_turboquant_paged_dequant()
+        self.ascend_pipelined_available = (
+            self.decode_implementation in ("auto", "ascend_fused")
+            and fused_features_supported
+            and paged_attention_available
+        )
         self.ascend_fused_available = (
             self.decode_implementation in ("auto", "ascend_fused")
             and fused_features_supported
             and fused_shape_supported
-            and has_turboquant_paged_dequant()
+            and (paged_attention_available or paged_dequant_available)
         )
+        if self.ascend_pipelined_available:
+            eager_single_token_path = "ascend_pipelined"
+        elif self.ascend_fused_available:
+            eager_single_token_path = "ascend_dequant_fia"
+        else:
+            eager_single_token_path = "packed_triton"
+        logger.info_once(
+            "TurboQuant decode dispatch: requested=%s, eager_single_token=%s, "
+            "paged_attention_schema=%s, paged_dequant_schema=%s, head_dim=%s, "
+            "alibi=%s, logits_soft_cap=%s.",
+            self.decode_implementation,
+            eager_single_token_path,
+            paged_attention_available,
+            paged_dequant_available,
+            head_size,
+            self.alibi_slopes is not None,
+            self.logits_soft_cap,
+        )
+        if self.decode_implementation == "auto" and not self.ascend_fused_available:
+            logger.warning_once(
+                "TurboQuant auto decode is falling back to packed Triton. "
+                "Qwen3-32B long-context decode can be extremely slow on this "
+                "path. Rebuild the paged-dequant custom op for the physical "
+                "NPU, or set VLLM_ASCEND_TURBOQUANT_DECODE_IMPLEMENTATION="
+                "ascend_fused to fail fast during startup."
+            )
         if self.decode_implementation == "ascend_fused" and not fused_features_supported:
             raise NotImplementedError("Ascend TurboQuant fused decode does not support ALiBi or logits soft cap.")
         if self.decode_implementation == "ascend_fused":
             _validate_ascend_fused_head_dim(head_size)
             if not self.ascend_fused_available:
                 raise RuntimeError(
-                    "Ascend TurboQuant fused decode requires the paged-dequant "
-                    "out operator. Rebuild vllm-ascend after sourcing CANN."
+                    "Ascend TurboQuant fused decode requires the pipelined "
+                    "attention operator or the paged-dequant out operator. "
+                    "Rebuild vllm-ascend after sourcing CANN."
                 )
 
     def _ensure_constants(
@@ -731,10 +799,26 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
                 and compute_rotation.dtype == activation_dtype
                 and compute_rotation.device == device
             )
-            if compute_rotation_ready and getattr(layer, "_tq_ascend_workspace_signature", None) == workspace_signature:
+            pipelined_rotation = getattr(layer, "_tq_ascend_pipelined_compute_rotation", None)
+            pipelined_rotation_ready = (
+                pipelined_rotation is not None
+                and pipelined_rotation.dtype == activation_dtype
+                and pipelined_rotation.device == device
+            )
+            if (
+                compute_rotation_ready
+                and pipelined_rotation_ready
+                and getattr(layer, "_tq_ascend_workspace_signature", None) == workspace_signature
+            ):
                 return
             if not compute_rotation_ready:
                 layer._tq_ascend_compute_rotation = _build_compute_rotation(
+                    self.head_size,
+                    str(device),
+                    activation_dtype,
+                )
+            if not pipelined_rotation_ready:
+                layer._tq_ascend_pipelined_compute_rotation = _build_pipelined_compute_rotation(
                     self.head_size,
                     str(device),
                     activation_dtype,
@@ -743,6 +827,11 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             rotation = _build_hadamard(self.head_size, str(device))
             layer._tq_ascend_hadamard = rotation
             layer._tq_ascend_compute_rotation = _build_compute_rotation(
+                self.head_size,
+                str(device),
+                activation_dtype,
+            )
+            layer._tq_ascend_pipelined_compute_rotation = _build_pipelined_compute_rotation(
                 self.head_size,
                 str(device),
                 activation_dtype,
@@ -1018,6 +1107,52 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
         )
         return output
 
+    def _run_ascend_pipelined_decode(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        output: torch.Tensor,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """Run packed dequant, QK, online softmax, and PV in one AscendC op."""
+        if max_seq_len <= 0:
+            raise ValueError(
+                "Ascend TurboQuant pipelined decode requires a positive "
+                f"max_seq_len, got {max_seq_len}."
+            )
+        cache_sequence_capacity = block_tables.shape[1] * kv_cache.shape[1]
+        if max_seq_len > cache_sequence_capacity:
+            raise ValueError(
+                "Ascend TurboQuant pipelined decode max_seq_len exceeds "
+                f"block-table capacity {cache_sequence_capacity}: "
+                f"{max_seq_len}."
+            )
+        rotated_query = layer._tq_ascend_query_rotation_buf[: query.shape[0]]
+        torch.matmul(
+            query,
+            layer._tq_ascend_pipelined_compute_rotation,
+            out=rotated_query,
+        )
+        turboquant_paged_attention_out(
+            rotated_query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            layer._tq_ascend_centroids,
+            output,
+            scale=self.scale,
+            max_seq_len=max_seq_len,
+            key_bits=self.tq_config.key_quant_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_bits=self.tq_config.value_quant_bits,
+            norm_correction=self.tq_config.norm_correction,
+            max_num_splits=self.max_num_kv_splits,
+        )
+        return output
+
     def _run_feature_prefill(
         self,
         query: torch.Tensor,
@@ -1143,6 +1278,20 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             _is_aclgraph_forward(),
         )
         if use_ascend_fused:
+            max_seq_len = metadata.max_seq_len
+            if max_seq_len is None:
+                max_seq_len = max(metadata.seq_lens_list[:num_reqs])
+            if self.ascend_pipelined_available:
+                self._run_ascend_pipelined_decode(
+                    layer,
+                    query[:num_reqs],
+                    kv_cache,
+                    metadata.block_tables[:num_reqs],
+                    metadata.seq_lens[:num_reqs],
+                    output[:num_reqs],
+                    max_seq_len,
+                )
+                return output
             if not isinstance(metadata.turboquant_workspace, _TurboQuantFusedWorkspace) or not isinstance(
                 metadata.turboquant_page_table_builder,
                 _TurboQuantPageTableBuilder,
@@ -1153,9 +1302,6 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
                     metadata.seq_lens_list[:num_reqs],
                     kv_cache.shape[1],
                 )
-            max_seq_len = metadata.max_seq_len
-            if max_seq_len is None:
-                max_seq_len = max(metadata.seq_lens_list[:num_reqs])
             self._run_ascend_fused_decode(
                 layer,
                 query[:num_reqs],
@@ -1277,6 +1423,10 @@ class AscendTurboQuantAttentionImpl(AscendAttentionBackendImpl):
             sequence_length_delta=sequence_length_delta,
             compute_rotation=(None if self.decode_implementation == "reference" else layer._tq_ascend_compute_rotation),
             implementation=triton_implementation,
+            grouped_block_kv=select_turboquant_grouped_block_kv(
+                max_sequence_length,
+                num_kv_splits,
+            ),
         )
 
     def _continuation_prefill(

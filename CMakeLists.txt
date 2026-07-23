@@ -196,7 +196,18 @@ else()
   )
 endif()
 
-target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
+# Use CMake's install-RPATH support instead of passing $ORIGIN through the
+# Makefile and shell as a raw linker option.  The latter turns it into the
+# literal ``$$ORIGIN`` on Makefile generators, so the editable extension
+# cannot find either its companion kernel library or the packaged custom-op
+# library at runtime.
+set_target_properties(
+  vllm_ascend_C
+  PROPERTIES
+    BUILD_RPATH_USE_ORIGIN TRUE
+    BUILD_RPATH "$ORIGIN;$ORIGIN/lib64;$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib"
+    INSTALL_RPATH "$ORIGIN;$ORIGIN/lib64;$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib"
+)
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})

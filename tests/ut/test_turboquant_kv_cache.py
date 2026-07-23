@@ -366,6 +366,35 @@ def test_turboquant_randomized_hadamard_spreads_constant_vectors():
     )
 
 
+def test_turboquant_pipelined_rotation_matches_packed_nibble_order():
+    from vllm_ascend.attention.turboquant import (
+        _build_compute_rotation,
+        _build_pipelined_compute_rotation,
+    )
+
+    head_dim = 128
+    rotation = _build_compute_rotation(head_dim, "cpu", torch.float32)
+    pipelined_rotation = _build_pipelined_compute_rotation(
+        head_dim,
+        "cpu",
+        torch.float32,
+    )
+    expected = torch.cat((rotation[:, 0::2], rotation[:, 1::2]), dim=1)
+
+    assert pipelined_rotation.is_contiguous()
+    torch.testing.assert_close(pipelined_rotation, expected)
+
+    query = torch.randn(3, head_dim)
+    rotated_key = torch.randn(5, head_dim)
+    nibble_major_key = torch.cat(
+        (rotated_key[:, 0::2], rotated_key[:, 1::2]),
+        dim=1,
+    )
+    regular_scores = (query @ rotation) @ rotated_key.T
+    pipelined_scores = (query @ pipelined_rotation) @ nibble_major_key.T
+    torch.testing.assert_close(pipelined_scores, regular_scores)
+
+
 def test_turboquant_rejects_unimplemented_fp8_key_path():
     with pytest.raises(NotImplementedError, match="FP8 keys"):
         validate_turboquant_layout("turboquant_k8v4", 128)
@@ -598,6 +627,8 @@ def test_turboquant_builder_routes_all_decode_tokens_to_packed_path():
         max_seq_len=16384,
     )
     builder = object.__new__(AscendTurboQuantMetadataBuilder)
+    builder._turboquant_page_table_builder = MagicMock()
+    builder._turboquant_workspace = MagicMock()
 
     with patch.object(
         AscendAttentionMetadataBuilder,
@@ -643,6 +674,55 @@ def test_turboquant_query_lens_rejects_invalid_metadata():
         _query_lens_from_cumulative([2, 2], 2)
 
 
+def test_turboquant_single_token_decode_uses_pipelined_operator_without_dense_workspace():
+    from vllm_ascend.attention.attention_v1 import AscendMetadata
+    from vllm_ascend.attention.turboquant import AscendTurboQuantAttentionImpl
+
+    query = torch.arange(4, dtype=torch.float32).view(2, 2, 1)
+    output = torch.empty_like(query)
+    metadata = AscendMetadata(
+        num_decodes=2,
+        num_decode_tokens=2,
+        actual_seq_lengths_q=[1, 2],
+        seq_lens=torch.tensor([129, 257], dtype=torch.int32),
+        seq_lens_list=[129, 257],
+        max_seq_len=257,
+        block_tables=torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32),
+    )
+    impl = object.__new__(AscendTurboQuantAttentionImpl)
+    impl.decode_implementation = "auto"
+    impl.ascend_fused_available = True
+    impl.ascend_pipelined_available = True
+
+    def run_pipelined(
+        _layer,
+        step_query,
+        _cache,
+        _blocks,
+        _seq_lens,
+        step_output,
+        _max_seq_len,
+    ):
+        step_output.copy_(step_query)
+        return step_output
+
+    impl._run_ascend_pipelined_decode = MagicMock(
+        side_effect=run_pipelined
+    )
+
+    result = impl._decode_attention(
+        MagicMock(),
+        query,
+        torch.empty(6, 128, 1, 1),
+        metadata,
+        output,
+    )
+
+    torch.testing.assert_close(result, query)
+    impl._run_ascend_pipelined_decode.assert_called_once()
+    assert metadata.turboquant_page_table is None
+
+
 def test_turboquant_uniform_multi_token_decode_reuses_request_workspace():
     from vllm_ascend.attention.attention_v1 import AscendMetadata
     from vllm_ascend.attention.turboquant import AscendTurboQuantAttentionImpl
@@ -661,6 +741,8 @@ def test_turboquant_uniform_multi_token_decode_reuses_request_workspace():
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_heads = 1
     impl.head_size = 1
+    impl.decode_implementation = "reference"
+    impl.ascend_fused_available = False
 
     impl._launch_decode = MagicMock(side_effect=_copy_decode_output)
 
@@ -695,6 +777,8 @@ def test_turboquant_uniform_decode_passes_padded_lengths_to_device():
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_heads = 1
     impl.head_size = 1
+    impl.decode_implementation = "reference"
+    impl.ascend_fused_available = False
 
     impl._launch_decode = MagicMock(side_effect=_copy_decode_output)
 
@@ -727,6 +811,8 @@ def test_turboquant_nonuniform_decode_uses_per_request_causal_lengths():
     impl = object.__new__(AscendTurboQuantAttentionImpl)
     impl.num_heads = 1
     impl.head_size = 1
+    impl.decode_implementation = "reference"
+    impl.ascend_fused_available = False
 
     impl._launch_decode = MagicMock(side_effect=_copy_decode_output)
 
@@ -889,7 +975,10 @@ def test_turboquant_launch_decode_reduces_splits_at_high_concurrency():
         )
 
     assert result is output
-    assert decode.call_args.kwargs["max_num_kv_splits"] == 4
+    # Long contexts deliberately keep more split-KV work in flight. Profiling
+    # on Ascend910_9382 shows 32 splits is faster than 4 for this B16/S16K
+    # grouped-GQA case, and matches the production selection policy.
+    assert decode.call_args.kwargs["max_num_kv_splits"] == 32
 
 
 def test_turboquant_large_continuation_dequantizes_history_only():
