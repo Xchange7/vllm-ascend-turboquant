@@ -13,7 +13,8 @@ namespace turbo_quant_attention_detail {
 constexpr uint32_t HEAD_DIM = 128U;
 constexpr uint32_t GROUP_SIZE = 8U;
 constexpr uint32_t CUBE_M = 16U;
-constexpr uint32_t TILE_TOKENS = 256U;
+constexpr uint32_t TILE_TOKENS = 384U;
+constexpr uint32_t CUBE_TILE_TOKENS = 256U;
 constexpr uint32_t ROWS_PER_AIV = GROUP_SIZE / 2U;
 constexpr uint32_t TOKENS_PER_AIV = TILE_TOKENS / 2U;
 constexpr uint32_t KEY_DATA_BYTES = HEAD_DIM / 2U;
@@ -1249,15 +1250,15 @@ class KernelTurboQuantPagedAttentionCube {
         turbo_quant_attention_detail::HEAD_DIM * sizeof(T);
     constexpr uint32_t probabilityL1Bytes =
         turbo_quant_attention_detail::CUBE_M *
-        turbo_quant_attention_detail::TILE_TOKENS * sizeof(T);
+        turbo_quant_attention_detail::CUBE_TILE_TOKENS * sizeof(T);
     constexpr uint32_t kvL1Bytes =
-        turbo_quant_attention_detail::TILE_TOKENS *
+        turbo_quant_attention_detail::CUBE_TILE_TOKENS *
         turbo_quant_attention_detail::HEAD_DIM * sizeof(T);
     constexpr uint32_t l0ABytes = queryL1Bytes;
     constexpr uint32_t l0BBytes = kvL1Bytes;
     constexpr uint32_t l0CBytes =
         turbo_quant_attention_detail::CUBE_M *
-        turbo_quant_attention_detail::TILE_TOKENS *
+        turbo_quant_attention_detail::CUBE_TILE_TOKENS *
         turbo_quant_attention_detail::FLOAT_BYTES;
     pipe_->InitBuffer(aL1Buffer_, queryL1Bytes);
     pipe_->InitBuffer(probabilityL1Buffer_, probabilityL1Bytes);
@@ -1409,125 +1410,162 @@ class KernelTurboQuantPagedAttentionCube {
 
   __aicore__ inline void ComputeQK(
       uint32_t tokenCount, uint32_t bufferIndex) {
-    const uint32_t tokenCountAligned =
-        turbo_quant_attention_detail::Align16(tokenCount);
-    GlobalTensor<T> keySource =
-        keyTileGm_[bufferIndex *
-                   turbo_quant_attention_detail::KV_TILE_ELEMENTS];
-    CopyGmNdToL1(
-        bL1Local_, keySource, tokenCount,
-        turbo_quant_attention_detail::HEAD_DIM,
-        turbo_quant_attention_detail::HEAD_DIM, tokenCountAligned);
-    SetFlag<HardEvent::MTE2_MTE1>(EVENT_ID3);
-    WaitFlag<HardEvent::MTE2_MTE1>(EVENT_ID3);
-
     LoadA(aL1Local_, turbo_quant_attention_detail::CUBE_M,
           turbo_quant_attention_detail::HEAD_DIM);
-    LoadData2DParams loadBParams;
-    loadBParams.startIndex = 0;
-    loadBParams.repeatTimes =
-        (tokenCountAligned / 16U) *
-        (turbo_quant_attention_detail::HEAD_DIM /
-         (32U / sizeof(T)));
-    loadBParams.srcStride = 1;
-    loadBParams.dstGap = 0;
-    loadBParams.ifTranspose = false;
-    LoadData(bL0Local_, bL1Local_, loadBParams);
-    SetFlag<HardEvent::MTE1_M>(EVENT_ID3);
-    WaitFlag<HardEvent::MTE1_M>(EVENT_ID3);
+    for (uint32_t cubeStart = 0U; cubeStart < tokenCount;
+         cubeStart +=
+             turbo_quant_attention_detail::CUBE_TILE_TOKENS) {
+      const uint32_t cubeRemaining = tokenCount - cubeStart;
+      const uint32_t cubeTokenCount =
+          cubeRemaining <
+                  turbo_quant_attention_detail::CUBE_TILE_TOKENS
+              ? cubeRemaining
+              : turbo_quant_attention_detail::CUBE_TILE_TOKENS;
+      const uint32_t cubeTokenCountAligned =
+          turbo_quant_attention_detail::Align16(cubeTokenCount);
+      GlobalTensor<T> keySource =
+          keyTileGm_[
+              bufferIndex *
+                      turbo_quant_attention_detail::KV_TILE_ELEMENTS +
+              cubeStart *
+                  turbo_quant_attention_detail::HEAD_DIM];
+      CopyGmNdToL1(
+          bL1Local_, keySource, cubeTokenCount,
+          turbo_quant_attention_detail::HEAD_DIM,
+          turbo_quant_attention_detail::HEAD_DIM,
+          cubeTokenCountAligned);
+      SetFlag<HardEvent::MTE2_MTE1>(EVENT_ID3);
+      WaitFlag<HardEvent::MTE2_MTE1>(EVENT_ID3);
 
-    MmadParams mmParams;
-    mmParams.m = turbo_quant_attention_detail::CUBE_M;
-    mmParams.n = tokenCountAligned;
-    mmParams.k = turbo_quant_attention_detail::HEAD_DIM;
-    mmParams.cmatrixInitVal = true;
-    mmParams.cmatrixSource = false;
-    mmParams.unitFlag = 0b11;
-    Mmad(cL0Local_, aL0Local_, bL0Local_, mmParams);
-    PipeBarrier<PIPE_M>();
-    SetFlag<HardEvent::M_FIX>(EVENT_ID3);
-    WaitFlag<HardEvent::M_FIX>(EVENT_ID3);
+      LoadData2DParams loadBParams;
+      loadBParams.startIndex = 0;
+      loadBParams.repeatTimes =
+          (cubeTokenCountAligned / 16U) *
+          (turbo_quant_attention_detail::HEAD_DIM /
+           (32U / sizeof(T)));
+      loadBParams.srcStride = 1;
+      loadBParams.dstGap = 0;
+      loadBParams.ifTranspose = false;
+      LoadData(bL0Local_, bL1Local_, loadBParams);
+      SetFlag<HardEvent::MTE1_M>(EVENT_ID3);
+      WaitFlag<HardEvent::MTE1_M>(EVENT_ID3);
 
-    FixpipeParamsV220 fixParams;
-    fixParams.nSize = tokenCountAligned;
-    fixParams.mSize = turbo_quant_attention_detail::CUBE_M;
-    fixParams.srcStride = turbo_quant_attention_detail::CUBE_M;
-    fixParams.dstStride = turbo_quant_attention_detail::TILE_TOKENS;
-    fixParams.unitFlag = 0b11;
-    fixParams.ndNum = 1;
-    Fixpipe(
-        scoresGm_[
-            bufferIndex *
-            turbo_quant_attention_detail::CUBE_M *
-            turbo_quant_attention_detail::TILE_TOKENS],
-        cL0Local_, fixParams);
+      MmadParams mmParams;
+      mmParams.m = turbo_quant_attention_detail::CUBE_M;
+      mmParams.n = cubeTokenCountAligned;
+      mmParams.k = turbo_quant_attention_detail::HEAD_DIM;
+      mmParams.cmatrixInitVal = true;
+      mmParams.cmatrixSource = false;
+      mmParams.unitFlag = 0b11;
+      Mmad(cL0Local_, aL0Local_, bL0Local_, mmParams);
+      PipeBarrier<PIPE_M>();
+      SetFlag<HardEvent::M_FIX>(EVENT_ID3);
+      WaitFlag<HardEvent::M_FIX>(EVENT_ID3);
+
+      FixpipeParamsV220 fixParams;
+      fixParams.nSize = cubeTokenCountAligned;
+      fixParams.mSize = turbo_quant_attention_detail::CUBE_M;
+      fixParams.srcStride = turbo_quant_attention_detail::CUBE_M;
+      fixParams.dstStride =
+          turbo_quant_attention_detail::TILE_TOKENS;
+      fixParams.unitFlag = 0b11;
+      fixParams.ndNum = 1;
+      Fixpipe(
+          scoresGm_[
+              bufferIndex *
+                      turbo_quant_attention_detail::CUBE_M *
+                      turbo_quant_attention_detail::TILE_TOKENS +
+              cubeStart],
+          cL0Local_, fixParams);
+    }
   }
 
   __aicore__ inline void ComputePV(
       uint32_t tokenCount, uint32_t bufferIndex) {
-    const uint32_t tokenCountAligned =
-        turbo_quant_attention_detail::Align16(tokenCount);
-    GlobalTensor<T> probabilitySource =
-        probabilityGm_[
-            bufferIndex *
-            turbo_quant_attention_detail::CUBE_M *
-            turbo_quant_attention_detail::TILE_TOKENS];
-    CopyGmNdToL1(
-        probabilityL1Local_, probabilitySource,
-        turbo_quant_attention_detail::GROUP_SIZE, tokenCountAligned,
-        turbo_quant_attention_detail::TILE_TOKENS,
-        turbo_quant_attention_detail::CUBE_M);
-    GlobalTensor<T> valueSource =
-        valueTileGm_[bufferIndex *
-                     turbo_quant_attention_detail::KV_TILE_ELEMENTS];
-    CopyGmNdToL1(
-        bL1Local_, valueSource, tokenCount,
-        turbo_quant_attention_detail::HEAD_DIM,
-        turbo_quant_attention_detail::HEAD_DIM, tokenCountAligned);
-    SetFlag<HardEvent::MTE2_MTE1>(EVENT_ID4);
-    WaitFlag<HardEvent::MTE2_MTE1>(EVENT_ID4);
+    uint32_t cubeIndex = 0U;
+    for (uint32_t cubeStart = 0U; cubeStart < tokenCount;
+         cubeStart +=
+             turbo_quant_attention_detail::CUBE_TILE_TOKENS,
+                  ++cubeIndex) {
+      const uint32_t cubeRemaining = tokenCount - cubeStart;
+      const uint32_t cubeTokenCount =
+          cubeRemaining <
+                  turbo_quant_attention_detail::CUBE_TILE_TOKENS
+              ? cubeRemaining
+              : turbo_quant_attention_detail::CUBE_TILE_TOKENS;
+      const uint32_t cubeTokenCountAligned =
+          turbo_quant_attention_detail::Align16(cubeTokenCount);
+      GlobalTensor<T> probabilitySource =
+          probabilityGm_[
+              bufferIndex *
+                      turbo_quant_attention_detail::CUBE_M *
+                      turbo_quant_attention_detail::TILE_TOKENS +
+              cubeStart];
+      CopyGmNdToL1(
+          probabilityL1Local_, probabilitySource,
+          turbo_quant_attention_detail::GROUP_SIZE,
+          cubeTokenCountAligned,
+          turbo_quant_attention_detail::TILE_TOKENS,
+          turbo_quant_attention_detail::CUBE_M);
+      GlobalTensor<T> valueSource =
+          valueTileGm_[
+              bufferIndex *
+                      turbo_quant_attention_detail::KV_TILE_ELEMENTS +
+              cubeStart *
+                  turbo_quant_attention_detail::HEAD_DIM];
+      CopyGmNdToL1(
+          bL1Local_, valueSource, cubeTokenCount,
+          turbo_quant_attention_detail::HEAD_DIM,
+          turbo_quant_attention_detail::HEAD_DIM,
+          cubeTokenCountAligned);
+      SetFlag<HardEvent::MTE2_MTE1>(EVENT_ID4);
+      WaitFlag<HardEvent::MTE2_MTE1>(EVENT_ID4);
 
-    LoadA(probabilityL1Local_,
-          turbo_quant_attention_detail::CUBE_M,
-          tokenCountAligned);
+      LoadA(probabilityL1Local_,
+            turbo_quant_attention_detail::CUBE_M,
+            cubeTokenCountAligned);
 
-    LoadData3DParamsV2<T> loadBParams;
-    loadBParams.l1H = tokenCountAligned / 16U;
-    loadBParams.l1W = 16U;
-    loadBParams.padList[0] = 0;
-    loadBParams.padList[1] = 0;
-    loadBParams.padList[2] = 0;
-    loadBParams.padList[3] = 255;
-    loadBParams.mExtension = tokenCountAligned;
-    loadBParams.kExtension =
-        turbo_quant_attention_detail::HEAD_DIM;
-    loadBParams.mStartPt = 0;
-    loadBParams.kStartPt = 0;
-    loadBParams.strideW = 1;
-    loadBParams.strideH = 1;
-    loadBParams.filterW = 1;
-    loadBParams.filterSizeW = false;
-    loadBParams.filterH = 1;
-    loadBParams.filterSizeH = false;
-    loadBParams.dilationFilterW = 1;
-    loadBParams.dilationFilterH = 1;
-    loadBParams.enTranspose = 1;
-    loadBParams.fMatrixCtrl = 0;
-    loadBParams.channelSize =
-        turbo_quant_attention_detail::HEAD_DIM;
-    LoadData<T, turbo_quant_attention_detail::LOAD3D_CONFIG>(
-        bL0Local_, bL1Local_, loadBParams);
-    SetFlag<HardEvent::MTE1_M>(EVENT_ID4);
-    WaitFlag<HardEvent::MTE1_M>(EVENT_ID4);
+      LoadData3DParamsV2<T> loadBParams;
+      loadBParams.l1H = cubeTokenCountAligned / 16U;
+      loadBParams.l1W = 16U;
+      loadBParams.padList[0] = 0;
+      loadBParams.padList[1] = 0;
+      loadBParams.padList[2] = 0;
+      loadBParams.padList[3] = 255;
+      loadBParams.mExtension = cubeTokenCountAligned;
+      loadBParams.kExtension =
+          turbo_quant_attention_detail::HEAD_DIM;
+      loadBParams.mStartPt = 0;
+      loadBParams.kStartPt = 0;
+      loadBParams.strideW = 1;
+      loadBParams.strideH = 1;
+      loadBParams.filterW = 1;
+      loadBParams.filterSizeW = false;
+      loadBParams.filterH = 1;
+      loadBParams.filterSizeH = false;
+      loadBParams.dilationFilterW = 1;
+      loadBParams.dilationFilterH = 1;
+      loadBParams.enTranspose = 1;
+      loadBParams.fMatrixCtrl = 0;
+      loadBParams.channelSize =
+          turbo_quant_attention_detail::HEAD_DIM;
+      LoadData<T, turbo_quant_attention_detail::LOAD3D_CONFIG>(
+          bL0Local_, bL1Local_, loadBParams);
+      SetFlag<HardEvent::MTE1_M>(EVENT_ID4);
+      WaitFlag<HardEvent::MTE1_M>(EVENT_ID4);
 
-    MmadParams mmParams;
-    mmParams.m = turbo_quant_attention_detail::CUBE_M;
-    mmParams.n = turbo_quant_attention_detail::HEAD_DIM;
-    mmParams.k = tokenCountAligned;
-    mmParams.cmatrixInitVal = true;
-    mmParams.cmatrixSource = false;
-    mmParams.unitFlag = 0b11;
-    Mmad(cL0Local_, aL0Local_, bL0Local_, mmParams);
+      MmadParams mmParams;
+      mmParams.m = turbo_quant_attention_detail::CUBE_M;
+      mmParams.n = turbo_quant_attention_detail::HEAD_DIM;
+      mmParams.k = cubeTokenCountAligned;
+      mmParams.cmatrixInitVal = cubeIndex == 0U;
+      mmParams.cmatrixSource = false;
+      mmParams.unitFlag = 0b11;
+      Mmad(cL0Local_, aL0Local_, bL0Local_, mmParams);
+      PipeBarrier<PIPE_M>();
+      SetFlag<HardEvent::M_MTE1>(EVENT_ID4);
+      WaitFlag<HardEvent::M_MTE1>(EVENT_ID4);
+    }
     PipeBarrier<PIPE_M>();
     SetFlag<HardEvent::M_FIX>(EVENT_ID4);
     WaitFlag<HardEvent::M_FIX>(EVENT_ID4);

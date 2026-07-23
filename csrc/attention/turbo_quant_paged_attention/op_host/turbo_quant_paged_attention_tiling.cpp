@@ -30,7 +30,7 @@ constexpr size_t MAX_NUM_SPLITS_ATTR_INDEX = 6;
 
 constexpr uint32_t SUPPORTED_HEAD_DIM = 128;
 constexpr uint32_t SUPPORTED_GROUP_SIZE = 8;
-constexpr uint32_t TILE_TOKENS = 256;
+constexpr uint32_t TILE_TOKENS = 384;
 constexpr uint32_t CUBE_ROWS = 16;
 constexpr uint32_t ELEMENT_BYTES = 2;
 constexpr uint32_t FLOAT_BYTES = 4;
