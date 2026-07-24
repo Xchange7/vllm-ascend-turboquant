@@ -10,6 +10,7 @@ MODEL="${MODEL:?Set MODEL to the local model path}"
 PORT="${PORT:-18001}"
 TP_SIZE="${TP_SIZE:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
 CONCURRENCY="${CONCURRENCY:-1}"
 CONCURRENCY_LEVELS="${CONCURRENCY_LEVELS:-${CONCURRENCY}}"
 read -r -a CONCURRENCY_VALUES <<<"${CONCURRENCY_LEVELS}"
@@ -42,6 +43,7 @@ MEASURE_REQUESTS="${MEASURE_REQUESTS:-10}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-600}"
 SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
+ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-0}"
 NATIVE_CACHE_DTYPE="${NATIVE_CACHE_DTYPE:-auto}"
 TQ_CACHE_DTYPE="${TQ_CACHE_DTYPE:-turboquant_4bit_nc}"
 MAX_TTFT_RATIO="${MAX_TTFT_RATIO:-}"
@@ -57,8 +59,20 @@ for positive_setting in MAX_NUM_SEQS MEASURE_REQUESTS; do
         exit 2
     fi
 done
+if [[ -n "${MAX_NUM_BATCHED_TOKENS}" \
+    && ! "${MAX_NUM_BATCHED_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'MAX_NUM_BATCHED_TOKENS must be empty or a positive integer; got %s.\n' \
+        "${MAX_NUM_BATCHED_TOKENS}" >&2
+    exit 2
+fi
 if [[ ! "${WARMUP_REQUESTS}" =~ ^[0-9]+$ ]]; then
     printf 'WARMUP_REQUESTS must be a non-negative integer; got %s.\n' "${WARMUP_REQUESTS}" >&2
+    exit 2
+fi
+if [[ "${ENABLE_CHUNKED_PREFILL}" != "0" \
+    && "${ENABLE_CHUNKED_PREFILL}" != "1" ]]; then
+    printf 'ENABLE_CHUNKED_PREFILL must be 0 or 1; got %s.\n' \
+        "${ENABLE_CHUNKED_PREFILL}" >&2
     exit 2
 fi
 if ((MAX_NUM_SEQS < MAX_CONCURRENCY)); then
@@ -168,6 +182,14 @@ start_server() {
     local label="$1"
     local cache_dtype="$2"
     local log_file="${OUTPUT_DIR}/${label}_server.log"
+    local server_args=(--no-enable-prefix-caching)
+
+    if [[ -n "${MAX_NUM_BATCHED_TOKENS}" ]]; then
+        server_args+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
+    fi
+    if [[ "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
+        server_args+=(--enable-chunked-prefill)
+    fi
 
     printf 'Starting %s server (cache dtype: %s).\n' "${label}" "${cache_dtype}"
     MODEL="${MODEL}" \
@@ -179,7 +201,7 @@ start_server() {
         KV_CACHE_DTYPE="${cache_dtype}" \
         ENFORCE_EAGER="${ENFORCE_EAGER}" \
         bash "${TQ_COMMON_DIR}/serve_qwen3_32b.sh" \
-            --no-enable-prefix-caching >"${log_file}" 2>&1 &
+            "${server_args[@]}" >"${log_file}" 2>&1 &
     SERVER_PID=$!
     wait_for_server "${log_file}"
 }

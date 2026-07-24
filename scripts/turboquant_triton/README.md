@@ -166,6 +166,29 @@ WARMUP_REQUESTS=16 MEASURE_REQUESTS=64 \
 bash scripts/turboquant_triton/performance/run_serving_benchmark.sh
 ```
 
+On a four-card Ascend 910B4 server, the dedicated TP4 entrypoint validates all
+four device models, profiles the TP4 per-rank attention shape, and then runs an
+actual Qwen3-32B TP4 native/TurboQuant serving A/B:
+
+```bash
+MODEL=/path/to/Qwen3-32B \
+bash scripts/turboquant_triton/performance/run_qwen3_32b_tp4_910b4.sh
+```
+
+It defaults to 16 concurrent sequences, 12,288 input tokens, 256 generated
+tokens, an 8,192-token chunked-prefill budget, one full warmup wave, and 64
+measured requests. It records TTFT, TPOT, request and token throughput,
+KV-cache capacity, server logs, operator reports, and periodic `npu-smi`
+snapshots under
+`logs/turboquant/qwen3_32b_tp4_910b4_<timestamp>/`. To collect a concurrency
+curve instead, set `CONCURRENCY_LEVELS="1 4 8 16"`; `MAX_NUM_SEQS` is inferred
+from the largest level. Set `RUN_OPERATOR_PROFILE=0` or `RUN_SERVING=0` to run
+only one part. `DRY_RUN=1` validates arguments and prints the commands without
+requiring model weights or NPU access. The script clears an inherited
+`HCCL_IF_IP` so it cannot conflict with `NETWORK_IFNAME`; set
+`HCCL_IF_IP_OVERRIDE=<address>` only when the deployment requires an explicit
+interface address.
+
 To compare ground-truth quality and hallucination resistance, run the chat
 quality suite. It grades native and TurboQuant independently, then treats a
 native-correct/TurboQuant-wrong case as a quantization regression:
